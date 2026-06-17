@@ -24,6 +24,10 @@ const {
   buildIntroCustomFields: buildIa360IntroCustomFields,
   buildReferidoContextoDraft: buildIa360ReferidoContextoDraft,
 } = require('./ia360ReferidoIntro');
+const {
+  suggestIa360Persona,
+  buildVcardPersonaRows,
+} = require('./ia360PersonaSuggest');
 
 const router = Router();
 
@@ -2777,7 +2781,16 @@ async function reflectIa360ToEspoCrm({ record, agent, channel = 'whatsapp' }) {
 
 async function notifyOwnerVcardCaptured({ record, shared }) {
   const who = shared.name || shared.contactNumber;
-  const body = `Alek, recibí un contacto compartido por WhatsApp y ya lo dejé capturado.\n\nNombre: ${who}\nWhatsApp: ${shared.contactNumber}\n\nPrimero clasifica qué tipo de persona/contacto es. En esta etapa NO envío secuencias automáticas desde vCard; solo guardo contexto para elegir después una secuencia lógica.`;
+  // G13: igual que las SECUENCIAS ya se rankean y marcan "Sugerida", aquí sugerimos
+  // la PERSONA probable a partir del nombre del vCard. La fila sugerida sube al tope
+  // de la lista marcada "SUGERIDA · ..."; si no hay señal clara, la lista queda
+  // EXACTAMENTE como antes. Sigue siendo SOLO sugerencia: el owner elige con un tap.
+  const suggestion = suggestIa360Persona(shared);
+  const rows = buildVcardPersonaRows({ contactNumber: shared.contactNumber, suggestion });
+  const suggestionLine = suggestion
+    ? `\n\nSugerencia: empieza por «${rows[0].title}» (${suggestion.reason}). Es solo una pista; tú decides.`
+    : '';
+  const body = `Alek, recibí un contacto compartido por WhatsApp y ya lo dejé capturado.\n\nNombre: ${who}\nWhatsApp: ${shared.contactNumber}\n\nPrimero clasifica qué tipo de persona/contacto es. En esta etapa NO envío secuencias automáticas desde vCard; solo guardo contexto para elegir después una secuencia lógica.${suggestionLine}`;
   return sendOwnerInteractive({
     record,
     label: `owner_vcard_captured_${shared.contactNumber}`,
@@ -2793,18 +2806,7 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
         button: 'Elegir persona',
         sections: [{
           title: 'Clasificación',
-          rows: [
-            { id: `owner_pipe:${shared.contactNumber}:persona_beta`, title: 'Beta / amigo', description: 'Técnico, conocido o prueba' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_referido`, title: 'Referido / BNI', description: 'Intro o recomendación' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_aliado`, title: 'Aliado / socio', description: 'Canal o proveedor' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_cliente`, title: 'Cliente activo', description: 'Engage o deleitar' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_sponsor`, title: 'Sponsor ejecutivo', description: 'Buyer o dueño' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_comercial`, title: 'Director comercial', description: 'Ventas o pipeline' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_cfo`, title: 'CFO / finanzas', description: 'Control, datos o dinero' },
-            { id: `owner_pipe:${shared.contactNumber}:persona_tecnico`, title: 'Guardián técnico', description: 'Integración o permisos' },
-            { id: `owner_pipe:${shared.contactNumber}:guardar`, title: 'Solo guardar', description: 'Captura sin envío' },
-            { id: `owner_pipe:${shared.contactNumber}:excluir`, title: 'No contactar', description: 'Exclusión sin envío' },
-          ],
+          rows,
         }],
       },
     },
