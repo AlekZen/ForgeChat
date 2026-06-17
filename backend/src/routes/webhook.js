@@ -23,6 +23,8 @@ const {
   compactQuienIntro: compactQuienIntroPure,
   buildIntroCustomFields: buildIa360IntroCustomFields,
   buildReferidoContextoDraft: buildIa360ReferidoContextoDraft,
+  isSequenceBlockedByMissingQuienIntro: isIa360SequenceBlockedByMissingQuienIntro,
+  buildIntroNeededMessage: buildIa360IntroNeededMessage,
 } = require('./ia360ReferidoIntro');
 
 const router = Router();
@@ -4423,11 +4425,32 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
     });
     return;
   }
+  await emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact });
+}
+
+// G11: armado del readout + tarjeta de aprobación de una secuencia persona-first.
+// Extraído de handleIa360OwnerSequenceChoice para reusarlo desde el comando
+// "intro <contacto>: <quién>" (auto-reanudar tras capturar quien_intro), sin
+// duplicar el bloque. `record` llega tal cual del inbound del owner (su
+// contact_number = owner); el callsite Fit re-scopea internamente al
+// targetContact. `contact` es la ficha ya cargada (loadIa360ContactForOwnerAction).
+async function emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact }) {
+  const name = contact?.name || targetContact;
   const payload = buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction: 'sequence_selected' });
   let readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
   if (hasUnresolvedIa360Placeholder(readout)) {
     payload.sequence_candidate.copy_status = 'blocked';
     payload.approval.reason = 'Borrador bloqueado por placeholder sin resolver.';
+  }
+  // G11 (Parte A): si el borrador quedó bloqueado por falta de quien_intro (típico
+  // del referido BNI: el opener arrastra el placeholder {{quien_intro}}), el owner
+  // veía un readout sin botón "Aprobar y enviar" y sin saber qué hacer. Le damos el
+  // COMANDO EXACTO y copiable para desbloquear. No toca contactos sin ese bloqueo.
+  if (isIa360SequenceBlockedByMissingQuienIntro({
+    draft: payload.sequence_candidate.draft,
+    quienIntro: contact?.custom_fields?.quien_intro,
+  })) {
+    readout += `\n\n${buildIa360IntroNeededMessage({ name })}`;
   }
   await persistIa360PersonaPayload({ record, targetContact, flow, sequence, payload, tags: ['owner-sequence-selected'] });
   // G10 (P2): "Fit identificado" (pos 0 del pipeline Partners). Este es el momento
@@ -6145,6 +6168,23 @@ async function handleIa360OwnerIntroCommand({ record, target, introducer }) {
     } catch (e) {
       console.error('[ia360-intro] introducer resolve:', e.message);
     }
+    // G11 (Parte B): captura ANTES del merge si este contacto traía una secuencia
+    // referido_contexto pendiente y bloqueada por falta de quien_intro. El merge de
+    // abajo puebla quien_intro, así que el estado "estaba bloqueado" hay que leerlo
+    // ahora. Best-effort: si la carga falla, no auto-reanudamos (el comando sigue).
+    let preMergeContact = null;
+    try {
+      preMergeContact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber });
+    } catch (e) { console.error('[ia360-intro] pre-merge load:', e.message); }
+    const wasReferidoBlockedByQuienIntro =
+      String(preMergeContact?.custom_fields?.sequence_candidate || '') === 'referido_contexto'
+      && isIa360SequenceBlockedByMissingQuienIntro({
+        draft: buildIa360ReferidoContextoDraft({
+          name: ia360FirstNameFrom(preMergeContact?.name || contactNumber),
+          quienIntro: preMergeContact?.custom_fields?.quien_intro,
+        }),
+        quienIntro: preMergeContact?.custom_fields?.quien_intro,
+      });
     const customFields = buildIa360IntroCustomFields({
       quienIntroName,
       introducerNumber,
@@ -6170,6 +6210,26 @@ async function handleIa360OwnerIntroCommand({ record, target, introducer }) {
       targetContact: contactNumber,
       ownerBudget: true,
     });
+    // G11 (Parte B): si había una secuencia referido_contexto pendiente y bloqueada
+    // por quien_intro, ahora que el dato ya está capturado RE-EMITIMOS el readout +
+    // la tarjeta con "Aprobar y enviar" desbloqueado, para que el owner solo apruebe
+    // (sin re-elegir la secuencia). Best-effort: envuelto en try/catch para que un
+    // fallo aquí NO tumbe el comando intro ni su confirmación de arriba.
+    if (wasReferidoBlockedByQuienIntro) {
+      try {
+        const refreshed = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber });
+        const found = findIa360SequenceFlow('referido_contexto');
+        if (found && refreshed) {
+          await emitIa360SequenceReadoutCard({
+            record,
+            targetContact: contactNumber,
+            flow: found.flow,
+            sequence: found.sequence,
+            contact: refreshed,
+          });
+        }
+      } catch (e) { console.error('[ia360-intro] re-emit readout/card:', e.message); }
+    }
   } catch (err) {
     console.error('[ia360-intro] owner command error:', err.message);
     await ownerText('ia360_intro_error',

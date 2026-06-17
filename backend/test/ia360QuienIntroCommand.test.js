@@ -251,7 +251,7 @@ test('webhook.js cablea el modulo puro en los DOS puntos de consumo + el comando
   // El handler persiste via mergeContactIa360State.
   const h = src.indexOf('async function handleIa360OwnerIntroCommand');
   assert.notEqual(h, -1, 'falta el handler');
-  const hBody = src.slice(h, h + 3000);
+  const hBody = src.slice(h, h + 4500);
   assert.match(hBody, /buildIa360IntroCustomFields\(/);
   assert.match(hBody, /mergeContactIa360State\(/);
   // CALIENTE: el draft usa la funcion del modulo.
