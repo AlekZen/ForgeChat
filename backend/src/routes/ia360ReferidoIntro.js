@@ -91,6 +91,26 @@ function hasUnresolvedQuienIntroPlaceholder(text) {
   return String(text || '').includes(IA360_QUIEN_INTRO_PLACEHOLDER);
 }
 
+// G11: predicado puro "secuencia bloqueada por quien_intro". True cuando el draft
+// arrastra el placeholder {{quien_intro}} sin resolver Y el contacto NO tiene
+// quien_intro capturado. Las dos condiciones van juntas a propósito: en
+// referido_contexto el placeholder aparece exactamente cuando falta el dato
+// (ver buildReferidoContextoDraft), pero exigir ambas hace el predicado robusto
+// para cualquier secuencia y deja claro el lado "desbloqueado" (quienIntro
+// presente => false, aunque por error quedara un placeholder en el texto).
+function isSequenceBlockedByMissingQuienIntro({ draft, quienIntro } = {}) {
+  return hasUnresolvedQuienIntroPlaceholder(draft) && !String(quienIntro || '').trim();
+}
+
+// G11: mensaje accionable para el owner cuando un referido se bloquea por falta
+// de quien_intro. Le da el COMANDO EXACTO y copiable que entiende
+// parseIa360OwnerIntroCommand ("intro <contacto>: <quien presenta>") con el
+// nombre real del contacto, para que sepa qué teclear y desbloquee el envío.
+function buildIntroNeededMessage({ name } = {}) {
+  const display = String(name || '').trim() || 'este contacto';
+  return `Para enviarle a ${display} primero necesito saber quién lo presentó. Escríbeme:\n\nintro ${display}: <quién lo presentó>\n\ny te dejo el envío listo para aprobar.`;
+}
+
 module.exports = {
   IA360_QUIEN_INTRO_PLACEHOLDER,
   parseIa360OwnerIntroCommand,
@@ -99,4 +119,6 @@ module.exports = {
   buildIntroCustomFields,
   buildReferidoContextoDraft,
   hasUnresolvedQuienIntroPlaceholder,
+  isSequenceBlockedByMissingQuienIntro,
+  buildIntroNeededMessage,
 };
