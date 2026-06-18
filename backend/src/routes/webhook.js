@@ -8130,6 +8130,60 @@ async function handleIa360FlowReply(record) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TransformIA lead review — taps de la notificación de lead (ids 'lead_*') del
+// OWNER (Alek). Short-circuit ANTES del brain/funnel (handleIa360FreeText): el
+// tap ejecuta la acción de owner-review en EspoCRM vía n8n y confirma SOLO al
+// owner. Nada se envía al LEAD. Si el id no es 'lead_*' o no viene del owner, no
+// consume el evento (return false) y el flujo normal sigue intacto.
+const N8N_TRANSFORMIA_OWNER_REVIEW_URL = process.env.N8N_TRANSFORMIA_OWNER_REVIEW_URL
+  || 'https://n8n.geekstudio.dev/webhook/transformia-owner-review-v1';
+const TRANSFORMIA_LEAD_ACK = { aprobar: '✅ aprobado', no_contactar: '🚫 marcado', corregir: '✏️ anotado' };
+
+async function handleTransformIaLeadOwnerTap(record) {
+  if (!record || record.direction !== 'incoming' || !['interactive', 'button'].includes(record.message_type)) return false;
+  const replyId = getInteractiveReplyId(record);
+  if (!replyId || replyId.indexOf('lead_') !== 0) return false;
+  // Sólo el owner acciona leads. Otro número con id 'lead_' → se consume sin eco.
+  if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+    console.warn('[transformia-lead] ignored lead-prefixed reply from non-owner contact=%s id=%s', record.contact_number || '-', replyId);
+    return true;
+  }
+  // id = lead_<accion>:<request_id>  (accion ∈ aprobar | corregir | no_contactar)
+  const colon = replyId.indexOf(':');
+  const head = colon >= 0 ? replyId.slice(0, colon) : replyId;
+  const requestId = colon >= 0 ? replyId.slice(colon + 1) : '';
+  const action = head.replace(/^lead_/, '');
+  console.log('[transformia-lead] owner tap action=%s request_id=%s', action, requestId || '-');
+  let body;
+  try {
+    const res = await fetch(N8N_TRANSFORMIA_OWNER_REVIEW_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-transformia-secret': process.env.IA360_DIRECTIVE_SECRET || '' },
+      body: JSON.stringify({ request_id: requestId, action: action, owner: IA360_OWNER_NUMBER, source: 'whatsapp_button' }),
+    });
+    let r = {};
+    try { r = await res.json(); } catch (e) { r = {}; }
+    if (res.ok && r && r.ok) {
+      const base = TRANSFORMIA_LEAD_ACK[action] || 'Hecho';
+      body = r.idempotent_replay ? (base + ' (ya estaba aplicado)') : base;
+      if (r.contact_summary) body += '\n' + r.contact_summary;
+    } else {
+      const errCode = (r && r.error) ? r.error : ('http_' + res.status);
+      body = 'No pude aplicar "' + action + '" (' + errCode + '). Reintenta el botón o revisa el CRM.';
+    }
+  } catch (err) {
+    console.error('[transformia-lead] owner-review call failed:', err.message);
+    body = 'No pude registrar "' + action + '" ahora (error de red al CRM). Reintenta el botón.';
+  }
+  try {
+    await sendIa360DirectText({ record: record, toNumber: IA360_OWNER_NUMBER, label: 'transformia_lead_' + action, body: body, ownerBudget: true });
+  } catch (e) {
+    console.error('[transformia-lead] confirm send failed:', e.message);
+  }
+  return true;
+}
+
 async function handleIa360LiteInteractive(record) {
   if (!record || record.direction !== 'incoming' || !['interactive', 'button'].includes(record.message_type)) return;
   // ── HITL: rama OWNER (Alek). Va ANTES de flow-reply y del funnel: un tap del
@@ -10068,6 +10122,9 @@ router.post('/webhook/whatsapp', async (req, res) => {
               }
             }
             continue; // do not also fire fresh triggers
+          }
+          if (await handleTransformIaLeadOwnerTap(record).catch(e => { console.error('[transformia-lead] dispatch:', e.message); return false; })) {
+            continue; // tap de lead del owner: ejecutado y confirmado; NO cae al brain/funnel
           }
           await handleIa360LiteInteractive(record);
           // PASO 2 Revenue OS (calificación) — DEBE ir antes del agente genérico y
