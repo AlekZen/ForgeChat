@@ -33,6 +33,13 @@ const {
   buildVcardPersonaRows,
   detectIa360ToneConflict: detectIa360ToneConflictPure,
 } = require('./ia360PersonaSuggest');
+const {
+  buildIa360UnblockCreateDealButtonId,
+  buildIa360BlockExitMessage,
+  interpretIa360BlockExitReply,
+  IA360_BLOCKEXIT_DEAL_PIPELINE,
+  IA360_BLOCKEXIT_DEAL_STAGE,
+} = require('./ia360BlockExit');
 
 const router = Router();
 
@@ -4836,6 +4843,171 @@ async function ia360ApproveSendDeny({ record, targetContact, reason, body }) {
   });
 }
 
+// G-FIX6: ofrece la SALIDA cuando cliente_expansion (u otra requiresLiveDeal)
+// se bloquea por falta de deal vivo. Emite (1) el mensaje de bloqueo con la
+// invitación a texto libre y (2) una tarjeta con el botón «Crear el deal y
+// seguir». Marca un estado pendiente por contacto para que el SIGUIENTE texto
+// del owner se interprete como respuesta al bloqueo. Cero egress al contacto.
+async function emitIa360BlockExitOffer({ record, targetContact, name, sequence }) {
+  // Persistir deny (auditoría) + estado pendiente para rutear el texto libre.
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    tags: ['ia360-approve-send-blocked', 'ia360-block-exit-pending'],
+    customFields: {
+      ia360_approve_send_blocked_at: new Date().toISOString(),
+      ia360_approve_send_blocked_reason: 'no_live_deal',
+      ia360_block_exit_pending: { sequence_id: sequence.id, at: new Date().toISOString() },
+    },
+  }).catch(e => console.error('[ia360-blockexit] persist pending:', e.message));
+  const body = buildIa360BlockExitMessage({ name, sequenceLabel: sequence.label });
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_block_exit_offer',
+    body,
+    targetContact,
+    ownerBudget: true,
+  });
+  // Tarjeta con UN botón (límite 6/60s: un solo botón, el resto es conversación).
+  await sendOwnerInteractive({
+    record,
+    label: `owner_block_exit_card_${targetContact}_${sequence.id}`,
+    messageBody: `IA360: desbloquear secuencia para ${name}`,
+    targetContact,
+    ownerBudget: true,
+    interactive: {
+      type: 'button',
+      body: { text: `${name} no tiene deal vivo. ¿Le creo uno y sigo con la secuencia «${sequence.label}»? O respóndeme en texto qué prefieres.` },
+      action: { buttons: [
+        { type: 'reply', reply: { id: buildIa360UnblockCreateDealButtonId(targetContact, sequence.id), title: 'Crear el deal y seguir' } },
+      ] },
+    },
+  });
+}
+
+// G-FIX6 (parte 2): interpreta el TEXTO LIBRE del owner cuando responde a un
+// bloqueo de secuencia. Busca el contacto con bloqueo pendiente (más reciente
+// si hay varios) y aplica el intérprete heurístico por palabras clave. Devuelve
+// true si manejó el texto (para cortar el flujo); false si no había bloqueo
+// pendiente (el texto sigue su curso normal: canary, comandos, etc.).
+//
+// HEURÍSTICA vs PENDIENTE-DE-IA: aquí solo hay reglas de palabras clave
+// (create_deal / send_info / keep / change_persona). La interpretación rica
+// (intención libre, multi-paso) queda al owner-operator de Brain v2, que hoy es
+// stub (reply_text vacío). Ante texto que no calza ('unknown') NO adivinamos:
+// pedimos aclaración con las opciones (nunca mudo, nunca acción no pedida).
+async function handleIa360BlockExitReply(record) {
+  // Buscar el contacto con bloqueo de salida pendiente para este owner.
+  let row;
+  try {
+    const { rows } = await pool.query(
+      `SELECT contact_number, name, custom_fields
+         FROM coexistence.contacts
+        WHERE wa_number = $1
+          AND custom_fields->'ia360_block_exit_pending' IS NOT NULL
+          AND custom_fields->'ia360_block_exit_pending' <> 'null'::jsonb
+        ORDER BY (custom_fields->'ia360_block_exit_pending'->>'at') DESC NULLS LAST
+        LIMIT 1`,
+      [record.wa_number]
+    );
+    row = rows[0];
+  } catch (e) {
+    console.error('[ia360-blockexit] pending lookup failed:', e.message);
+    return false; // fail-open: el texto sigue su curso (no traga el mensaje)
+  }
+  if (!row) return false;
+  const targetContact = String(row.contact_number || '').replace(/\D/g, '');
+  const name = row.name || targetContact;
+  const pending = row.custom_fields?.ia360_block_exit_pending || {};
+  const sequenceId = pending.sequence_id;
+  const { intent } = interpretIa360BlockExitReply(record.message_body);
+
+  if (intent === 'create_deal') {
+    // Misma acción que el botón: crear el deal y re-emitir el readout.
+    await handleIa360UnblockCreateDeal({ record, targetContact, sequenceId });
+    return true;
+  }
+  if (intent === 'keep') {
+    await mergeContactIa360State({ waNumber: record.wa_number, contactNumber: targetContact,
+      tags: ['ia360-guardado'], customFields: { ia360_block_exit_pending: null } })
+      .catch(e => console.error('[ia360-blockexit] clear pending:', e.message));
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_block_exit_keep',
+      body: `Hecho: dejé a ${name} solo guardado (sin deal, sin envío). Cuando quieras retomar, vuelve a elegir su secuencia.`,
+      targetContact, ownerBudget: true });
+    return true;
+  }
+  if (intent === 'change_persona') {
+    // Reabrir la selección de persona/secuencia (mismo handler que «Cambiar»).
+    await mergeContactIa360State({ waNumber: record.wa_number, contactNumber: targetContact,
+      customFields: { ia360_block_exit_pending: null } })
+      .catch(e => console.error('[ia360-blockexit] clear pending:', e.message));
+    await handleIa360OwnerVcardChange({ record, targetContact });
+    return true;
+  }
+  if (intent === 'send_info') {
+    // No hay todavía una ruta de 'mandar info' sin deal; lo confirmamos como
+    // acción manual (pendiente de IA/owner-operator). Nunca mudo, nunca egress.
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_block_exit_sendinfo',
+      body: `Entendí que quieres mandarle info a ${name}, pero sin deal vivo no tengo una secuencia de envío que aplique. Opciones: «Crear el deal y seguir» (botón de arriba) y luego apruebas el opener, o «déjalo guardado». ¿Cuál?`,
+      targetContact, ownerBudget: true });
+    return true;
+  }
+  // unknown → pedir aclaración (no adivinar, no quedar mudo).
+  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_block_exit_unknown',
+    body: `No te entendí del todo sobre ${name}. Dime una de estas: «créale un deal», «mándale info», «déjalo guardado» o «cambiar persona». (También está el botón «Crear el deal y seguir».)`,
+    targetContact, ownerBudget: true });
+  return true;
+}
+
+// G-FIX6: tap «Crear el deal y seguir» — crea el deal faltante en el pipeline
+// por defecto (P2, stage pos 0 'open' → satisface la guardia requiresLiveDeal)
+// y RE-EMITE el readout, que esta vez pasa la guardia y muestra «Aprobar y
+// enviar». Cero egress al contacto (syncIa360Deal es solo DB; el readout va al
+// owner). Idempotente-ish: si ya hubiera deal vivo, syncIa360Deal no regresa.
+async function handleIa360UnblockCreateDeal({ record, targetContact, sequenceId }) {
+  if (!targetContact) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_unblock_missing_target', body: 'No encontré el número del contacto para crear el deal. No hice nada.' });
+    return;
+  }
+  const found = findIa360SequenceFlow(sequenceId);
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  if (!found) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_unblock_seq_unknown', body: `No reconozco la secuencia (${sequenceId}) para desbloquear a ${name}. No hice nada.`, targetContact, ownerBudget: true });
+    return;
+  }
+  const { flow, sequence } = found;
+  // Crear el deal faltante (P2, stage inicial open).
+  const deal = await syncIa360Deal({
+    record: { ...record, contact_number: targetContact, contact_name: name },
+    targetStageName: IA360_BLOCKEXIT_DEAL_STAGE,
+    titleSuffix: 'Deal creado (desbloqueo secuencia)',
+    notes: `Deal creado por el owner desde la salida de bloqueo G-FIX6 para habilitar la secuencia ${sequence.id}.`,
+    pipelineName: IA360_BLOCKEXIT_DEAL_PIPELINE,
+  }).catch(e => { console.error('[ia360-blockexit] syncIa360Deal:', e.message); return null; });
+  if (!deal) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_unblock_deal_failed', body: `No pude crear el deal para ${name} (error de base de datos). No envié nada; reintenta en un momento.`, targetContact, ownerBudget: true });
+    return;
+  }
+  // Limpiar el estado pendiente de bloqueo (ya se actuó).
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    customFields: { ia360_block_exit_pending: null },
+  }).catch(e => console.error('[ia360-blockexit] clear pending:', e.message));
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_unblock_deal_done',
+    body: `Listo: le abrí un deal a ${name} en «${IA360_BLOCKEXIT_DEAL_PIPELINE}». Ahora sí re-emito el readout de «${sequence.label}».`,
+    targetContact,
+    ownerBudget: true,
+  });
+  // Re-emitir el readout: la guardia ya pasa (hay deal vivo) → tarjeta «Aprobar y enviar».
+  await emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact });
+}
+
 async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }) {
   const deny = (reason, body) => ia360ApproveSendDeny({ record, targetContact, reason, body });
   if (!targetContact) return deny('missing_target', 'No encontré el número del contacto de esa aprobación. No envié nada.');
@@ -4936,7 +5108,14 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
       return deny('live_deal_check_failed', `No pude verificar si ${name} tiene un proyecto activo (error de base de datos). Por seguridad no envié nada; reintenta en un momento.`);
     }
     if (!liveRows.length) {
-      return deny('no_live_deal', `${name} no tiene un proyecto activo (deal vivo en P2/P7). La secuencia ${sequence.id} solo aplica a clientes con proyecto en curso; elige otra secuencia. No envié nada.`);
+      // G-FIX6: NO callejón sin salida. La guardia sigue siendo correcta (no
+      // tratar a alguien sin proyecto como cliente activo), pero en vez de
+      // terminar mudo ofrecemos (a) un botón que CREA el deal faltante y
+      // re-emite el readout desbloqueado, y (b) una invitación a responder en
+      // texto libre (se rutea al intérprete heurístico del bloqueo). Cero egress
+      // al contacto: solo tarjeta + texto al owner.
+      await emitIa360BlockExitOffer({ record, targetContact, name, sequence });
+      return;
     }
   }
 
@@ -7955,6 +8134,11 @@ async function handleIa360LiteInteractive(record) {
         await handleIa360OwnerSequenceChoice({ record, targetContact, sequenceId: ownerPipe });
         return;
       }
+      // G-FIX6: tap «Crear el deal y seguir» de la tarjeta de salida de bloqueo.
+      if (ownerAction === 'owner_unblock_create_deal') {
+        await handleIa360UnblockCreateDeal({ record, targetContact, sequenceId: ownerPipe });
+        return;
+      }
       // APPROVE-SEND: decisiones de la tarjeta de aprobación post-readout.
       if (ownerAction === 'owner_approve_send') {
         await handleIa360OwnerApproveSend({ record, targetContact, sequenceId: ownerPipe });
@@ -9714,6 +9898,17 @@ router.post('/webhook/whatsapp', async (req, res) => {
                 .catch(e => console.error('[ia360-intro] owner command error:', e.message));
               continue; // no procesar como mensaje normal
             }
+          }
+          // ── G-FIX6: respuesta del owner en TEXTO al bloqueo de secuencia ──
+          // Si el contacto tiene un bloqueo pendiente (ia360_block_exit_pending),
+          // el SIGUIENTE texto del owner se interpreta por palabras clave y se
+          // actúa o se confirma. Va ANTES del canary (el owner está en la
+          // allowlist y el canary haría continue). Nunca queda mudo.
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+            const handledBlockExit = await handleIa360BlockExitReply(record)
+              .catch(e => { console.error('[ia360-blockexit] reply error:', e.message); return false; });
+            if (handledBlockExit) continue;
           }
           // ── CANARY Brain v2 (reversible, allowlist) ──────────────────
           // Antes de TODO el pipeline del monolito: si el remitente esta en la
