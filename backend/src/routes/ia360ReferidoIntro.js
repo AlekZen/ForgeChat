@@ -122,6 +122,52 @@ function buildIntroNeededMessage({ name } = {}) {
   return `Para enviarle a ${display} primero necesito saber quién lo presentó. Escríbeme:\n\nintro ${display}: <quién lo presentó>\n\ny te dejo el envío listo para aprobar.`;
 }
 
+// ============================================================================
+// G-FIX4 (2026-06-18, decision de Alek): clasificar TONO (relacion personal) vs
+// CANAL (BNI/referido). El texto que el owner teclea tras "intro <contacto>:" o
+// que viene en una nota puede ser un NOMBRE de quien presento ("Jorge Samano")
+// o una DESCRIPCION DE RELACION ("es mi amiga y compañera"). Hoy todo se metia
+// crudo en quien_intro y el opener decia "...nos presento es mi amiga..." (caso
+// Esmeralda). Distinguimos: si es relacion, NO tocamos quien_intro; marcamos una
+// señal de relacion personal (tono_personal) para que el sistema pregunte el tono.
+// ============================================================================
+
+// Heuristica de "esto describe una RELACION, no es un nombre de introductor".
+// Corre sobre el texto crudo (case/acento-insensible vía la i + clases). Cubre
+// los modos en que Alek describe a un conocido: posesivos ("es mi", "mi "),
+// vinculos ("amig*", "compañer*", "colega", "herman*", "vecin*", "socia"),
+// confianza ("de confianza", "conozco/conocemos"), familia, cliente.
+const IA360_RELACION_PERSONAL_RE = /\b(es mi|somos|amig[oa]s?|compañer|colega|conozco|conocemos|de confianza|herman[oa]s?|familia|familiar|vecin[oa]s?|client[ae]s?|socia\b|mi\s+(amig|compañer|colega|herman|socia|client|vecin|prim[oa]|cuñad|jefe|jefa))/i;
+
+// Clasifica el texto del introductor.
+//   { kind:'relationship', value:<texto saneado> }  si describe una relacion
+//   { kind:'name',         value:<nombre saneado> }  en caso contrario
+//   { kind:'empty' }                                  si no queda nada usable
+// El saneo reusa sanitizeIntroName (control/bidi/zero-width fuera, sin llaves,
+// tope 60). Para 'relationship' devolvemos el texto saneado tal cual (es contexto,
+// no un nombre a interpolar en el opener).
+function classifyIntroIntroducer(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return { kind: 'empty' };
+  const isRelationship = IA360_RELACION_PERSONAL_RE.test(text);
+  const safe = sanitizeIntroName(text);
+  if (!safe) return { kind: 'empty' };
+  return isRelationship ? { kind: 'relationship', value: safe } : { kind: 'name', value: safe };
+}
+
+// Patch de custom_fields cuando el intro describe una RELACION PERSONAL (no un
+// introductor). NO escribe quien_intro (no hay nombre que interpolar). Marca la
+// señal de tono: ia360_relacion_personal (texto saneado) + tono_personal=true.
+// Ese flag, junto con la señal de CANAL (nombre BNI), dispara la tarjeta de tono.
+function buildRelationPersonalCustomFields({ relationText, nowIso }) {
+  return {
+    ia360_relacion_personal: relationText,
+    tono_personal: true,
+    relacion_personal_capturada_por: 'owner-comando',
+    relacion_personal_capturada_at: nowIso,
+  };
+}
+
 module.exports = {
   IA360_QUIEN_INTRO_PLACEHOLDER,
   parseIa360OwnerIntroCommand,
@@ -132,4 +178,7 @@ module.exports = {
   hasUnresolvedQuienIntroPlaceholder,
   isSequenceBlockedByMissingQuienIntro,
   buildIntroNeededMessage,
+  IA360_RELACION_PERSONAL_RE,
+  classifyIntroIntroducer,
+  buildRelationPersonalCustomFields,
 };

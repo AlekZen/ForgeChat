@@ -100,9 +100,48 @@ function buildVcardPersonaRows({ contactNumber, suggestion } = {}) {
   return rows;
 }
 
+// ============================================================================
+// G-FIX4: detector de CONFLICTO DE TONO. Un contacto puede traer a la vez una
+// señal de CANAL (BNI/referido en el nombre → persona_referido) y una señal de
+// RELACION PERSONAL (token "amig"/"beta" en el nombre, o el flag tono_personal
+// que dejó el comando "intro" cuando el owner describió una relación). Ante esa
+// doble señal NO auto-elegimos: el sistema PREGUNTA el tono (decisión de Alek).
+// Módulo PURO: estas funciones no hacen IO; webhook.js orquesta la tarjeta.
+// ============================================================================
+
+// True si el NOMBRE del vCard trae una señal de relación personal cálida
+// ("amig*" o "beta"). Corre sobre el nombre YA normalizado (sin acentos).
+function hasRelationshipSignalInName(name) {
+  const t = normalizeName(name);
+  if (!t.trim()) return false;
+  return /\bamig[oa]s?\b|\bbeta\b/.test(t);
+}
+
+// True si hay señal de CANAL referido/BNI en el nombre (misma regla que la
+// señal persona_referido de PERSONA_SIGNALS, aislada para el detector de tono).
+function hasChannelSignalInName(name) {
+  const t = normalizeName(name);
+  if (!t.trim()) return false;
+  return /\bbni\b|referid|recomend|me presento|\bintro\b/.test(t);
+}
+
+// Detecta el conflicto de tono. Recibe el nombre del vCard y, opcionalmente, el
+// flag de relación personal persistido (tono_personal, del comando intro).
+//   channel  = señal BNI/referido en el nombre
+//   personal = "amig"/"beta" en el nombre  OR  relationPersonalFlag===true
+// Devuelve { conflict, channel, personal }. conflict === true SOLO si ambas.
+function detectIa360ToneConflict({ name, relationPersonalFlag = false } = {}) {
+  const channel = hasChannelSignalInName(name);
+  const personal = hasRelationshipSignalInName(name) || relationPersonalFlag === true;
+  return { conflict: Boolean(channel && personal), channel, personal };
+}
+
 module.exports = {
   suggestIa360Persona,
   buildVcardPersonaRows,
   VCARD_PERSONA_ROWS,
   normalizeName,
+  hasRelationshipSignalInName,
+  hasChannelSignalInName,
+  detectIa360ToneConflict,
 };
