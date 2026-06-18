@@ -79,11 +79,22 @@ function buildIntroCustomFields({
   return patch;
 }
 
-// Draft del opener caliente referido_contexto. Con quienIntro arma la intro real;
-// sin el, deja el placeholder {{quien_intro}} (que hasUnresolvedIa360Placeholder
-// detecta -> copyStatus 'blocked', sin envio).
+// Draft del opener caliente referido_contexto.
+// G-FIX3b (2026-06-18, decision de Alek): 1-tap PURO para referidos. La AUSENCIA
+// de quien_intro ya NO bloquea. Dos variantes, ambas SIN placeholder sin resolver:
+//   - con quienIntro: intro personalizada que menciona quien presentó (G11 intacto).
+//   - sin quienIntro: variante natural que alude a "un contacto en común" SIN
+//     nombrar al introductor (nada de {{quien_intro}} literal), para que el readout
+//     salga directo con [Aprobar y enviar]+[Cambiar] en vez de pedir el comando intro.
+// El comando "intro <contacto>: <quien>" sigue enriqueciendo: al capturar quien_intro
+// el siguiente readout usa la variante personalizada.
 function buildReferidoContextoDraft({ name, quienIntro }) {
-  return `Hola ${name}, soy la IA de Alek. Te escribo porque nos presentó ${quienIntro || IA360_QUIEN_INTRO_PLACEHOLDER} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
+  const who = String(quienIntro || '').trim();
+  const saludo = String(name || '').trim() ? `Hola ${String(name).trim()}` : 'Hola';
+  if (who) {
+    return `${saludo}, soy la IA de Alek. Te escribo porque nos presentó ${who} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
+  }
+  return `${saludo}, soy la IA de Alek. Te escribo porque tenemos un contacto en común y, antes de proponerte nada, Alek quiere entender un poco tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
 }
 
 // True si el texto trae el placeholder de quien_intro sin resolver.
