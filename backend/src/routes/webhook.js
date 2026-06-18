@@ -3056,7 +3056,7 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_cuentame: 'Con gusto. Alek está armando IA360 (su sistema de WhatsApp + CRM con memoria) y quería que tú lo conocieras de primera mano, sin formalidades. ¿Te late que te cuente rápido de qué va?',
         },
         draft: ({ name }) => (String(name || '').trim()
-          ? `Hola ${String(name).trim()}, soy la IA de Alek. Como ya se conocen, no vengo a venderte nada: Alek solo quería que tú lo conocieras antes que nadie y saludarte por aquí. ¿Cómo has estado?`
+          ? `Hola ${String(name).trim()}, soy la IA de Alek. Como ya se conocen, no vengo a venderte nada: Alek quería que conocieras lo que está construyendo y saludarte por aquí. ¿Cómo has estado?`
           : `Hola, soy la IA de Alek. Como ya se conocen, no vengo a venderte nada: Alek solo quería saludarte por aquí y que conozcas en lo que anda. ¿Cómo has estado?`),
         metaTemplateName: null, // sin template frío: solo dentro de ventana o tras saludo
         openerOptions: {
