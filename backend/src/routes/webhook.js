@@ -2781,7 +2781,93 @@ async function reflectIa360ToEspoCrm({ record, agent, channel = 'whatsapp' }) {
   }
 }
 
+// G-FIX3 (1 TAP): al capturar un vCard, en vez de emitir 4 tarjetas en cadena
+// (Elegir persona -> Elegir secuencia -> Readout -> Aprobar), AUTO-elegimos la
+// persona sugerida (suggestIa360Persona) y la secuencia sugerida
+// (rankIa360Sequences) y saltamos DIRECTO al readout persona-first con la tarjeta
+// [Aprobar y enviar] + [Cambiar]. Sigue siendo dry-run: CERO egress al contacto;
+// la unica salida es el readout al owner. Si no hay senal de persona, o el ranker
+// no sugiere secuencia, o algo falla, caemos con gracia al flujo viejo de la lista
+// "Elegir persona" (sendIa360VcardPersonaList). NUNCA queda mudo.
 async function notifyOwnerVcardCaptured({ record, shared }) {
+  try {
+    const suggestion = suggestIa360Persona(shared);
+    const flowKey = suggestion && suggestion.persona;
+    const flow = flowKey ? IA360_PERSONA_SEQUENCE_FLOWS[flowKey] : null;
+    if (!flow) {
+      // Senal de persona nula o sin flujo mapeado -> flujo viejo de 4 tarjetas.
+      return await sendIa360VcardPersonaList({ record, shared });
+    }
+    const targetContact = String(shared.contactNumber || '').replace(/\D/g, '');
+    const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+    // Rankear secuencias por senales reales del contacto (mismo ranker que el
+    // selector). Tomamos la sugerida; si el ranker no sugiere (sin senales),
+    // tomamos la primera del catalogo de esa persona (orden de diseno).
+    const signals = await gatherIa360ContactSignals({ waNumber: record.wa_number, contactNumber: targetContact });
+    const ranking = rankIa360Sequences({ flow, signals });
+    const sequenceId = ranking.suggestedId || (flow.sequences && flow.sequences[0] && flow.sequences[0].id) || null;
+    const found = sequenceId ? findIa360SequenceFlow(sequenceId) : null;
+    if (!found) {
+      return await sendIa360VcardPersonaList({ record, shared });
+    }
+    // Persistir la clasificacion auto-sugerida para que el contexto persona quede
+    // coherente con lo que valida el approve-send (relationship_context).
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: targetContact,
+      customFields: {
+        ia360_persona_first: {
+          classification: {
+            persona_key: flowKey,
+            relationship_context: flow.relationshipContext,
+            auto_suggested: true,
+            suggested_reason: suggestion.reason,
+            at: new Date().toISOString(),
+          },
+        },
+      },
+    }).catch(e => console.error('[ia360-vcard-1tap] persist persona:', e.message));
+    // Aviso al owner de que esto fue auto-elegido y puede cambiarlo.
+    const who = shared.name || shared.contactNumber;
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: `owner_vcard_autosuggest_${targetContact}`,
+      body: `Alek, capture a ${who} (${shared.contactNumber}). Auto-elegi persona «${flow.personaContext}» (${suggestion.reason}) y la secuencia sugerida. Abajo el borrador: aprueba, o toca «Cambiar» para elegir otra persona/secuencia. Sigo en dry-run: nada sale al contacto sin tu OK.`,
+      targetContact,
+      ownerBudget: true,
+    });
+    // Saltar directo al readout + tarjeta de aprobacion, con boton "Cambiar".
+    return await emitIa360SequenceReadoutCard({
+      record,
+      targetContact,
+      flow,
+      sequence: found.sequence,
+      contact,
+      allowVcardChange: true,
+    });
+  } catch (e) {
+    console.error('[ia360-vcard-1tap] auto-suggest fallo, caigo al flujo de lista:', e.message);
+    try {
+      return await sendIa360VcardPersonaList({ record, shared });
+    } catch (e2) {
+      console.error('[ia360-vcard-1tap] lista fallback tambien fallo:', e2.message);
+      // Nunca mudo: un acuse minimo al owner.
+      return sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_vcard_capture_error',
+        body: `Alek, capture el contacto ${shared && shared.contactNumber || ''} pero no pude armar la tarjeta de clasificacion. Revisalo manual.`,
+        ownerBudget: true,
+      });
+    }
+  }
+}
+
+// Flujo VIEJO (4 tarjetas): lista "Elegir persona". Antes era el cuerpo de
+// notifyOwnerVcardCaptured; ahora es el fallback del 1-tap y lo que reabre el
+// boton "Cambiar" (handleIa360OwnerVcardChange).
+async function sendIa360VcardPersonaList({ record, shared }) {
   const who = shared.name || shared.contactNumber;
   // G13: igual que las SECUENCIAS ya se rankean y marcan "Sugerida", aquí sugerimos
   // la PERSONA probable a partir del nombre del vCard. La fila sugerida sube al tope
@@ -2813,6 +2899,24 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
       },
     },
   });
+}
+
+// G-FIX3: reabrir el flujo VIEJO de seleccion (lista "Elegir persona") cuando el
+// owner toca "Cambiar" en el readout 1-tap. Reconstruye `shared` desde la ficha
+// del contacto (nombre + numero) y reusa sendIa360VcardPersonaList. NUNCA mudo:
+// si no encuentra la ficha, igual reabre la lista con el numero crudo.
+async function handleIa360OwnerVcardChange({ record, targetContact }) {
+  const num = String(targetContact || '').replace(/\D/g, '');
+  if (!num) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_vcard_change_missing', body: 'No encontre el numero del contacto para reabrir la seleccion. No envie nada.' });
+    return;
+  }
+  let name = num;
+  try {
+    const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: num });
+    if (contact && contact.name) name = contact.name;
+  } catch (e) { console.error('[ia360-vcard-change] load contact:', e.message); }
+  await sendIa360VcardPersonaList({ record, shared: { name, contactNumber: num } });
 }
 
 const IA360_PERSONA_SEQUENCE_FLOWS = {
@@ -4436,7 +4540,7 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
 // duplicar el bloque. `record` llega tal cual del inbound del owner (su
 // contact_number = owner); el callsite Fit re-scopea internamente al
 // targetContact. `contact` es la ficha ya cargada (loadIa360ContactForOwnerAction).
-async function emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact }) {
+async function emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact, allowVcardChange = false }) {
   const name = contact?.name || targetContact;
   const payload = buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction: 'sequence_selected' });
   let readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
@@ -4533,7 +4637,7 @@ async function emitIa360SequenceReadoutCard({ record, targetContact, flow, seque
   // que la tarjeta de cancelación). Solo si el payload realmente requiere
   // aprobación humana (no para solo_guardar / no_contactar / copy bloqueado).
   if (payload.approval.status === 'requires_alek' && payload.sequence_candidate.copy_status !== 'blocked') {
-    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked, coldNotice });
+    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked, coldNotice, allowVcardChange });
   }
 }
 
@@ -4551,7 +4655,7 @@ function ia360ApproveSendAllowlist() {
     .filter(Boolean);
 }
 
-async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked = false, coldNotice = null }) {
+async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked = false, coldNotice = null, allowVcardChange = false }) {
   // G-COLD: con coldNotice el owner ve en la tarjeta cómo saldría el opener (o
   // por qué no puede salir); con coldBlocked se RETIRA la fila "Aprobar y
   // enviar" — el owner jamás debe poder aprobar algo imposible.
@@ -4564,6 +4668,9 @@ async function sendIa360ApproveCard({ record, targetContact, name, flow, sequenc
     { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar', description: 'Captura sin envío ni secuencia' },
     { id: `owner_approve_dnc:${targetContact}:${sequence.id}`, title: 'No contactar', description: 'Exclusión operativa, sin envío' },
     { id: `owner_approve_manual:${targetContact}:${sequence.id}`, title: 'Tomar manual', description: 'Tú le escribes; muevo el deal a Requiere Alek' },
+    // G-FIX3: en el flujo 1-tap desde vCard, "Cambiar" reabre la lista "Elegir
+    // persona" (flujo viejo) para corregir la persona/secuencia auto-sugerida.
+    ...(allowVcardChange ? [{ id: `owner_vcard_change:${targetContact}`, title: 'Cambiar', description: 'Elegir otra persona/secuencia (reabre la selección)' }] : []),
   ];
   return sendOwnerInteractive({
     record,
@@ -7657,6 +7764,11 @@ async function handleIa360LiteInteractive(record) {
       }
       if (ownerAction === 'owner_vnone') {
         await handleIa360OwnerVaultNone({ record, targetContact });
+        return;
+      }
+      // G-FIX3: "Cambiar" desde el readout 1-tap -> reabre la lista "Elegir persona".
+      if (ownerAction === 'owner_vcard_change') {
+        await handleIa360OwnerVcardChange({ record, targetContact });
         return;
       }
       if (ownerAction === 'owner_pipe') {
