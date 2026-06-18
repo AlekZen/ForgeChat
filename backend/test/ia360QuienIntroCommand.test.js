@@ -196,13 +196,17 @@ test('E2E efecto: con quien_intro tecleado, FRIO no deny y CALIENTE no placehold
   ]);
   const record = { wa_number: BOT, contact_number: OWNER, message_type: 'text' };
 
-  // ── ANTES de teclear: ambos caminos bloqueados ──
+  // ── ANTES de teclear ──
+  // G-FIX3b (2026-06-18): el camino CALIENTE ya NO se bloquea sin quien_intro
+  // (1-tap puro: variante natural sin placeholder). El camino FRIO (template Meta
+  // {{2}}) SIGUE exigiendo el dato, por restricción de la plantilla aprobada.
   const before = store.get(BOT, REFERIDO);
   const coldBefore = coldReferidoGate(before);
   const hotBefore = hotReferidoDraft(before, 'Carlos');
-  assert.equal(coldBefore.deny, 'cold_send_missing_quien_intro', 'frio: sin dato => deny');
-  assert.equal(hotBefore.blocked, true, 'caliente: sin dato => placeholder => blocked');
-  assert.ok(hotBefore.draft.includes(IA360_QUIEN_INTRO_PLACEHOLDER), 'el draft trae el placeholder crudo');
+  assert.equal(coldBefore.deny, 'cold_send_missing_quien_intro', 'frio: sin dato => deny (template Meta)');
+  assert.equal(hotBefore.blocked, false, 'caliente: sin dato => NO blocked (1-tap directo)');
+  assert.ok(!hotBefore.draft.includes(IA360_QUIEN_INTRO_PLACEHOLDER), 'el draft caliente NO trae placeholder');
+  assert.ok(hotBefore.draft.includes('contacto en común'), 'usa la variante natural sin mencionar al introductor');
 
   // ── El owner teclea la intro ──
   const parsed = parseIa360OwnerIntroCommand(`intro Carlos Sandbox: ${ALIADO_NOMBRE}`);

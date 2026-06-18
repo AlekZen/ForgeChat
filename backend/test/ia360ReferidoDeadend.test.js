@@ -57,15 +57,18 @@ test('Parte A: sin nombre cae a un genérico seguro, nunca "undefined:"', () => 
 
 // ── Predicado "secuencia bloqueada por quien_intro" — ambos lados ───────────
 
-test('predicado: draft con {{quien_intro}} y sin dato => bloqueado (true)', () => {
+// G-FIX3b (2026-06-18, decision de Alek): 1-tap PURO. El referido SIN quien_intro
+// ya NO se bloquea: el draft usa una variante natural SIN el placeholder.
+test('predicado: draft sin dato => variante natural SIN placeholder y NO bloqueado', () => {
   const draft = buildReferidoContextoDraft({ name: 'Carlos', quienIntro: null });
-  assert.ok(draft.includes(IA360_QUIEN_INTRO_PLACEHOLDER), 'sanity: el draft trae el placeholder');
+  assert.ok(!draft.includes(IA360_QUIEN_INTRO_PLACEHOLDER), 'el draft sin dato NO trae el placeholder');
+  assert.ok(draft.includes('contacto en común'), 'la variante sin dato alude a un contacto en común');
   assert.equal(
-    isSequenceBlockedByMissingQuienIntro({ draft, quienIntro: null }), true,
-    'placeholder + quien_intro ausente => bloqueado');
+    isSequenceBlockedByMissingQuienIntro({ draft, quienIntro: null }), false,
+    'sin placeholder => NO bloqueado (1-tap directo)');
   assert.equal(
-    isSequenceBlockedByMissingQuienIntro({ draft, quienIntro: '   ' }), true,
-    'quien_intro en blanco cuenta como ausente');
+    isSequenceBlockedByMissingQuienIntro({ draft, quienIntro: '   ' }), false,
+    'quien_intro en blanco tampoco bloquea (no hay placeholder)');
 });
 
 test('predicado: con quien_intro presente o sin placeholder => NO bloqueado (false)', () => {
@@ -97,14 +100,20 @@ function readoutWithIntroHint({ name, quienIntro }) {
   return readout;
 }
 
-test('integración A: referido bloqueado => readout trae el comando; no bloqueado => NO lo trae', () => {
-  const blocked = readoutWithIntroHint({ name: 'Carlos Chávez', quienIntro: null });
-  assert.ok(blocked.includes('intro Carlos Chávez:'),
-    'el referido bloqueado recibe el comando accionable en el readout');
+// G-FIX3b: con o sin quien_intro, el readout del referido NUNCA pide el comando intro
+// (1-tap directo). El comando sigue existiendo para enriquecer opcionalmente.
+test('integración A: referido (con o sin quien_intro) => readout NUNCA pide el comando intro', () => {
+  const sinDato = readoutWithIntroHint({ name: 'Carlos Chávez', quienIntro: null });
+  assert.ok(!sinDato.includes('intro Carlos Chávez:'),
+    'sin quien_intro el readout sale directo (1-tap), no pide el comando');
+  assert.ok(sinDato.includes('contacto en común'),
+    'sin dato usa la variante natural sin placeholder');
 
   const clear = readoutWithIntroHint({ name: 'Carlos Chávez', quienIntro: 'Juan Pérez' });
   assert.ok(!clear.includes('intro Carlos Chávez:'),
-    'un contacto con quien_intro NO recibe el mensaje (no cambia su readout)');
+    'con quien_intro tampoco pide el comando; el opener queda personalizado');
+  assert.ok(clear.includes('nos presentó Juan Pérez'),
+    'con dato el opener menciona a quien presentó (enriquecimiento G11)');
 });
 
 // ── Parte B (cableado afirmado contra webhook.js) ───────────────────────────
