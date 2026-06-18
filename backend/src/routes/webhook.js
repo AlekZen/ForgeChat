@@ -9682,20 +9682,36 @@ async function handleBrainV2Canary(record) {
   }
   const isOwnerDirect = normalizePhone(record.contact_number) === IA360_OWNER_NUMBER && !forceActor;
   if (isOwnerDirect) {
+    // F1 OOA en n8n: el texto libre del owner que no calzo un comando rigido se
+    // enruta al AI Agent del Brain v2 (rama owner, force_actor=owner) con tools
+    // internas (query_memory/record_fact/capture_idea). Si n8n falla, timeout o
+    // devuelve vacio -> FALLBACK al menu de comandos (nunca queda mudo).
+    const ownerOperatorMenu = [
+      'Te leo como owner. Brain v2 sigue en canary, pero ya no te voy a mandar el error genérico.',
+      '',
+      'Comandos útiles:',
+      '- `/sim <mensaje>` para probar cómo respondería a un contacto.',
+      '- `idea: <texto>` para mandar algo a la bandeja de ideas.',
+      '- `qué sabes de <nombre|número>` para consultar memoria.',
+      '- `sincroniza a <nombre|número>` para vincular notas del vault.',
+      '- `intro <contacto>: <quién presenta>` para teclear la intro de un referido.'
+    ].join('\n');
+    let ooaReply = '';
+    try {
+      const ooaOut = await callBrainV2({ contactWaNumber: record.contact_number, message, forceActor: 'owner' });
+      if (ooaOut && (ooaOut.branch === 'owner_operator' || ooaOut.actor_type === 'owner')) {
+        ooaReply = String(ooaOut.reply_text || '').trim();
+      } else if (ooaOut) {
+        console.warn('[ooa] respuesta inesperada branch=%s actor=%s', ooaOut.branch, ooaOut.actor_type);
+      }
+    } catch (ooaErr) {
+      console.error('[ooa] callBrainV2 error:', ooaErr && ooaErr.message);
+    }
     await sendIa360DirectText({
       record,
       toNumber: IA360_OWNER_NUMBER,
-      label: 'brainv2_owner_operator_local',
-      body: [
-        'Te leo como owner. Brain v2 sigue en canary, pero ya no te voy a mandar el error genérico.',
-        '',
-        'Comandos útiles:',
-        '- `/sim <mensaje>` para probar cómo respondería a un contacto.',
-        '- `idea: <texto>` para mandar algo a la bandeja de ideas.',
-        '- `qué sabes de <nombre|número>` para consultar memoria.',
-        '- `sincroniza a <nombre|número>` para vincular notas del vault.',
-        '- `intro <contacto>: <quién presenta>` para teclear la intro de un referido.'
-      ].join('\n')
+      label: ooaReply ? 'ooa_owner_operator' : 'brainv2_owner_operator_local',
+      body: ooaReply || ownerOperatorMenu
     });
     return;
   }
