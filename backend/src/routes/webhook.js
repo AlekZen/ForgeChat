@@ -34,6 +34,9 @@ const {
   detectIa360ToneConflict: detectIa360ToneConflictPure,
 } = require('./ia360PersonaSuggest');
 const {
+  buildVcardQuickRows,
+} = require('./ia360VcardQuickOptions');
+const {
   buildIa360UnblockCreateDealButtonId,
   buildIa360BlockExitMessage,
   interpretIa360BlockExitReply,
@@ -2818,8 +2821,10 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
     const flowKey = suggestion && suggestion.persona;
     const flow = flowKey ? IA360_PERSONA_SEQUENCE_FLOWS[flowKey] : null;
     if (!flow) {
-      // Senal de persona nula o sin flujo mapeado -> flujo viejo de 4 tarjetas.
-      return await sendIa360VcardPersonaList({ record, shared });
+      // G-FIX5: senal de persona nula -> en vez de la lista de 10, una tarjeta
+      // CORTA con 4 opciones rapidas + "Ver todas las personas...". El fallback
+      // viejo (sendIa360VcardPersonaList) sigue vivo detras de "Ver todas".
+      return await sendIa360VcardQuickList({ record, shared });
     }
     const targetContact = String(shared.contactNumber || '').replace(/\D/g, '');
     const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
@@ -2960,6 +2965,50 @@ async function handleIa360OwnerToneChoice({ record, targetContact, tone }) {
     contact,
     allowVcardChange: true,
   });
+}
+
+// G-FIX5: tarjeta CORTA de captura de vCard cuando el contacto NO trae una
+// senal de persona (antes caia directo a la lista de 10). Muestra 4 opciones
+// rapidas + una 5a fila "Ver todas las personas..." que reabre la lista completa
+// (sendIa360VcardPersonaList via handler owner_vcard_seeall). Reusa los MISMOS
+// ids owner_pipe:<num>:<key> que la lista de 10, asi que cada tap rutea a la
+// misma logica (handleIa360OwnerPipelineChoice). MISMO label owner_vcard_captured_
+// <num> para que la validacion de contexto del dispatch owner_pipe pase. NUNCA
+// mudo: si algo falla, cae a la lista completa.
+async function sendIa360VcardQuickList({ record, shared }) {
+  try {
+    const who = shared.name || shared.contactNumber;
+    const rows = buildVcardQuickRows({ contactNumber: shared.contactNumber });
+    const body = `Alek, recibi un contacto compartido por WhatsApp y ya lo deje capturado.
+
+Nombre: ${who}
+WhatsApp: ${shared.contactNumber}
+
+No le lei una senal clara en el nombre. Clasificalo rapido con una de estas opciones, o abre la lista completa. En esta etapa NO envio nada al contacto; solo guardo contexto.`;
+    return await sendOwnerInteractive({
+      record,
+      label: `owner_vcard_captured_${shared.contactNumber}`,
+      messageBody: `IA360: vCard ${who}`,
+      targetContact: shared.contactNumber,
+      ownerBudget: true,
+      interactive: {
+        type: 'list',
+        header: { type: 'text', text: 'Contacto capturado' },
+        body: { text: body },
+        footer: { text: 'Opciones rapidas; "Ver todas" abre la lista completa' },
+        action: {
+          button: 'Clasificar',
+          sections: [{
+            title: 'Opciones rapidas',
+            rows,
+          }],
+        },
+      },
+    });
+  } catch (e) {
+    console.error('[ia360-vcard-quick] tarjeta corta fallo, caigo a la lista completa:', e.message);
+    return sendIa360VcardPersonaList({ record, shared });
+  }
 }
 
 // Flujo VIEJO (4 tarjetas): lista "Elegir persona". Antes era el cuerpo de
@@ -8114,6 +8163,12 @@ async function handleIa360LiteInteractive(record) {
       }
       // G-FIX3: "Cambiar" desde el readout 1-tap -> reabre la lista "Elegir persona".
       if (ownerAction === 'owner_vcard_change') {
+        await handleIa360OwnerVcardChange({ record, targetContact });
+        return;
+      }
+      // G-FIX5: "Ver todas las personas..." desde la tarjeta corta -> reabre la
+      // lista completa de 10 (mismo fallback de siempre).
+      if (ownerAction === 'owner_vcard_seeall') {
         await handleIa360OwnerVcardChange({ record, targetContact });
         return;
       }
