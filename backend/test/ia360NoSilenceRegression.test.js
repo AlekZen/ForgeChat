@@ -106,15 +106,16 @@ test('datos vivos del portal: handoff explícito, nunca inventar listas', () => 
   assert.match(handoffBlock, /alreadyResponded: sentHandoff === true/);
 });
 
-test('owner directo en Brain v2 canary no responde holding generico', () => {
+test('owner directo en Brain v2 canary enruta al OOA con fallback a menu (nunca mudo)', () => {
   const handlerStart = src.indexOf('async function handleBrainV2Canary(record)');
   assert.notEqual(handlerStart, -1, 'falta handleBrainV2Canary');
   const handlerEnd = src.indexOf('// G-LIVE QA-GUARD', handlerStart);
   const handler = src.slice(handlerStart, handlerEnd);
-  assert.match(handler, /isOwnerDirect/, 'la ruta owner directa debe estar explícita');
-  assert.match(handler, /brainv2_owner_operator_local/, 'owner directo debe recibir respuesta operativa local');
-  assert.ok(
-    handler.indexOf('brainv2_owner_operator_local') < handler.indexOf('callBrainV2'),
-    'owner directo no debe depender del workflow Brain v2 incompleto'
-  );
+  assert.match(handler, /isOwnerDirect/, 'la ruta owner directa debe estar explicita');
+  // F1 OOA: el owner ahora SI se enruta al Brain v2 con force_actor owner...
+  const ownerBlock = handler.slice(handler.indexOf('if (isOwnerDirect)'));
+  assert.match(ownerBlock, /callBrainV2\([^)]*forceActor:\s*'owner'/, 'owner directo debe llamar callBrainV2 con force_actor owner');
+  // ...pero el menu local sigue presente como FALLBACK para nunca quedar mudo.
+  assert.match(ownerBlock, /brainv2_owner_operator_local/, 'debe conservar el menu local como fallback');
+  assert.match(ownerBlock, /ooaReply\s*\|\|\s*ownerOperatorMenu/, 'el cuerpo debe caer al menu si el OOA no responde');
 });
