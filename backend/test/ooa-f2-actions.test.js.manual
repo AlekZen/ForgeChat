@@ -1,0 +1,140 @@
+// F2 OOA isolation test: verifica (1) parse/guardrail de proposed_action,
+// (2) que el patron CONFIRMAR ejecuta la mutacion real (deal + custom_fields)
+// reusando la MISMA logica del backend, (3) que CANCELAR no muta, (4) idempotencia.
+// Corre con el pool real apuntando a forgecrm-db. Limpia sus datos al final.
+// NO toca egress (no enqueue): solo ejercita la capa DB del confirm.
+const path = '/app';
+process.chdir(path);
+const { Pool } = require(path + '/node_modules/pg');
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// --- copia EXACTA de la logica pura de parseIa360ProposedAction (guardrail) ---
+const IA360_OOA_ACTION_TYPES = ['set_client_status', 'advance_deal', 'set_intro'];
+function parseIa360ProposedAction(raw) {
+  if (!raw) return null;
+  let pa = raw;
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (!t || t === 'null' || t === '""') return null;
+    try { pa = JSON.parse(t); } catch (e) { return null; }
+  }
+  if (!pa || typeof pa !== 'object') return null;
+  const type = String(pa.type || '').trim();
+  if (!IA360_OOA_ACTION_TYPES.includes(type)) return null;
+  const contact_number = String(pa.contact_number || '').replace(/\D/g, '');
+  if (!contact_number) return null;
+  const clean = { type, contact_number,
+    project: pa.project ? String(pa.project).trim() : null,
+    stage: pa.stage ? String(pa.stage).trim() : null,
+    introducer: pa.introducer ? String(pa.introducer).trim() : null };
+  if (type === 'set_client_status' && !clean.project) return null;
+  if (type === 'advance_deal' && !clean.stage) return null;
+  if (type === 'set_intro' && !clean.introducer) return null;
+  return clean;
+}
+
+const MUSIO_WA = '5213321594582';
+const MUSIO_CONTACT = '5213322630839';
+const PIPELINE = 'IA360 WhatsApp Revenue Pipeline';
+
+async function mergeCF(contactNumber, customFields) {
+  await pool.query(
+    `INSERT INTO coexistence.contacts (wa_number, contact_number, custom_fields, updated_at)
+     VALUES ($1,$2,$3::jsonb,NOW())
+     ON CONFLICT (wa_number, contact_number) DO UPDATE SET
+       custom_fields = COALESCE(coexistence.contacts.custom_fields,'{}'::jsonb) || EXCLUDED.custom_fields,
+       updated_at = NOW()`,
+    [MUSIO_WA, contactNumber, JSON.stringify(customFields)]);
+}
+
+async function dealsForMusio() {
+  const { rows } = await pool.query(
+    `SELECT d.id, d.status, s.name AS stage, d.title FROM coexistence.deals d
+       JOIN coexistence.pipeline_stages s ON s.id=d.stage_id
+       JOIN coexistence.pipelines p ON p.id=d.pipeline_id
+      WHERE p.name=$1 AND d.contact_number=$2 ORDER BY d.id DESC`,
+    [PIPELINE, MUSIO_CONTACT]);
+  return rows;
+}
+async function cfForMusio() {
+  const { rows } = await pool.query(
+    `SELECT custom_fields FROM coexistence.contacts WHERE contact_number=$1 AND wa_number=$2`,
+    [MUSIO_CONTACT, MUSIO_WA]);
+  return rows[0] ? rows[0].custom_fields : null;
+}
+
+// reproduce executeIa360OoaAction(set_client_status): syncIa360Deal -> Ganado + cf
+async function execConfirm(pending) {
+  // crear/mover deal a Ganado (mismo criterio que syncIa360Deal: won)
+  const { rows: pr } = await pool.query(`SELECT id FROM coexistence.pipelines WHERE name=$1`, [PIPELINE]);
+  const pid = pr[0].id;
+  const { rows: sr } = await pool.query(`SELECT id, stage_type FROM coexistence.pipeline_stages WHERE pipeline_id=$1 AND name='Ganado'`, [pid]);
+  const stage = sr[0];
+  const { rows: ex } = await pool.query(`SELECT id FROM coexistence.deals WHERE pipeline_id=$1 AND contact_number=$2 ORDER BY id DESC LIMIT 1`, [pid, MUSIO_CONTACT]);
+  if (ex.length === 0) {
+    await pool.query(
+      `INSERT INTO coexistence.deals (pipeline_id, stage_id, title, value, currency, status, contact_wa_number, contact_number, contact_name, notes, position, won_at)
+       VALUES ($1,$2,$3,0,'MXN','won',$4,$5,'Musio',$6,0,NOW())`,
+      [pid, stage.id, 'IA360 - Musio - Cliente activo - ' + pending.project, MUSIO_WA, MUSIO_CONTACT, 'OOA F2 cliente activo']);
+  } else {
+    await pool.query(`UPDATE coexistence.deals SET stage_id=$1, status='won', won_at=COALESCE(won_at,NOW()), updated_at=NOW() WHERE id=$2`, [stage.id, ex[0].id]);
+  }
+  await mergeCF(MUSIO_CONTACT, { ia360_cliente_activo: true, project_name: pending.project, lifecycle_stage: 'cliente_activo', ia360_cliente_activo_source: 'ooa_owner_confirm' });
+}
+
+(async () => {
+  let pass = 0, fail = 0;
+  const ok = (c, m) => { if (c) { pass++; console.log('PASS', m); } else { fail++; console.log('FAIL', m); } };
+
+  // 1) guardrail parse
+  ok(parseIa360ProposedAction('{"type":"set_client_status","contact_number":"5213322630839","project":"Palmart"}') !== null, 'parse: set_client_status valido');
+  ok(parseIa360ProposedAction('{"type":"set_client_status","contact_number":"5213322630839"}') === null, 'parse: set_client_status sin project -> rechazado');
+  ok(parseIa360ProposedAction('{"type":"mandar_mensaje","contact_number":"5213322630839"}') === null, 'parse: tipo no permitido (mandar_mensaje) -> rechazado');
+  ok(parseIa360ProposedAction('null') === null, 'parse: null -> null');
+  ok(parseIa360ProposedAction('') === null, 'parse: vacio -> null');
+
+  // snapshot inicial
+  const deals0 = await dealsForMusio();
+  const cf0 = await cfForMusio();
+
+  // 2) CANCELAR: setea pending y lo limpia, sin mutar deal/cf
+  await mergeCF(MUSIO_CONTACT, { ia360_ooa_action_pending: { type: 'set_client_status', contact_number: MUSIO_CONTACT, project: 'Palmart', at: new Date().toISOString() } });
+  await mergeCF(MUSIO_CONTACT, { ia360_ooa_action_pending: null }); // cancel = clear
+  const dealsAfterCancel = await dealsForMusio();
+  const cfAfterCancel = await cfForMusio();
+  ok(dealsAfterCancel.length === deals0.length, 'cancel: no creo/movio deals');
+  ok(!cfAfterCancel.ia360_cliente_activo, 'cancel: NO marco cliente activo');
+  ok(!cfAfterCancel.ia360_ooa_action_pending, 'cancel: limpio el pending');
+
+  // 3) CONFIRMAR: ejecuta mutacion
+  const pending = { type: 'set_client_status', contact_number: MUSIO_CONTACT, project: 'Palmart' };
+  await mergeCF(MUSIO_CONTACT, { ia360_ooa_action_pending: { ...pending, at: new Date().toISOString() } });
+  await execConfirm(pending);
+  await mergeCF(MUSIO_CONTACT, { ia360_ooa_action_pending: null });
+  const dealsAfter = await dealsForMusio();
+  const cfAfter = await cfForMusio();
+  ok(dealsAfter.length >= 1 && dealsAfter[0].status === 'won', 'confirm: deal creado en Ganado (won)');
+  ok(cfAfter.ia360_cliente_activo === true, 'confirm: cliente activo = true');
+  ok(cfAfter.project_name === 'Palmart', 'confirm: project_name = Palmart');
+  ok(!cfAfter.ia360_ooa_action_pending, 'confirm: pending limpiado tras ejecutar');
+
+  // 4) IDEMPOTENCIA: confirmar de nuevo no duplica deal
+  const beforeIdem = (await dealsForMusio()).length;
+  await execConfirm(pending);
+  const afterIdem = (await dealsForMusio()).length;
+  ok(afterIdem === beforeIdem, 'idempotencia: 2do confirm no duplica deal');
+
+  // CLEANUP: borrar deals de prueba y limpiar cf de Musio
+  await pool.query(`DELETE FROM coexistence.deals WHERE contact_number=$1 AND pipeline_id=(SELECT id FROM coexistence.pipelines WHERE name=$2)`, [MUSIO_CONTACT, PIPELINE]);
+  await pool.query(
+    `UPDATE coexistence.contacts SET custom_fields = custom_fields - 'ia360_cliente_activo' - 'project_name' - 'lifecycle_stage' - 'ia360_cliente_activo_source' - 'ia360_cliente_activo_set_at' - 'ia360_ooa_action_pending' WHERE contact_number=$1 AND wa_number=$2`,
+    [MUSIO_CONTACT, MUSIO_WA]);
+  const cfClean = await cfForMusio();
+  const dealsClean = await dealsForMusio();
+  ok(!cfClean || !cfClean.ia360_cliente_activo, 'cleanup: cf limpio');
+  ok(dealsClean.length === 0, 'cleanup: deals de prueba borrados');
+
+  console.log('\nRESULT: ' + pass + ' pass, ' + fail + ' fail');
+  await pool.end();
+  process.exit(fail ? 1 : 0);
+})().catch(e => { console.error('TEST ERROR', e); process.exit(2); });

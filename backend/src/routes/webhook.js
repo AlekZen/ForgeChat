@@ -8248,6 +8248,15 @@ async function handleIa360LiteInteractive(record) {
         await handleIa360UnblockCreateDeal({ record, targetContact, sequenceId: ownerPipe });
         return;
       }
+      // F2 OOA: tarjeta de confirmacion de accion de estado propuesta por el agente.
+      if (ownerAction === 'owner_ooa_confirm') {
+        await handleIa360OoaConfirm({ record, targetContact });
+        return;
+      }
+      if (ownerAction === 'owner_ooa_cancel') {
+        await handleIa360OoaCancel({ record, targetContact });
+        return;
+      }
       // APPROVE-SEND: decisiones de la tarjeta de aprobación post-readout.
       if (ownerAction === 'owner_approve_send') {
         await handleIa360OwnerApproveSend({ record, targetContact, sequenceId: ownerPipe });
@@ -9721,6 +9730,169 @@ async function callBrainV2({ contactWaNumber, message, forceActor }) {
   }
 }
 
+// --- F2 OOA: acciones de estado con CONFIRMACION (propuesta -> tap -> ejecuta) ---
+// El Owner Operator Agent (n8n) NUNCA muta estado: PROPONE (proposed_action) y el
+// backend emite una tarjeta [Confirmar] [Cancelar]. La accion real solo corre con
+// el tap Confirmar. La propuesta se guarda en custom_fields del contacto destino
+// (ia360_ooa_action_pending) para no exceder el largo del id del boton ni romper
+// con proyectos que contengan ':'. Cero egress a contactos.
+const IA360_OOA_ACTION_TYPES = ['set_client_status', 'advance_deal', 'set_intro'];
+const IA360_OOA_DEFAULT_PIPELINE = 'IA360 WhatsApp Revenue Pipeline';
+
+function parseIa360ProposedAction(raw) {
+  if (!raw) return null;
+  let pa = raw;
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (!t || t === 'null' || t === '""') return null;
+    try { pa = JSON.parse(t); } catch (e) { console.warn('[ooa-action] proposed_action no parseable:', e.message); return null; }
+  }
+  if (!pa || typeof pa !== 'object') return null;
+  const type = String(pa.type || '').trim();
+  if (!IA360_OOA_ACTION_TYPES.includes(type)) { console.warn('[ooa-action] tipo no soportado: %s', type); return null; }
+  const contact_number = String(pa.contact_number || '').replace(/\D/g, '');
+  if (!contact_number) { console.warn('[ooa-action] sin contact_number'); return null; }
+  const clean = {
+    type,
+    contact_number,
+    contact_name: pa.contact_name ? String(pa.contact_name).trim() : null,
+    project: pa.project ? String(pa.project).trim() : null,
+    stage: pa.stage ? String(pa.stage).trim() : null,
+    introducer: pa.introducer ? String(pa.introducer).trim() : null,
+    note: pa.note ? String(pa.note).trim() : null,
+  };
+  if (type === 'set_client_status' && !clean.project) { console.warn('[ooa-action] set_client_status sin project'); return null; }
+  if (type === 'advance_deal' && !clean.stage) { console.warn('[ooa-action] advance_deal sin stage'); return null; }
+  if (type === 'set_intro' && !clean.introducer) { console.warn('[ooa-action] set_intro sin introducer'); return null; }
+  return clean;
+}
+
+function describeIa360OoaAction(p) {
+  const who = p.contact_name ? (p.contact_name + ' (' + p.contact_number + ')') : p.contact_number;
+  if (p.type === 'set_client_status') return 'Marcar a ' + who + ' como CLIENTE ACTIVO y asignar el proyecto "' + p.project + '".';
+  if (p.type === 'advance_deal') return 'Mover el deal de ' + who + ' a la etapa "' + p.stage + '".';
+  if (p.type === 'set_intro') return 'Registrar que a ' + who + ' lo presento "' + p.introducer + '".';
+  return 'Accion ' + p.type + ' sobre ' + who + '.';
+}
+
+async function sendIa360OoaActionCard({ record, proposal, replyText }) {
+  const targetContact = proposal.contact_number;
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    customFields: { ia360_ooa_action_pending: { ...proposal, at: new Date().toISOString() } },
+  });
+  let bodyText = (replyText ? replyText + '\n\n' : '') + 'Voy a: ' + describeIa360OoaAction(proposal) + '\n\nNada se ejecuta hasta que toques Confirmar.';
+  if (bodyText.length > 1024) bodyText = compactForWhatsApp(bodyText, 1024);
+  await sendOwnerInteractive({
+    record,
+    label: 'owner_ooa_action_' + proposal.type + '_' + targetContact,
+    messageBody: 'IA360: confirmar accion (' + proposal.type + ') sobre ' + (proposal.contact_name || targetContact),
+    targetContact,
+    ownerBudget: true,
+    interactive: {
+      type: 'button',
+      body: { text: bodyText },
+      action: { buttons: [
+        { type: 'reply', reply: { id: 'owner_ooa_confirm:' + targetContact, title: 'Confirmar' } },
+        { type: 'reply', reply: { id: 'owner_ooa_cancel:' + targetContact, title: 'Cancelar' } },
+      ] },
+    },
+  });
+  return true;
+}
+
+async function loadIa360OoaPending(targetContact) {
+  const num = String(targetContact || '').replace(/\D/g, '');
+  if (!num) return null;
+  const { rows } = await pool.query(
+    "SELECT wa_number, contact_number, COALESCE(name, profile_name) AS name, custom_fields\n       FROM coexistence.contacts\n      WHERE contact_number = $1\n        AND custom_fields->'ia360_ooa_action_pending' IS NOT NULL\n        AND custom_fields->'ia360_ooa_action_pending' <> 'null'::jsonb\n      ORDER BY updated_at DESC NULLS LAST\n      LIMIT 1",
+    [num]
+  );
+  return rows[0] || null;
+}
+
+async function clearIa360OoaPending({ waNumber, contactNumber }) {
+  await mergeContactIa360State({ waNumber, contactNumber, customFields: { ia360_ooa_action_pending: null } })
+    .catch(e => console.error('[ooa-action] clear pending:', e.message));
+}
+
+async function executeIa360OoaAction({ record, pending, row }) {
+  const waNumber = row.wa_number || record.wa_number;
+  const targetContact = String(pending.contact_number || '').replace(/\D/g, '');
+  const name = pending.contact_name || row.name || targetContact;
+  const dealRecord = { wa_number: waNumber, contact_number: targetContact, contact_name: name, message_body: '' };
+
+  if (pending.type === 'set_client_status') {
+    const deal = await syncIa360Deal({
+      record: dealRecord,
+      targetStageName: 'Ganado',
+      titleSuffix: 'Cliente activo - ' + pending.project,
+      notes: 'Owner marco CLIENTE ACTIVO (proyecto ' + pending.project + ') via OOA F2.' + (pending.note ? ' Nota: ' + pending.note : ''),
+      pipelineName: IA360_OOA_DEFAULT_PIPELINE,
+    }).catch(e => { console.error('[ooa-action] syncIa360Deal:', e.message); return null; });
+    await mergeContactIa360State({
+      waNumber, contactNumber: targetContact,
+      tags: ['cliente-activo', 'ia360-ooa'],
+      customFields: {
+        ia360_cliente_activo: true,
+        project_name: pending.project,
+        lifecycle_stage: 'cliente_activo',
+        ia360_cliente_activo_set_at: new Date().toISOString(),
+        ia360_cliente_activo_source: 'ooa_owner_confirm',
+      },
+    });
+    return { ok: true, dealOk: !!deal, summary: 'Listo: ' + name + ' marcado como cliente activo y proyecto "' + pending.project + '" asignado' + (deal ? ' (deal en pipeline IA360).' : ' (deal no se creo, revisa pipeline).') };
+  }
+
+  if (pending.type === 'advance_deal') {
+    const deal = await syncIa360Deal({
+      record: dealRecord,
+      targetStageName: pending.stage,
+      titleSuffix: 'Etapa - ' + pending.stage,
+      notes: 'Owner movio deal a "' + pending.stage + '" via OOA F2.' + (pending.note ? ' Nota: ' + pending.note : ''),
+      pipelineName: IA360_OOA_DEFAULT_PIPELINE,
+    }).catch(e => { console.error('[ooa-action] advance syncIa360Deal:', e.message); return null; });
+    return { ok: !!deal, dealOk: !!deal, summary: deal ? ('Listo: movi el deal de ' + name + ' a "' + pending.stage + '".') : ('No pude mover el deal de ' + name + ' a "' + pending.stage + '" (revisa que exista esa etapa). No cambie nada mas.') };
+  }
+
+  if (pending.type === 'set_intro') {
+    await mergeContactIa360State({
+      waNumber, contactNumber: targetContact,
+      tags: ['ia360-ooa'],
+      customFields: { ia360_introducer: pending.introducer, ia360_introducer_set_at: new Date().toISOString() },
+    });
+    return { ok: true, dealOk: false, summary: 'Listo: registre que a ' + name + ' lo presento "' + pending.introducer + '".' };
+  }
+  return { ok: false, summary: 'Accion no reconocida; no hice nada.' };
+}
+
+async function handleIa360OoaConfirm({ record, targetContact }) {
+  const row = await loadIa360OoaPending(targetContact);
+  if (!row) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_ooa_confirm_nopending', body: 'No encontre una accion pendiente para confirmar (puede que ya la confirmaras o cancelaras). No hice nada.' });
+    return;
+  }
+  const pending = row.custom_fields && row.custom_fields.ia360_ooa_action_pending ? row.custom_fields.ia360_ooa_action_pending : {};
+  let result;
+  try {
+    result = await executeIa360OoaAction({ record, pending, row });
+  } catch (e) {
+    console.error('[ooa-action] execute error:', e.message);
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_ooa_confirm_failed', body: 'No pude ejecutar la accion para ' + (pending.contact_name || targetContact) + ' (error interno). No deje nada a medias; reintenta.', targetContact, ownerBudget: true });
+    return;
+  }
+  await clearIa360OoaPending({ waNumber: row.wa_number || record.wa_number, contactNumber: targetContact });
+  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_ooa_confirm_done', body: result.summary, targetContact, ownerBudget: true });
+}
+
+async function handleIa360OoaCancel({ record, targetContact }) {
+  const row = await loadIa360OoaPending(targetContact);
+  const name = (row && row.name) || targetContact;
+  if (row) await clearIa360OoaPending({ waNumber: row.wa_number || record.wa_number, contactNumber: targetContact });
+  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_ooa_cancel_done', body: 'Cancelado. No ejecute ninguna accion sobre ' + name + '.', targetContact, ownerBudget: true });
+}
+
 async function handleBrainV2Canary(record) {
   const raw = String(record.message_body || '').trim();
   let message = raw;
@@ -9751,15 +9923,24 @@ async function handleBrainV2Canary(record) {
       '- `intro <contacto>: <quién presenta>` para teclear la intro de un referido.'
     ].join('\n');
     let ooaReply = '';
+    let ooaProposed = null;
     try {
       const ooaOut = await callBrainV2({ contactWaNumber: record.contact_number, message, forceActor: 'owner' });
       if (ooaOut && (ooaOut.branch === 'owner_operator' || ooaOut.actor_type === 'owner')) {
         ooaReply = String(ooaOut.reply_text || '').trim();
+        ooaProposed = parseIa360ProposedAction(ooaOut.proposed_action);
       } else if (ooaOut) {
         console.warn('[ooa] respuesta inesperada branch=%s actor=%s', ooaOut.branch, ooaOut.actor_type);
       }
     } catch (ooaErr) {
       console.error('[ooa] callBrainV2 error:', ooaErr && ooaErr.message);
+    }
+    // F2: si el OOA propuso una accion de estado, NO se ejecuta: se emite una
+    // tarjeta [Confirmar] [Cancelar]. La accion real solo corre con el tap.
+    if (ooaProposed) {
+      const carded = await sendIa360OoaActionCard({ record, proposal: ooaProposed, replyText: ooaReply })
+        .catch(e => { console.error('[ooa-action] card error:', e && e.message); return false; });
+      if (carded) return;
     }
     await sendIa360DirectText({
       record,
