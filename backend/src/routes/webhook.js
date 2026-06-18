@@ -25,10 +25,13 @@ const {
   buildReferidoContextoDraft: buildIa360ReferidoContextoDraft,
   isSequenceBlockedByMissingQuienIntro: isIa360SequenceBlockedByMissingQuienIntro,
   buildIntroNeededMessage: buildIa360IntroNeededMessage,
+  classifyIntroIntroducer: classifyIa360IntroIntroducer,
+  buildRelationPersonalCustomFields: buildIa360RelationPersonalCustomFields,
 } = require('./ia360ReferidoIntro');
 const {
   suggestIa360Persona,
   buildVcardPersonaRows,
+  detectIa360ToneConflict: detectIa360ToneConflictPure,
 } = require('./ia360PersonaSuggest');
 
 const router = Router();
@@ -2792,6 +2795,19 @@ async function reflectIa360ToEspoCrm({ record, agent, channel = 'whatsapp' }) {
 async function notifyOwnerVcardCaptured({ record, shared }) {
   try {
     const suggestion = suggestIa360Persona(shared);
+    // G-FIX4: DOBLE señal (canal BNI + relación personal) → NO auto-saltamos:
+    // preguntamos el tono. Señal de relación = token "amig"/"beta" en el nombre
+    // o el flag tono_personal persistido por el comando "intro" (best-effort).
+    let relationPersonalFlag = false;
+    try {
+      const tcNum = String(shared.contactNumber || '').replace(/\D/g, '');
+      const tcContact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: tcNum });
+      relationPersonalFlag = tcContact?.custom_fields?.tono_personal === true;
+    } catch (e) { console.error('[ia360-tone] preload flag:', e.message); }
+    const toneConflict = detectIa360ToneConflictPure({ name: shared.name, relationPersonalFlag });
+    if (toneConflict.conflict) {
+      return await sendIa360ToneChoiceCard({ record, shared });
+    }
     const flowKey = suggestion && suggestion.persona;
     const flow = flowKey ? IA360_PERSONA_SEQUENCE_FLOWS[flowKey] : null;
     if (!flow) {
@@ -2862,6 +2878,81 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
       });
     }
   }
+}
+
+// G-FIX4: TARJETA DE ELECCION DE TONO. Cuando un contacto trae DOBLE señal
+// (CANAL referido/BNI Y RELACION PERSONAL), no auto-saltamos al readout: le
+// preguntamos a Alek el tono con dos botones. "Cálido / de confianza" rutea a
+// persona_beta + opener cálido (beta_calido); "Referido / BNI" a persona_referido
+// + referido_contexto. La respuesta (owner_tone_*) setea persona/secuencia y
+// recién entonces emite el readout 1-tap [Aprobar y enviar]+[Cambiar].
+async function sendIa360ToneChoiceCard({ record, shared }) {
+  const who = shared.name || shared.contactNumber;
+  const targetContact = String(shared.contactNumber || '').replace(/\D/g, '');
+  const body = `Alek, capturé a ${who} (${shared.contactNumber}). Leo DOS señales a la vez: parece de confianza (relación personal) y también referido/BNI. ¿Con qué tono le escribo? Tú decides el tono; luego te dejo el borrador listo para aprobar. No envío nada al contacto sin tu OK.`;
+  return sendOwnerInteractive({
+    record,
+    label: `owner_tone_choice_${targetContact}`,
+    messageBody: `IA360: elegir tono ${who}`,
+    targetContact,
+    ownerBudget: true,
+    interactive: {
+      type: 'button',
+      body: { text: compactForWhatsApp(body, 1024) },
+      action: {
+        buttons: [
+          { type: 'reply', reply: { id: `owner_tone_warm:${targetContact}`, title: 'Cálido / confianza' } },
+          { type: 'reply', reply: { id: `owner_tone_referral:${targetContact}`, title: 'Referido / BNI' } },
+        ],
+      },
+    },
+  });
+}
+
+// G-FIX4: handler de la eleccion de tono. tone ∈ {'warm','referral'}. Resuelve la
+// persona/secuencia correspondiente, persiste la clasificacion (igual que el
+// 1-tap) y emite el readout 1-tap con [Aprobar y enviar]+[Cambiar]. NUNCA mudo.
+async function handleIa360OwnerToneChoice({ record, targetContact, tone }) {
+  const num = String(targetContact || '').replace(/\D/g, '');
+  if (!num) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_tone_missing', body: 'No encontré el número del contacto para esa elección de tono. No envié nada.', ownerBudget: true });
+    return;
+  }
+  const flowKey = tone === 'warm' ? 'persona_beta' : 'persona_referido';
+  const sequenceId = tone === 'warm' ? 'beta_calido' : 'referido_contexto';
+  const flow = IA360_PERSONA_SEQUENCE_FLOWS[flowKey];
+  const found = flow ? findIa360SequenceFlow(sequenceId) : null;
+  if (!flow || !found) {
+    await sendIa360VcardPersonaList({ record, shared: { name: num, contactNumber: num } });
+    return;
+  }
+  let contact = null;
+  try { contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: num }); }
+  catch (e) { console.error('[ia360-tone] load contact:', e.message); }
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: num,
+    customFields: {
+      ia360_persona_first: {
+        classification: {
+          persona_key: flowKey,
+          relationship_context: flow.relationshipContext,
+          auto_suggested: false,
+          tone_chosen: tone,
+          suggested_reason: tone === 'warm' ? 'Alek eligió tono cálido (doble señal)' : 'Alek eligió tono referido (doble señal)',
+          at: new Date().toISOString(),
+        },
+      },
+    },
+  }).catch(e => console.error('[ia360-tone] persist:', e.message));
+  return emitIa360SequenceReadoutCard({
+    record,
+    targetContact: num,
+    flow,
+    sequence: found.sequence,
+    contact,
+    allowVcardChange: true,
+  });
 }
 
 // Flujo VIEJO (4 tarjetas): lista "Elegir persona". Antes era el cuerpo de
@@ -2946,6 +3037,34 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
             { id: 'seq_beta_architectura:si_pregunta', title: 'Sí, pregúntame' },
             { id: 'seq_beta_architectura:alek_directo', title: 'Que me escriba Alek' },
             { id: 'seq_beta_architectura:ahora_no', title: 'Ahora no' },
+          ],
+        },
+      },
+      {
+        // G-FIX4: opener CALIDO GENERICO para un conocido/amig@ (sin el sesgo
+        // tecnico de beta_architectura). Corto, calido, reconoce que ya se
+        // conocen, SIN venta y SIN placeholders sin resolver (first_name puede
+        // faltar; el draft usa "Hola" a secas si no hay nombre).
+        id: 'beta_calido',
+        uiTitle: 'Saludo cálido',
+        label: 'Saludo cálido (conocido)',
+        goal: 'reconectar con calidez sin vender',
+        expectedSignal: 'apertura natural de la conversación',
+        nextAction: 'Alek decide si la conversación pide contexto antes de proponer algo.',
+        cta: 'saludar con calidez y abrir conversación',
+        step2: {
+          si_cuentame: 'Con gusto. Alek está armando IA360 (su sistema de WhatsApp + CRM con memoria) y quería que tú lo conocieras de primera mano, sin formalidades. ¿Te late que te cuente rápido de qué va?',
+        },
+        draft: ({ name }) => (String(name || '').trim()
+          ? `Hola ${String(name).trim()}, soy la IA de Alek. Como ya se conocen, no vengo a venderte nada: Alek solo quería que tú lo conocieras antes que nadie y saludarte por aquí. ¿Cómo has estado?`
+          : `Hola, soy la IA de Alek. Como ya se conocen, no vengo a venderte nada: Alek solo quería saludarte por aquí y que conozcas en lo que anda. ¿Cómo has estado?`),
+        metaTemplateName: null, // sin template frío: solo dentro de ventana o tras saludo
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_beta_calido:si_cuentame', title: 'Cuéntame' },
+            { id: 'seq_beta_calido:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_beta_calido:ahora_no', title: 'Ahora no' },
           ],
         },
       },
@@ -6240,11 +6359,59 @@ async function handleIa360OwnerVaultSync({ record, query }) {
 // placeholder caliente). Resuelve el contacto con la misma tolerancia del
 // expediente; intenta resolver al aliado real a un numero para referido_por
 // (nunca el owner). try/catch total: NUNCA queda mudo.
+// G-FIX4: rama RELACION del comando intro, extraida para mantener compacto el
+// cuerpo de handleIa360OwnerIntroCommand (y que los guards de los tests sigan
+// viendo la ruta quien_intro). Devuelve true si el intro describia una relacion
+// personal y ya la proceso por completo; false si NO era relacion.
+async function handleIa360OwnerIntroRelationship({ record, target, introducer }) {
+  const ownerText = (label, body) => sendIa360DirectText({
+    record, toNumber: IA360_OWNER_NUMBER, label, body, ownerBudget: true,
+  });
+  const introClass = classifyIa360IntroIntroducer(introducer);
+  if (introClass.kind !== 'relationship') return false;
+      const resolvedRel = await resolveIa360MemoryTarget(target);
+      if (resolvedRel.kind === 'none') {
+        await ownerText('ia360_intro_target_none',
+          `No encontré a "${target}" ni como nombre ni como número. Revisa el nombre o usa el número.`);
+        return;
+      }
+      if (resolvedRel.kind === 'ambiguous') {
+        const list = resolvedRel.candidates.slice(0, 8)
+          .map(c => `- ${c.contact_name || 'sin nombre'} (${c.contact_number})`).join('\n');
+        await ownerText('ia360_intro_target_ambiguous',
+          `Hay varios contactos que coinciden con "${target}". ¿A cuál?\n${list}\n\nMándame "intro <número>: ${introClass.value}".`);
+        return;
+      }
+      const relNumber = normalizePhone(resolvedRel.candidates[0].contact_number);
+      const relName = resolvedRel.candidates[0].contact_name || relNumber;
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: relNumber,
+        customFields: buildIa360RelationPersonalCustomFields({ relationText: introClass.value, nowIso: new Date().toISOString() }),
+      });
+      // ¿Doble señal? El nombre del contacto puede traer canal (BNI). Releemos.
+      let relContact = null;
+      try { relContact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: relNumber }); }
+      catch (e) { console.error('[ia360-intro] rel reload:', e.message); }
+      const tone = detectIa360ToneConflictPure({ name: relContact?.name || relName, relationPersonalFlag: true });
+      await sendIa360DirectText({
+        record, toNumber: IA360_OWNER_NUMBER, label: 'ia360_intro_relacion_saved', targetContact: relNumber, ownerBudget: true,
+        body: `Anotado: a ${relName} (${relNumber}) lo tomo como relación personal («${introClass.value}»), no como una intro de tercero. ${tone.conflict ? 'Como además trae señal de BNI/referido, te pregunto el tono abajo.' : 'Cuando reabras su tarjeta o re-compartas su contacto, te propongo un tono cálido.'}`,
+      });
+      if (tone.conflict) {
+        await sendIa360ToneChoiceCard({ record, shared: { name: relContact?.name || relName, contactNumber: relNumber } });
+      }
+  return true;
+}
+
 async function handleIa360OwnerIntroCommand({ record, target, introducer }) {
   const ownerText = (label, body) => sendIa360DirectText({
     record, toNumber: IA360_OWNER_NUMBER, label, body, ownerBudget: true,
   });
   try {
+    // G-FIX4: si el intro describe una RELACION personal (no un nombre de
+    // tercero), esa rama lo maneja por completo y termina aquí; si no, seguimos.
+    if (await handleIa360OwnerIntroRelationship({ record, target, introducer })) return;
     const quienIntroName = sanitizeIa360IntroNamePure(introducer);
     if (!quienIntroName) {
       await ownerText('ia360_intro_bad_name',
@@ -7769,6 +7936,15 @@ async function handleIa360LiteInteractive(record) {
       // G-FIX3: "Cambiar" desde el readout 1-tap -> reabre la lista "Elegir persona".
       if (ownerAction === 'owner_vcard_change') {
         await handleIa360OwnerVcardChange({ record, targetContact });
+        return;
+      }
+      // G-FIX4: elección de TONO ante doble señal (canal BNI + relación personal).
+      if (ownerAction === 'owner_tone_warm') {
+        await handleIa360OwnerToneChoice({ record, targetContact, tone: 'warm' });
+        return;
+      }
+      if (ownerAction === 'owner_tone_referral') {
+        await handleIa360OwnerToneChoice({ record, targetContact, tone: 'referral' });
         return;
       }
       if (ownerAction === 'owner_pipe') {
