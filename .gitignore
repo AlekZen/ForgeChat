@@ -80,3 +80,8 @@ ForgeCRM_LLD.html
 *.dump
 *.sql.gz
 *.backup
+
+# Project skills are committed (cloudflare-diapazo, etc.); rest of .claude stays local
+!backend/.claude/
+backend/.claude/*
+!backend/.claude/skills/

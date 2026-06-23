@@ -95,3 +95,7 @@ docker exec -i forgecrm-db psql "$DBURL" -t -A -F'|' < /tmp/q.sql
 - `05-Agentes/auditorias/2026-06-15 - Auditoria coherencia y UX pipelines WhatsApp y Email.md`
 - `05-Agentes/auditorias/2026-06-15-diagnostico-no-delivery.md`
 - `05-Agentes/auditorias/2026-06-15-pipeline-aliado-bni-vs-journey.md`
+
+## Cloudflare control plane (DIAPAZO)
+
+Gestion de Cloudflare (DNS, Email Routing, Workers, KV) via token scoped en backend/.env (CLOUDFLARE_API_TOKEN). Helper: scripts/cf.sh. Runbook: docs/cloudflare-runbook.md. Skill: .claude/skills/cloudflare-diapazo. NUNCA commitear el token.
