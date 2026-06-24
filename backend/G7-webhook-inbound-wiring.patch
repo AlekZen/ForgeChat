@@ -1,0 +1,24 @@
+--- a/src/routes/webhook.js
++++ b/src/routes/webhook.js
+@@ -10,6 +10,7 @@
+ const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
+ const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
+ const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
++const { handleDiapazoInbound } = require('./diapazo-inbound'); // G7: ruteo INBOUND DIAPAZO (aditivo, flag-gated, reversible)
+ const {
+   IA360_DEFAULT_PIPELINE_NAME,
+   IA360_PARTNERS_PIPELINE_NAME,
+@@ -10349,6 +10350,13 @@
+             handleBrainV2Canary(record).catch(e => console.error('[brain-v2-canary] fire-and-forget:', e.message));
+             continue;
+           }
++          // ── G7 DIAPAZO INBOUND (aditivo, flag-gated, reversible) ───────────
++          // Tras el canary, ANTES del embudo IA360: si DIAPAZO_INBOUND='on' y el
++          // contacto es lead DIAPAZO (custom_fields.project='diapazo'), lo atiende
++          // su handler con voz DIAPAZO y CORTA el flujo (el monolito no contesta).
++          // Owner y no-DIAPAZO => false (siguen al embudo IA360/TransformIA intacto).
++          // Flag off por defecto => return false => CERO cambio de comportamiento.
++          if (await handleDiapazoInbound(record).catch(e => { console.error('[diapazo-inbound] dispatch:', e.message); return false; })) continue;
+           // ── PRODUCTION-HARDENING: CAPTURA DEL COMENTARIO del owner ──────────
+           // Va ANTES de TODO (paused-resume, flow, funnel): si el owner (Alek) tocó
+           // "Comentar" en una alerta de fallo, su SIGUIENTE texto ES el comentario.

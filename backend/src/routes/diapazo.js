@@ -173,6 +173,33 @@ router.post('/diapazo/notify', async (req, res) => {
       next_offer: b.next_offer || '', afinacion,
     };
     const acct = await resolveCreds();
+
+    // G7 PREREQ: replicar la marca de propiedad DIAPAZO en coexistence.contacts (no
+    // solo en EspoCRM). En el WhatsApp COMPARTIDO esta es la UNICA senal por la que
+    // el ruteo de inbound (diapazo-inbound.js) reconoce al lead. Merge jsonb
+    // superficial: agrega project/diapazo_lead y conserva el resto de custom_fields.
+    if (phone) {
+      const waNumber = onlyDigits(acct.displayPhoneNumber);
+      if (waNumber) {
+        await pool.query(
+          `INSERT INTO coexistence.contacts (wa_number, contact_number, custom_fields, updated_at)
+           VALUES ($1,$2,$3::jsonb,NOW())
+           ON CONFLICT (wa_number, contact_number) DO UPDATE SET
+             custom_fields = COALESCE(coexistence.contacts.custom_fields,'{}'::jsonb) || EXCLUDED.custom_fields,
+             updated_at = NOW()`,
+          [waNumber, phone, JSON.stringify({ project: 'diapazo', diapazo_lead: true })]
+        ).catch((e) => console.error('[diapazo] marcar contacts project=diapazo req=%s: %s', requestId, e && e.message));
+      }
+    }
+
+    // Guarda QA: un lead sandbox (52199900XXXXX) NO debe cardear el WhatsApp real del
+    // owner. Se marco arriba project=diapazo (para los tests de ruteo) y se corta sin
+    // egress real. Cero tarjetas de prueba en el telefono de Alek.
+    if (phone && /^52199900\d{5}$/.test(phone)) {
+      console.log('[diapazo] QA sandbox lead req=%s: marcado project=diapazo, owner card OMITIDA', requestId);
+      return res.status(200).json({ ok: true, sandbox: true, request_id: requestId, status: 'pending_owner_review' });
+    }
+
     let ownerMsgId = null;
     try {
       const r = await sendInteractive({ accessToken: acct.accessToken, phoneNumberId: acct.phoneNumberId, to: OWNER_WA, interactive: ownerCard(n) });
