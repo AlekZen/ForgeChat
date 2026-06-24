@@ -11,6 +11,7 @@ const { router: messagesRouter } = require('./routes/messages');
 const { router: webhookRouter } = require('./routes/webhook');
 const { router: ia360IntakeRouter } = require('./routes/ia360-intake');
 const { router: ia360CalendarRouter } = require('./routes/ia360-calendar');
+const { router: diapazoRouter, startDiapazoPoller } = require('./routes/diapazo'); // G6: notificacion WhatsApp DIAPAZO (aislado)
 const { router: categoriesRouter } = require('./routes/categories');
 const { router: contactFieldsRouter } = require('./routes/contactFields');
 const { router: usersRouter } = require('./routes/users');
@@ -104,6 +105,7 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 app.use('/api', webhookRouter);
 app.use('/api', ia360IntakeRouter); // B-28 intake (publico, secreto compartido)
 app.use('/api', ia360CalendarRouter); // IA360 add-to-calendar (publico, token)
+app.use('/api', diapazoRouter); // G6: DIAPAZO notify (publico, secreto compartido X-Diapazo-Notify-Secret)
 
 // Auth routes (public)
 app.use('/api', authRouter);
@@ -140,6 +142,7 @@ async function start() {
   startMediaWorker();
   startSendWorker();
   startReminderScheduler(); // IA360 per-meeting reminders (self-contained)
+  startDiapazoPoller(); // G6: poll de taps diapazo_* del owner en chat_history (egress human-gated)
 
   // Stale-pause sweeper: mark paused automation executions that have outlived
   // their expires_at as error. Resume already inline-checks expires_at, so
