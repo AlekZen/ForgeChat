@@ -10,6 +10,7 @@ const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
+const { buildIa360MemoryJaulaWhere } = require('../services/ia360MemoryIsolation');
 const {
   IA360_DEFAULT_PIPELINE_NAME,
   IA360_PARTNERS_PIPELINE_NAME,
@@ -858,23 +859,17 @@ async function lookupIa360MemoryContext({ record, contact, limit = 8 }) {
     jaulaProjectKey,
     limit,
   ];
-  // G-RAG JAULA por proyecto (decisión B1 de Alek 06-11): prohibida la fuga
-  // inter-proyecto. Con proyecto activo declarado, el agente recibe SOLO
-  // memoria de ESE proyecto + memoria general de persona (project_name
-  // vacío); lo que el mismo contacto tenga en OTRO proyecto queda FUERA.
-  // Sin proyecto activo no hay jaula que aplicar: se conserva el
-  // comportamiento G-BRAIN (toda la memoria del contacto). La comparación
-  // normaliza guiones/guiones bajos/espacios ('Camiones-Selectos' =
-  // 'Camiones Selectos'). El expediente del owner NO pasa por aquí: ese es
-  // cross-proyecto a propósito.
-  const jaulaWhere = `(
-        (contact_wa_number=$1 AND contact_number=$2
-         AND (COALESCE($3::text,'')=''
-              OR COALESCE(project_name,'')=''
-              OR regexp_replace(lower(project_name),'[-_ ]','','g') = regexp_replace(lower($3),'[-_ ]','','g')))
-        OR ($3::text IS NOT NULL AND $3<>'' AND
-            regexp_replace(lower(project_name),'[-_ ]','','g') = regexp_replace(lower($3),'[-_ ]','','g'))
-      )`;
+  // G-RAG JAULA por contacto + proyecto (revisión 07-16): prohibida la fuga
+  // inter-contacto e inter-proyecto. La memoria privada SIEMPRE requiere match
+  // exacto del contacto (wa_number + contact_number) y luego se filtra por
+  // proyecto declarado. La memoria compartida por proyecto solo puede entrar si
+  // NO está asociada a ningún contacto; nunca usar project_name como atajo para
+  // mezclar hechos de Andrés, Germán u otros Champions entre sí.
+  //
+  // Invariante de seguridad: un fact/event con forgechat_contact_id o número de
+  // contacto pertenece a ese contacto y no debe ser recuperado por otro contacto
+  // aunque ambos tengan el mismo project_name/account_name.
+  const jaulaWhere = buildIa360MemoryJaulaWhere();
   const events = await pool.query(
     `SELECT area, signal_type, summary, business_impact, missing_data, next_action, owner_review_status, created_at
        FROM coexistence.ia360_memory_events
