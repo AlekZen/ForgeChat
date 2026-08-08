@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
-const { requirePermission } = require('../middleware/access');
+const { requirePermission, assertContactAccess } = require('../middleware/access');
 const { canonicalizeMime, isTemplateHeaderMime, TEMPLATE_TYPES_MSG } = require('../util/metaMime');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -808,6 +808,8 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
 
     const { account, error } = await resolveAccount({ accountId: tpl.whatsapp_account_id });
     if (error) return res.status(400).json({ error });
+    if (!account.displayPhoneNumber) return res.status(400).json({ error: 'WhatsApp account has no sender number' });
+    if (!(await assertContactAccess(req, res, account.displayPhoneNumber, to))) return;
 
     // Guardrail (Sergio/Jorge bug): a template whose body has variables MUST
     // receive every parameter, else WhatsApp renders the literal "{{1}}".
@@ -856,7 +858,7 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
       payload: { name: tpl.name, languageCode: tpl.language || 'en', components },
     });
 
-    res.status(202).json({ ok: true, messageId: localId, status: 'sending' });
+    res.status(202).json({ ok: true, messageId: localId, correlationId: localId, status: 'sending' });
   } catch (err) {
     console.error('[templates] test-send error:', err.message);
     res.status(500).json({ error: 'Failed to enqueue test send' });

@@ -620,6 +620,53 @@ router.post('/messages/mark-read', async (req, res) => {
   }
 });
 
+function publicOutboundError(value) {
+  return String(value || 'ForgeChat reported a send failure.')
+    .slice(0, 500)
+    .replace(/(?:bearer\s+)[^\s,;]+/gi, 'Bearer [REDACTED]')
+    .replace(/(cookie|password|token|secret)\s*[=:]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/\+?\d[\d\s()./\\-]{6,}\d/g, '[REDACTED]');
+}
+
+// POST /api/messages/send-status
+// Exact lifecycle lookup for an accepted outbound send. correlationId is never
+// returned; callers expose only their own opaque hash.
+router.post('/messages/send-status', async (req, res) => {
+  try {
+    const { waNumber, contactNumber, correlationId } = req.body || {};
+    if (!waNumber || !contactNumber || !correlationId) {
+      return res.status(400).json({ error: 'waNumber, contactNumber and correlationId required' });
+    }
+    if (!(await assertContactAccess(req, res, waNumber, contactNumber))) return;
+
+    const { rows } = await pool.query(
+      `SELECT message_id, status, error_message
+         FROM coexistence.chat_history
+        WHERE send_correlation_id = $1
+          AND wa_number = $2
+          AND contact_number = $3
+          AND direction = 'outgoing'
+        LIMIT 2`,
+      [correlationId, String(waNumber).replace(/\D/g, ''), String(contactNumber).replace(/\D/g, '')]
+    );
+    if (rows.length > 1) {
+      return res.status(409).json({ error: 'Outbound correlation is ambiguous', code: 'CORRELATION_AMBIGUOUS' });
+    }
+    if (rows.length === 0) return res.json({ found: false });
+    res.json({
+      found: true,
+      message: {
+        message_id: rows[0].message_id,
+        status: rows[0].status,
+        error_message: publicOutboundError(rows[0].error_message),
+      },
+    });
+  } catch (err) {
+    console.error('[messages] send-status error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch outbound status' });
+  }
+});
+
 // GET /api/messages?waNumber=xxx&contactNumber=xxx&page=1&limit=50
 router.get('/messages', async (req, res) => {
   try {
@@ -902,7 +949,7 @@ router.post('/messages/send', async (req, res) => {
       payload: { body: trimmedText, previewUrl: /https?:\/\/\S+/i.test(trimmedText), contextMessageId: ctxId },
     });
 
-    res.status(202).json({ ok: true, messageId: localId, status: 'sending' });
+    res.status(202).json({ ok: true, messageId: localId, correlationId: localId, status: 'sending' });
   } catch (err) {
     console.error('[messages] send error:', err.message);
     res.status(500).json({ error: 'Failed to enqueue send' });
@@ -990,7 +1037,7 @@ router.post('/messages/send-media', mediaUpload.single('file'), async (req, res)
       },
     });
 
-    res.status(202).json({ ok: true, messageId: localId, status: 'sending', mediaId });
+    res.status(202).json({ ok: true, messageId: localId, correlationId: localId, status: 'sending', mediaId });
   } catch (err) {
     console.error('[messages] send-media error:', err.message);
     res.status(500).json({ error: 'Failed to send media' });
@@ -1076,7 +1123,7 @@ router.post('/messages/send-audio', mediaUpload.single('file'), async (req, res)
       payload: { type: 'audio', mediaId, contextMessageId: ctxId },
     });
 
-    res.status(202).json({ ok: true, messageId: localId, status: 'sending', mediaId });
+    res.status(202).json({ ok: true, messageId: localId, correlationId: localId, status: 'sending', mediaId });
   } catch (err) {
     console.error('[messages] send-audio error:', err.message);
     res.status(500).json({ error: 'Failed to send audio' });
@@ -1194,7 +1241,7 @@ router.post('/messages/send-library-media', async (req, res) => {
     });
 
     res.status(202).json({
-      ok: true, messageId: localId, status: 'sending',
+      ok: true, messageId: localId, correlationId: localId, status: 'sending',
       mediaId: sync.meta_media_id, mediaLibraryId: Number(media.id),
     });
   } catch (err) {

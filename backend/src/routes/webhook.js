@@ -6,6 +6,7 @@ const { evaluateTriggers, resumeAutomation } = require('../engine/automationEngi
 const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
 const { enqueueMediaDownload } = require('../queue/mediaQueue');
 const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
+const { recordOutboundStatus } = require('../services/outboundStatusReceipt');
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
@@ -9995,16 +9996,16 @@ function isIa360BlockedSyntheticInbound(record) {
 
 router.post('/webhook/whatsapp', async (req, res) => {
   try {
-    // Authenticity: this endpoint is necessarily unauthenticated (public), so
-    // the control is Meta's HMAC signature. When META_APP_SECRET is configured
-    // we REJECT anything unsigned/invalid; if it's not set we log a warning so
-    // operators know inbound webhooks are unverified (forgeable).
+    // Authenticity: this endpoint is public, so Meta's HMAC signature is
+    // mandatory. Missing verifier configuration fails closed and asks Meta to
+    // retry instead of accepting forgeable status or message payloads.
     const sig = verifyMetaSignature(req);
     if (sig === false) {
       return res.status(403).json({ error: 'Invalid webhook signature' });
     }
     if (sig === null) {
-      console.warn('[webhook] META_APP_SECRET not set — inbound webhook signature NOT verified (set it to reject forged payloads).');
+      console.error('[webhook] META_APP_SECRET not set — rejecting unverified webhook.');
+      return res.status(503).json({ error: 'Webhook signature verification unavailable' });
     }
 
     const payload = req.body;
@@ -10054,18 +10055,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
           const statusErrors = Array.isArray(r.errors) && r.errors.length > 0
             ? r.errors.map((e) => e?.message || e?.title || e?.code || JSON.stringify(e)).filter(Boolean).join('; ')
             : null;
-          await client.query(
-            `UPDATE coexistence.chat_history
-                SET status = $1,
-                    raw_payload = COALESCE($3::jsonb, raw_payload),
-                    error_message = CASE
-                      WHEN $1 IN ('failed', 'error') THEN COALESCE($4, error_message)
-                      WHEN $1 IN ('sent', 'delivered', 'read') THEN NULL
-                      ELSE error_message
-                    END
-              WHERE message_id = $2`,
-            [r.status, r.message_id, r.raw_payload || null, statusErrors]
-          );
+          await recordOutboundStatus(client, {
+            messageId: r.message_id,
+            status: r.status,
+            errorMessage: statusErrors,
+          });
           continue;
         }
 

@@ -14,6 +14,7 @@
 const crypto = require('crypto');
 const pool = require('../db');
 const { getAccountByPhoneNumber, getAccountWithToken, getSingleAccount } = require('../routes/whatsappAccounts');
+const { applyPendingOutboundStatus, lockOutboundMessage } = require('./outboundStatusReceipt');
 
 function localMessageId() {
   // Distinct from Meta's wamid format so we can tell them apart in logs
@@ -43,7 +44,7 @@ async function resolveAccount({ accountId, fromPhoneNumber }) {
 
 /**
  * Insert an optimistic chat_history row that the UI shows as "sending…".
- * Returns the local message_id used so caller can correlate later updates.
+ * The immutable send_correlation_id survives message_id changing to a wamid.
  *
  * G-BRAIN dedupe atómico: el índice único parcial
  * chat_history_ia360_handler_dedupe (contact_number, template_meta->>'ia360_handler_for')
@@ -62,10 +63,10 @@ async function insertPendingRow({ account, toNumber, messageType, messageBody, m
   const messageId = localMessageId();
   const res = await db.query(
     `INSERT INTO coexistence.chat_history
-       (message_id, phone_number_id, wa_number, contact_number, to_number,
+       (message_id, send_correlation_id, phone_number_id, wa_number, contact_number, to_number,
         direction, message_type, message_body, raw_payload,
         media_url, media_mime_type, status, timestamp, template_meta, context_message_id)
-     VALUES ($1,$2,$3,$4,$5,'outgoing',$6,$7,$8,$9,$10,$13,NOW(),$11,$12)
+     VALUES ($1,$1,$2,$3,$4,$5,'outgoing',$6,$7,$8,$9,$10,$13,NOW(),$11,$12)
      ON CONFLICT (contact_number, (template_meta->>'ia360_handler_for'))
        WHERE direction = 'outgoing' AND (template_meta->>'ia360_handler_for') IS NOT NULL
      DO NOTHING
@@ -95,27 +96,42 @@ async function insertPendingRow({ account, toNumber, messageType, messageBody, m
 }
 
 /**
- * Mark a previously-inserted row as accepted by Meta, swapping in the real wamid.
+ * Mark a previously-inserted row as accepted by Meta, swapping in the real
+ * wamid while retaining the immutable correlation id.
  */
 async function markSent(localId, wamid) {
-  await pool.query(
-    `UPDATE coexistence.chat_history
-        SET message_id = $1, status = 'sent', error_message = NULL
-      WHERE message_id = $2`,
-    [wamid, localId]
-  );
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await lockOutboundMessage(client, wamid);
+    const result = await client.query(
+      `UPDATE coexistence.chat_history
+          SET message_id = $1, status = 'sent', error_message = NULL
+        WHERE send_correlation_id = $2`,
+      [wamid, localId]
+    );
+    if (result.rowCount !== 1) throw new Error('Outbound correlation missing or ambiguous');
+    await applyPendingOutboundStatus(client, wamid);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
  * Mark a row as failed (Meta rejected, network error, etc).
  */
 async function markFailed(localId, errorMessage) {
-  await pool.query(
+  const result = await pool.query(
     `UPDATE coexistence.chat_history
         SET status = 'failed', error_message = $1
-      WHERE message_id = $2`,
+      WHERE send_correlation_id = $2`,
     [(errorMessage || 'send failed').slice(0, 500), localId]
   );
+  if (result.rowCount !== 1) throw new Error('Outbound correlation missing or ambiguous');
 }
 
 /**
