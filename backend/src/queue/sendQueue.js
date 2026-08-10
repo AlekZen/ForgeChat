@@ -16,7 +16,7 @@ const QUEUE_NAME = 'forgecrm-send';
 const CONCURRENCY = parseInt(process.env.SEND_QUEUE_CONCURRENCY || '5', 10);
 const RATE_MAX = parseInt(process.env.SEND_RATE_MAX || '60', 10);
 const RATE_DURATION_MS = parseInt(process.env.SEND_RATE_DURATION_MS || '1000', 10);
-const ATTEMPTS = parseInt(process.env.SEND_QUEUE_ATTEMPTS || '4', 10);
+const ATTEMPTS = 1;
 
 const connection = new IORedis(REDIS_URL, {
   maxRetriesPerRequest: null,
@@ -115,11 +115,8 @@ async function processJob(job) {
   } catch (err) {
     const cls = classifyMetaError(err);
     await markAccountHealth(account.id, cls, err.message);
-    // Don't retry auth failures — they'll fail every time until token is fixed.
-    // G5: tampoco reintentar bloqueos de cuenta por pago/elegibilidad (131042 y
-    // familia): Meta ya dijo bloqueo, reintentar quema los 4 intentos en vano.
-    // (El 131042 suele llegar como webhook de status, no como excepción síncrona;
-    // este skipRetry cubre el caso en que Meta SÍ rechace de forma síncrona.)
+    // Outbound egress is at-most-once. Every synchronous provider rejection is
+    // terminal for this job; operators inspect state instead of replaying it.
     if (cls === 'invalid_token' || cls === 'payment_blocked') {
       err.skipRetry = true;
     }
@@ -166,10 +163,8 @@ function startSendWorker() {
   });
   worker.on('failed', async (job, err) => {
     const localId = job?.data?.localMessageId;
-    const skipRetry = err?.skipRetry || /invalid.*token|access token has expired|Error validating access token/i.test(err?.message || '');
-    const finalAttempt = (job?.attemptsMade || 0) >= ATTEMPTS || skipRetry;
-    console.error(`[sendQueue] ${job?.data?.kind} to ${job?.data?.to} failed attempt=${job?.attemptsMade}/${ATTEMPTS}${skipRetry ? ' (no-retry: auth)' : ''}: ${err.message}`);
-    if (finalAttempt && localId) {
+    console.error(`[sendQueue] ${job?.data?.kind} to ${job?.data?.to} failed attempt=${job?.attemptsMade || 1}/${ATTEMPTS}: ${err.message}`);
+    if (localId) {
       await markFailed(localId, err.message).catch(() => {});
       if (job?.data?.originRef?.kind === 'broadcast_log') {
         await pool.query(
@@ -192,7 +187,6 @@ async function enqueueSend(jobData, opts = {}) {
   const addOpts = {
     jobId: `send-${idKey}`,
     attempts: ATTEMPTS,
-    backoff: { type: 'exponential', delay: 1500 },
     removeOnComplete: { count: 500, age: 3600 },
     removeOnFail: { count: 1000, age: 86400 },
   };

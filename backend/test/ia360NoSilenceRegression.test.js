@@ -106,6 +106,80 @@ test('datos vivos del portal: handoff explícito, nunca inventar listas', () => 
   assert.match(handoffBlock, /alreadyResponded: sentHandoff === true/);
 });
 
+test('operaciones beta sin deal entra al camino no-silencio sin telefono hard-coded', () => {
+  assert.match(src, /function isIa360OperacionesChampionContact\(contact\)/);
+  assert.match(src, /champion_operaciones/);
+  assert.match(src, /director_operativo/);
+  assert.match(src, /function buildIa360ClienteActivoBetaPseudoDeal\(contact\)/);
+  assert.match(src, /stage_name: 'Cliente activo beta supervisado'/);
+  assert.match(src, /memory_mode: 'cliente_activo_beta_supervisado'/);
+
+  const handlerStart = src.indexOf('async function handleIa360FreeText');
+  const betaStart = src.indexOf("if (deal.memory_mode === 'cliente_activo_beta_supervisado'", handlerStart);
+  assert.notEqual(handlerStart, -1, 'falta handleIa360FreeText');
+  assert.notEqual(betaStart, -1, 'falta rama cliente activo/beta');
+  const preBetaBlock = src.slice(handlerStart, betaStart);
+  assert.match(preBetaBlock, /preloadedContactContext = await loadIa360ContactContext\(record\)/);
+  assert.match(preBetaBlock, /!deal && isIa360ClienteActivoBetaContact\(preloadedContactContext\)/);
+  assert.match(preBetaBlock, /buildIa360ClienteActivoBetaPseudoDeal\(preloadedContactContext\)/);
+  assert.match(preBetaBlock, /if \(!deal\) return/);
+
+  assert.doesNotMatch(src, /Hendri/i, 'la elegibilidad no debe depender del nombre real');
+  assert.doesNotMatch(src, /2844/, 'la elegibilidad no debe depender del id real del contacto');
+});
+
+test('operaciones live-data usa holding honesto y failure trazable por chokepoint', () => {
+  assert.match(src, /function isIa360OperacionesLiveDataQuestion\(body\)/);
+  const detectorStart = src.indexOf('function isIa360OperacionesLiveDataQuestion');
+  const detectorEnd = src.indexOf('function buildIa360OperacionesLiveDataHoldingResponse', detectorStart);
+  const detectorBlock = src.slice(detectorStart, detectorEnd);
+  assert.match(detectorBlock, /normalizeIa360Marker\(body\)\.split\('_'\)/);
+  assert.match(detectorBlock, /tokens\.some/);
+  assert.match(detectorBlock, /'inventario'/);
+  assert.match(detectorBlock, /'taller'/);
+  assert.match(detectorBlock, /'refacciones'/);
+  assert.doesNotMatch(detectorBlock, /\\b\(inventario\|taller/, 'no debe usar \\b sobre texto normalizado con guiones bajos');
+  assert.match(src, /function buildIa360OperacionesLiveDataHoldingResponse\(\)/);
+  assert.match(src, /no inventarte datos de inventario/);
+
+  const holdingIdx = src.indexOf('ia360_operaciones_live_data_holding');
+  assert.notEqual(holdingIdx, -1, 'falta el holding de Operaciones');
+  const holdingBlock = src.slice(holdingIdx - 500, holdingIdx + 900);
+  assert.match(holdingBlock, /isIa360OperacionesChampionContact\(contactContext\)/);
+  assert.match(holdingBlock, /isIa360OperacionesLiveDataQuestion\(record\.message_body\)/);
+  assert.match(holdingBlock, /await enqueueIa360Text/);
+  assert.match(holdingBlock, /buildIa360OperacionesLiveDataHoldingResponse\(\)/);
+  assert.match(holdingBlock, /await handleIa360BotFailure/);
+  assert.match(holdingBlock, /alreadyResponded: sentHandoff === true/);
+  assert.doesNotMatch(holdingBlock, /sendText|sendTemplate|sendInteractive|metaSend/i, 'no debe introducir egress directo a Meta');
+});
+
+test('failure handoff: alerta al owner con nombre y el comentario de Alek responde al contacto', () => {
+  assert.match(src, /function ia360ContactDisplayName/);
+  assert.match(src, /async function loadIa360FailureTarget/);
+  assert.match(src, /async function sendIa360OwnerCommentToFailureContact/);
+
+  const failureStart = src.indexOf('async function handleIa360BotFailure');
+  const failureEnd = src.indexOf('// ── G-LIVE: invariante estructural no-silencio', failureStart);
+  assert.notEqual(failureStart, -1, 'falta handleIa360BotFailure');
+  const failureBlock = src.slice(failureStart, failureEnd);
+  assert.match(failureBlock, /loadIa360ContactContext\(record\)/, 'la alerta debe resolver contacto');
+  assert.match(failureBlock, /ia360ContactDisplayName/, 'la alerta debe preferir nombre sobre número');
+  const ownerAlertStart = failureBlock.lastIndexOf("label: 'owner_bot_failure'");
+  assert.notEqual(ownerAlertStart, -1, 'falta alerta real al owner');
+  const ownerAlertBlock = failureBlock.slice(ownerAlertStart);
+  assert.doesNotMatch(ownerAlertBlock, /mensaje de \$\{record\.contact_number/, 'la alerta real al owner no debe anunciar solo el teléfono');
+  assert.match(ownerAlertBlock, /title: 'Responder'/, 'el botón debe expresar que la respuesta saldrá al contacto');
+
+  const captureStart = src.indexOf("custom_fields->>'ia360_awaiting_comment_failure'");
+  const captureEnd = src.indexOf('// ── G-RAG: intake del vault', captureStart);
+  assert.notEqual(captureStart, -1, 'falta captura de comentario owner');
+  const captureBlock = src.slice(captureStart, captureEnd);
+  assert.match(captureBlock, /sendIa360OwnerCommentToFailureContact/, 'el comentario de Alek debe enviarse al contacto');
+  assert.match(captureBlock, /respondido_por_comentario_owner/, 'debe quedar trazabilidad de respuesta enviada');
+  assert.match(src, /Alek me confirmó lo siguiente/, 'el contacto debe recibir contexto de que viene de Alek');
+});
+
 test('owner directo en Brain v2 canary enruta al OOA con fallback a menu (nunca mudo)', () => {
   const handlerStart = src.indexOf('async function handleBrainV2Canary(record)');
   assert.notEqual(handlerStart, -1, 'falta handleBrainV2Canary');

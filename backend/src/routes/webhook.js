@@ -1,17 +1,20 @@
 const { Router } = require('express');
 const pool = require('../db');
 const { decrypt } = require('../util/crypto');
+const { randomBytes } = require('crypto');
 const { safeEqual, verifyMetaSignature } = require('../util/webhookSignature');
 const { evaluateTriggers, resumeAutomation } = require('../engine/automationEngine');
 const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
 const { enqueueMediaDownload } = require('../queue/mediaQueue');
 const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
 const { recordOutboundStatus } = require('../services/outboundStatusReceipt');
+const { projectSignedWebhook } = require('../services/whatsapp5gInboundBridge');
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
 const { buildIa360MemoryJaulaWhere } = require('../services/ia360MemoryIsolation');
+const { handleDiapazoInbound } = require('./diapazo-inbound'); // G7: ruteo INBOUND DIAPAZO (aditivo, flag-gated, reversible)
 const {
   IA360_DEFAULT_PIPELINE_NAME,
   IA360_PARTNERS_PIPELINE_NAME,
@@ -384,7 +387,60 @@ function isIa360ClienteActivoBetaContact(contact) {
     || beta.contact_role === 'cliente_activo_cfo_champion'
     || cf.lifecycle_stage === 'cliente_activo_beta_supervisado'
     || cf.relationship_context === 'cliente_activo_beta_supervisado'
-    || tags.includes('cliente-activo-beta');
+    || tags.includes('cliente-activo-beta')
+    || isIa360OperacionesChampionContact(contact);
+}
+
+function normalizeIa360Marker(value) {
+  return String(value || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function isIa360OperacionesChampionContact(contact) {
+  const cf = contact?.custom_fields || {};
+  const beta = cf.ia360_cliente_activo_beta || {};
+  const tags = Array.isArray(contact?.tags) ? contact.tags.map(normalizeIa360Marker) : [];
+  const markers = [
+    ...tags,
+    beta.contact_role,
+    beta.role,
+    beta.context,
+    beta.lane,
+    beta.persona,
+    cf.relationship_context,
+    cf.lifecycle_stage,
+    cf.project_role,
+    cf.rol_comite,
+    cf.role,
+    cf.context,
+    cf.lane,
+    cf.persona,
+  ].map(normalizeIa360Marker);
+  return markers.includes('champion_operaciones')
+    || markers.includes('director_operativo');
+}
+
+function isIa360OperacionesLiveDataQuestion(body) {
+  const tokens = normalizeIa360Marker(body).split('_').filter(Boolean);
+  return tokens.some(t => [
+    'inventario',
+    'taller',
+    'sucursal',
+    'sucursales',
+    'refaccion',
+    'refacciones',
+    'obsolescencia',
+    'mercado',
+    'comprador',
+    'compradores',
+  ].includes(t));
+}
+
+function buildIa360OperacionesLiveDataHoldingResponse() {
+  return 'Recibí tu pregunta operativa. Para no inventarte datos de inventario, taller, sucursales, refacciones, obsolescencia, mercado o compradores, necesito validar la fuente certificada antes de darte cifras. Lo dejo tomado y te confirmo por aquí cuando esté verificado.';
 }
 
 // G-LIVE: números QA del harness E2E (pruebas sintéticas autorizadas). Longitud
@@ -937,6 +993,121 @@ function maskIa360Number(number) {
   return `${s.slice(0, 3)}***${s.slice(-2)}`;
 }
 
+function ia360ContactDisplayName({ contact = null, record = null, fallbackNumber = '' } = {}) {
+  const candidate = String(contact?.name || record?.contact_name || '').trim();
+  if (candidate) return candidate;
+  const number = String(fallbackNumber || record?.contact_number || '').trim();
+  return number ? `contacto ${maskIa360Number(number)}` : 'contacto desconocido';
+}
+
+async function loadIa360FailureTarget(failureId) {
+  const fid = String(failureId || '').replace(/\D/g, '');
+  if (!fid) return null;
+  const { rows } = await pool.query(
+    `SELECT f.id, f.contact_number, f.contact_message, f.reason, f.bot_fallback,
+            COALESCE(c.name, c.profile_name) AS contact_name,
+            c.wa_number AS contact_wa_number
+       FROM coexistence.ia360_bot_failures f
+       LEFT JOIN coexistence.contacts c ON c.contact_number = f.contact_number
+      WHERE f.id=$1
+      ORDER BY c.updated_at DESC NULLS LAST
+      LIMIT 1`,
+    [fid]
+  );
+  return rows[0] || null;
+}
+
+function buildIa360OwnerCommentReply(comment) {
+  const text = String(comment || '').trim();
+  if (!text) return '';
+  return `Alek me confirmó lo siguiente:\n\n${text}`;
+}
+
+async function sendIa360OwnerCommentToFailureContact({ ownerRecord, failureId, comment }) {
+  const target = await loadIa360FailureTarget(failureId);
+  const targetNumber = normalizePhone(target?.contact_number || '');
+  const body = buildIa360OwnerCommentReply(comment);
+  if (!target || !targetNumber || !body) return { ok: false, reason: 'missing_target_or_body' };
+  const targetRecord = {
+    ...ownerRecord,
+    contact_number: targetNumber,
+    contact_name: target.contact_name || '',
+    message_id: `owner_comment_fail:${String(failureId).replace(/\D/g, '')}:${Date.now()}`,
+    message_type: 'text',
+    message_body: target.contact_message || '',
+  };
+  const sent = await enqueueIa360Text({
+    record: targetRecord,
+    label: 'ia360_owner_supervised_reply',
+    body,
+  });
+  return {
+    ok: sent === true,
+    contactName: target.contact_name || '',
+    contactNumber: targetNumber,
+  };
+}
+
+async function captureIa360OwnerFailureComment(record) {
+  if (record.message_type !== 'text'
+      || normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER
+      || !String(record.message_body || '').trim()) return false;
+  try {
+    const { rows: awRows } = await pool.query(
+      `SELECT custom_fields->>'ia360_awaiting_comment_failure' AS fid
+         FROM coexistence.contacts
+        WHERE wa_number=$1 AND contact_number=$2
+        LIMIT 1`,
+      [record.wa_number, record.contact_number]
+    );
+    const awaitingFid = awRows[0]?.fid;
+    if (!awaitingFid || String(awaitingFid).trim() === '') return false;
+    const comment = String(record.message_body || '').trim();
+    const fid = String(awaitingFid).replace(/\D/g, '');
+    await pool.query(
+      `UPDATE coexistence.ia360_bot_failures
+          SET owner_comment=$1, owner_action='respondio_con_comentario', status='comentario_recibido'
+        WHERE id=$2`,
+      [comment, fid]
+    ).catch(e => console.error('[ia360-failure] save comment:', e.message));
+    let supervised = { ok: false, reason: 'not_attempted' };
+    try {
+      supervised = await sendIa360OwnerCommentToFailureContact({
+        ownerRecord: record,
+        failureId: fid,
+        comment,
+      });
+    } catch (sendErr) {
+      supervised = { ok: false, reason: sendErr.message };
+      console.error('[ia360-failure] send owner comment to contact:', sendErr.message);
+    }
+    await pool.query(
+      `UPDATE coexistence.ia360_bot_failures
+          SET status=$1
+        WHERE id=$2`,
+      [supervised.ok ? 'respondido_por_comentario_owner' : 'comentado_envio_fallo', fid]
+    ).catch(e => console.error('[ia360-failure] mark comment send:', e.message));
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      customFields: { ia360_awaiting_comment_failure: '' },
+    }).catch(e => console.error('[ia360-failure] clear awaiting:', e.message));
+    const ackName = supervised.contactName || (supervised.contactNumber ? `contacto ${maskIa360Number(supervised.contactNumber)}` : 'el contacto');
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_comment_fail_saved',
+      body: supervised.ok
+        ? `Listo: guardé tu comentario y se lo envié a ${ackName}.`
+        : `Guardé tu comentario, pero no pude enviarlo al contacto (${supervised.reason || 'error desconocido'}).`,
+    });
+    return true;
+  } catch (capErr) {
+    console.error('[ia360-failure] comment-capture error:', capErr.message);
+    return false;
+  }
+}
+
 function buildIa360OwnerMemoryReadout({ record, signals, persisted }) {
   const lines = [
     'Readout IA360 memoria',
@@ -1166,6 +1337,37 @@ async function upsertIa360SharedContact({ record, shared }) {
 
 function isIa360OwnerNumber(phone) {
   return normalizePhone(phone) === IA360_OWNER_NUMBER;
+}
+
+function ia360PersonaKeyFromRelationship(rel) {
+  const r = String(rel || '').trim();
+  if (r === 'referido_bni') return 'persona_referido';
+  if (r === 'aliado_socio') return 'persona_aliado';
+  if (r === 'beta_amigo') return 'persona_beta';
+  if (r === 'cliente_activo' || r === 'cliente_activo_beta_supervisado') return 'persona_cliente';
+  if (r === 'sponsor_ejecutivo') return 'persona_sponsor';
+  if (r === 'director_comercial') return 'persona_comercial';
+  if (r === 'cfo_finanzas') return 'persona_cfo';
+  if (r === 'guardian_tecnico') return 'persona_tecnico';
+  return null;
+}
+
+function suggestIa360PersonaFromContactContext(contact) {
+  if (!contact) return null;
+  const cf = contact.custom_fields || {};
+  const tags = Array.isArray(contact.tags) ? contact.tags : [];
+  const chapter = String(cf.bni_chapter || '').trim();
+  const bniSignal = Boolean(chapter || cf.bni_role || tags.includes('bni-industrial-jalisco') || /\bbni\b/i.test(String(cf.source || '')));
+  if (bniSignal) {
+    const relPersona = ia360PersonaKeyFromRelationship(cf.relationship_context || cf.ia360_persona_first?.classification?.relationship_context);
+    return {
+      persona: relPersona || 'persona_referido',
+      reason: chapter ? `Miembro BNI ${chapter} (AlekContenido)` : 'Contacto BNI registrado en AlekContenido/ForgeChat',
+    };
+  }
+  const rel = ia360PersonaKeyFromRelationship(cf.relationship_context || cf.ia360_persona_first?.classification?.relationship_context);
+  if (rel) return { persona: rel, reason: 'contexto persistido del contacto (AlekContenido/ForgeChat)' };
+  return null;
 }
 
 async function recordBlockedOwnerNumberVcard({ record, shared }) {
@@ -2055,15 +2257,25 @@ async function enqueueIa360Interactive({ record, label, messageBody, interactive
 // existing IA360 interactive path. metaSend.sendInteractive forwards `interactive` verbatim,
 // so a flow object is sent as-is. Returns the bool from enqueueIa360Interactive
 // (true once enqueued; downstream Meta rejection is NOT observable here).
-async function enqueueIa360FlowMessage({ record, flowId, screen, cta, bodyText, mediaUrl, flowToken, label, footer = 'IA360' }) {
+// `mediaUrl` es OPCIONAL: sin él se manda el Flow SIN header de imagen (Meta lo
+// permite y así se envió a mano la Sesión de Afinación DIAPAZO). Un header con
+// link undefined sería un envío roto, no un envío sin imagen.
+// `messageBody` permite fijar el texto que queda en chat_history (evidencia de
+// auditoría) cuando el Flow no es de la marca IA360.
+// `modo` = 'draft' manda un Flow SIN publicar, que es la única forma de probar un
+// Flow nuevo de punta a punta antes de publicarlo (publicar no se deshace, sólo se
+// deprecia). Meta lo entrega con un aviso de versión de prueba. Default 'published':
+// nadie manda un borrador a un cliente por descuido.
+async function enqueueIa360FlowMessage({ record, flowId, screen, cta, bodyText, mediaUrl, flowToken, label, footer = 'IA360', messageBody, modo = 'published' }) {
   const interactive = {
     type: 'flow',
-    header: { type: 'image', image: { link: mediaUrl } },
+    ...(mediaUrl ? { header: { type: 'image', image: { link: mediaUrl } } } : {}),
     body: { text: bodyText },
     footer: { text: footer },
     action: {
       name: 'flow',
       parameters: {
+        ...(modo === 'draft' ? { mode: 'draft' } : {}),
         flow_message_version: '3',
         flow_token: flowToken,
         flow_id: flowId,
@@ -2076,7 +2288,7 @@ async function enqueueIa360FlowMessage({ record, flowId, screen, cta, bodyText, 
   return enqueueIa360Interactive({
     record,
     label: label || `ia360_flow_${flowToken}`,
-    messageBody: `IA360 Flow: ${cta}`,
+    messageBody: messageBody || `IA360 Flow: ${cta}`,
     interactive,
   });
 }
@@ -2281,7 +2493,13 @@ const { validateTemplateSend } = require('../integrations/templateValidator');
 function renderIa360TemplateBody(tpl, record, vars = null) {
   const samples = parseTemplateSamples(tpl.samples);
   return String(tpl.body || '').replace(/\{\{\s*(\d+)\s*\}\}/g, (_, k) => {
-    if (k === '1') return firstNameForTemplate(record);
+    if (k === '1') {
+      // Inbox Orchestrator: si el flujo pasa vars[1] con contenido (p.ej. remitente
+      // completo "Banco BBVA"), usarlo literal; si no, conservar el primer nombre
+      // (comportamiento de todos los demas flujos que NO pasan vars[1]).
+      const v1 = vars?.[1];
+      return (v1 != null && String(v1).trim() !== '') ? String(v1) : firstNameForTemplate(record);
+    }
     const v = vars?.[k];
     const hasVar = v != null && String(v).trim() !== '';
     return hasVar ? String(v) : String(samples[k] || ' ');
@@ -2306,7 +2524,13 @@ async function buildIa360TemplateComponents(tpl, account, record, vars = null) {
       // quien_intro) tiene prioridad SOLO si trae contenido; si no, se conserva
       // el fallback samples[k] || ' ' de los flujos existentes.
       parameters: indexes.map(k => {
-        if (k === '1') return { type: 'text', text: firstNameForTemplate(record) };
+        if (k === '1') {
+          // Inbox Orchestrator: vars[1] (remitente completo) tiene prioridad si trae
+          // contenido; si no, primer nombre (paridad con renderIa360TemplateBody y
+          // backward-compatible: el resto de flujos no pasan vars[1]).
+          const v1 = vars?.[1];
+          return { type: 'text', text: (v1 != null && String(v1).trim() !== '') ? String(v1) : firstNameForTemplate(record) };
+        }
         const v = vars?.[k];
         const hasVar = v != null && String(v).trim() !== '';
         return { type: 'text', text: hasVar ? String(v) : String(samples[k] || ' ') };
@@ -2331,7 +2555,10 @@ async function waitForIa360OutboundStatus(handlerFor, timeoutMs = 9000) {
       [handlerFor]
     );
     last = rows[0] || last;
-    if (last && ['sent', 'failed'].includes(String(last.status || '').toLowerCase())) return last;
+    // Meta can accept a template as "sent" and then immediately return a failed
+    // status (e.g. ecosystem engagement quality). Do not report success on the
+    // first transient sent row; keep polling briefly so fast failures are caught.
+    if (last && ['failed', 'delivered', 'read'].includes(String(last.status || '').toLowerCase())) return last;
   }
   return last || { status: 'unknown' };
 }
@@ -2564,6 +2791,16 @@ function getInteractiveReplyId(record) {
 //   - optout:      send reply, move deal to "Perdido / no fit"
 //   - else:        send the agent's coherent reply (and advance pain if asked)
 // Fire-and-forget from the inbound loop so it never blocks the Meta 200 ack.
+function buildIa360ClienteActivoBetaPseudoDeal(contact) {
+  return {
+    id: null,
+    stage_name: 'Cliente activo beta supervisado',
+    stage_type: 'active_client_beta',
+    memory_mode: 'cliente_activo_beta_supervisado',
+    contact_context: contact,
+  };
+}
+
 async function getActiveNonTerminalIa360Deal(record) {
   const { rows: pipeRows } = await pool.query(
     `SELECT id FROM coexistence.pipelines WHERE name = 'IA360 WhatsApp Revenue Pipeline' LIMIT 1`
@@ -2583,13 +2820,7 @@ async function getActiveNonTerminalIa360Deal(record) {
   if (!deal) {
     const contact = await loadIa360ContactContext(record).catch(() => null);
     if (isIa360ClienteActivoBetaContact(contact)) {
-      return {
-        id: null,
-        stage_name: 'Cliente activo beta supervisado',
-        stage_type: 'active_client_beta',
-        memory_mode: 'cliente_activo_beta_supervisado',
-        contact_context: contact,
-      };
+      return buildIa360ClienteActivoBetaPseudoDeal(contact);
     }
     return null;
   }
@@ -2615,10 +2846,7 @@ async function getActiveNonTerminalIa360Deal(record) {
     if (isIa360ClienteActivoBetaContact(contact)) {
       return {
         ...deal,
-        stage_name: 'Cliente activo beta supervisado',
-        stage_type: 'active_client_beta',
-        memory_mode: 'cliente_activo_beta_supervisado',
-        contact_context: contact,
+        ...buildIa360ClienteActivoBetaPseudoDeal(contact),
       };
     }
     return null;
@@ -2800,21 +3028,31 @@ async function reflectIa360ToEspoCrm({ record, agent, channel = 'whatsapp' }) {
 // "Elegir persona" (sendIa360VcardPersonaList). NUNCA queda mudo.
 async function notifyOwnerVcardCaptured({ record, shared }) {
   try {
-    const suggestion = suggestIa360Persona(shared);
+    let suggestion = suggestIa360Persona(shared);
+    const targetContact = String(shared.contactNumber || '').replace(/\D/g, '');
+    let contact = null;
+    // BNI/RAG seed path: si el contacto ya existe en ForgeChat con persona-first
+    // persistida (p.ej. import AlekContenido BNI Industrial), usamos esa señal antes
+    // de caer a la lista corta. Así un vCard compartido por Alek "ya sabe" quién es,
+    // salta al readout 1-tap y conserva el guardrail: CERO egress sin aprobación.
+    try {
+      contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+    } catch (e) { console.error('[ia360-vcard-1tap] preload contact:', e.message); }
+    const contextSuggestion = suggestIa360PersonaFromContactContext(contact);
+    if (!suggestion && contextSuggestion) suggestion = contextSuggestion;
+    const persistedPersonaKey = contact?.custom_fields?.ia360_persona_first?.classification?.persona_key
+      || contextSuggestion?.persona
+      || ia360PersonaKeyFromRelationship(contact?.custom_fields?.relationship_context || contact?.custom_fields?.ia360_persona_first?.classification?.relationship_context);
     // G-FIX4: DOBLE señal (canal BNI + relación personal) → NO auto-saltamos:
     // preguntamos el tono. Señal de relación = token "amig"/"beta" en el nombre
     // o el flag tono_personal persistido por el comando "intro" (best-effort).
-    let relationPersonalFlag = false;
-    try {
-      const tcNum = String(shared.contactNumber || '').replace(/\D/g, '');
-      const tcContact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: tcNum });
-      relationPersonalFlag = tcContact?.custom_fields?.tono_personal === true;
-    } catch (e) { console.error('[ia360-tone] preload flag:', e.message); }
+    let relationPersonalFlag = contact?.custom_fields?.tono_personal === true;
     const toneConflict = detectIa360ToneConflictPure({ name: shared.name, relationPersonalFlag });
     if (toneConflict.conflict) {
       return await sendIa360ToneChoiceCard({ record, shared });
     }
-    const flowKey = suggestion && suggestion.persona;
+    const flowKey = (suggestion && suggestion.persona) || persistedPersonaKey;
+    const suggestionReason = suggestion?.reason || (persistedPersonaKey ? 'contexto persistido del contacto (AlekContenido/ForgeChat)' : '');
     const flow = flowKey ? IA360_PERSONA_SEQUENCE_FLOWS[flowKey] : null;
     if (!flow) {
       // G-FIX5: senal de persona nula -> en vez de la lista de 10, una tarjeta
@@ -2822,8 +3060,6 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
       // viejo (sendIa360VcardPersonaList) sigue vivo detras de "Ver todas".
       return await sendIa360VcardQuickList({ record, shared });
     }
-    const targetContact = String(shared.contactNumber || '').replace(/\D/g, '');
-    const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
     // Rankear secuencias por senales reales del contacto (mismo ranker que el
     // selector). Tomamos la sugerida; si el ranker no sugiere (sin senales),
     // tomamos la primera del catalogo de esa persona (orden de diseno).
@@ -2845,7 +3081,7 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
             persona_key: flowKey,
             relationship_context: flow.relationshipContext,
             auto_suggested: true,
-            suggested_reason: suggestion.reason,
+            suggested_reason: suggestionReason,
             at: new Date().toISOString(),
           },
         },
@@ -2857,7 +3093,7 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: `owner_vcard_autosuggest_${targetContact}`,
-      body: `Alek, capture a ${who} (${shared.contactNumber}). Auto-elegi persona «${flow.personaContext}» (${suggestion.reason}) y la secuencia sugerida. Abajo el borrador: aprueba, o toca «Cambiar» para elegir otra persona/secuencia. Sigo en dry-run: nada sale al contacto sin tu OK.`,
+      body: `Alek, capture a ${who} (${shared.contactNumber}). Auto-elegi persona «${flow.personaContext}» (${suggestionReason}) y la secuencia sugerida. Abajo el borrador: aprueba, o toca «Cambiar» para elegir otra persona/secuencia. Sigo en dry-run: nada sale al contacto sin tu OK.`,
       targetContact,
       ownerBudget: true,
     });
@@ -4833,16 +5069,14 @@ async function sendIa360ApproveCard({ record, targetContact, name, flow, sequenc
   let bodyText = `Alek, el borrador para ${name} (${flow.personaContext}, secuencia ${sequence.label}) está arriba en el readout. ¿Qué hago?`;
   if (coldNotice) bodyText += `\n${coldNotice}`;
   if (bodyText.length > 1024) bodyText = compactForWhatsApp(bodyText, 1024);
-  const rows = [
-    ...(coldBlocked ? [] : [{ id: `owner_approve_send:${targetContact}:${sequence.id}`, title: 'Aprobar y enviar', description: 'Envío el opener al contacto y avanzo el pipeline' }]),
-    { id: `owner_approve_edit:${targetContact}:${sequence.id}`, title: 'Editar copy', description: 'Queda en borrador; lo editas antes de enviar' },
-    { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar', description: 'Captura sin envío ni secuencia' },
-    { id: `owner_approve_dnc:${targetContact}:${sequence.id}`, title: 'No contactar', description: 'Exclusión operativa, sin envío' },
-    { id: `owner_approve_manual:${targetContact}:${sequence.id}`, title: 'Tomar manual', description: 'Tú le escribes; muevo el deal a Requiere Alek' },
-    // G-FIX3: en el flujo 1-tap desde vCard, "Cambiar" reabre la lista "Elegir
-    // persona" (flujo viejo) para corregir la persona/secuencia auto-sugerida.
-    ...(allowVcardChange ? [{ id: `owner_vcard_change:${targetContact}`, title: 'Cambiar', description: 'Elegir otra persona/secuencia (reabre la selección)' }] : []),
-  ];
+  // UX de producción: NO usar lista escondida para la aprobación crítica.
+  // WhatsApp sí muestra 1-tap con botones; el resto queda cubierto por texto libre
+  // ("aprobado", "guardar", "manual") y por el botón Cambiar.
+  const buttons = [
+    ...(coldBlocked ? [] : [{ type: 'reply', reply: { id: `owner_approve_send:${targetContact}:${sequence.id}`, title: '✅ Aprobar y enviar' } }]),
+    { type: 'reply', reply: { id: allowVcardChange ? `owner_vcard_change:${targetContact}` : `owner_approve_edit:${targetContact}:${sequence.id}`, title: allowVcardChange ? 'Cambiar' : 'Editar copy' } },
+    { type: 'reply', reply: { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar' } },
+  ].slice(0, 3);
   return sendOwnerInteractive({
     record,
     label: `owner_approve_card_${targetContact}_${sequence.id}`,
@@ -4850,17 +5084,11 @@ async function sendIa360ApproveCard({ record, targetContact, name, flow, sequenc
     targetContact,
     ownerBudget: true,
     interactive: {
-      type: 'list',
+      type: 'button',
       header: { type: 'text', text: 'Aprobar envío' },
-      body: { text: bodyText },
-      footer: { text: 'Solo envío con tu aprobación explícita' },
-      action: {
-        button: 'Decidir',
-        sections: [{
-          title: 'Acciones',
-          rows,
-        }],
-      },
+      body: { text: bodyText + '\n\nTambién puedes responder en texto: APROBADO / GUARDAR / MANUAL.' },
+      footer: { text: 'IA360 · acción 1-tap' },
+      action: { buttons },
     },
   });
 }
@@ -4886,6 +5114,86 @@ async function ia360ApproveSendDeny({ record, targetContact, reason, body }) {
     targetContact,
     ownerBudget: true,
   });
+}
+
+
+function parseIa360OwnerApproveTextCommand(text) {
+  const body = String(text || '').trim().toLowerCase();
+  if (!body) return null;
+  if (/\b(no\s+contactar|no\s+le\s+mandes|no\s+mandes|excluir|dnc)\b/.test(body)) return 'dnc';
+  if (/\b(solo\s+guardar|guarda(?:r|lo)?|sin\s+enviar|no\s+enviar)\b/.test(body)) return 'keep';
+  if (/\b(manual|lo\s+tomo|yo\s+le\s+escribo|yo\s+lo\s+tomo)\b/.test(body)) return 'manual';
+  if (/\b(aprobado|apruebo|aprobada|aprobar|env[ií]a(?:lo)?|m[aá]nda(?:lo)?|dale|s[ií]\s*,?\s*(env[ií]a|manda|aprob))\b/.test(body)) return 'send';
+  return null;
+}
+
+async function findLatestIa360ApproveCardForOwner({ record, text }) {
+  const body = String(text || '').toLowerCase();
+  const { rows } = await pool.query(
+    `SELECT h.id, h.created_at, h.template_meta->>'label' AS label,
+            c.contact_number, c.name, c.custom_fields
+       FROM coexistence.chat_history h
+       LEFT JOIN coexistence.contacts c
+         ON c.wa_number=h.wa_number
+        AND c.contact_number = substring(h.template_meta->>'label' from '^owner_approve_card_([0-9]+)_')
+      WHERE h.wa_number=$1
+        AND h.contact_number=$2
+        AND h.direction='outgoing'
+        AND h.message_type='interactive'
+        AND h.template_meta->>'label' LIKE 'owner_approve_card_%'
+        AND h.created_at > NOW() - INTERVAL '24 hours'
+      ORDER BY h.created_at DESC
+      LIMIT 8`,
+    [record.wa_number, IA360_OWNER_NUMBER]
+  );
+  if (!rows.length) return null;
+  const explicit = rows.find(r => {
+    const n = String(r.name || '').toLowerCase();
+    const num = String(r.contact_number || '');
+    if (num && body.includes(num.slice(-6))) return true;
+    if (n && n.split(/\s+/).filter(Boolean).some(part => part.length >= 4 && body.includes(part))) return true;
+    return false;
+  });
+  const row = explicit || rows[0];
+  const m = String(row.label || '').match(/^owner_approve_card_(\d+)_(.+)$/);
+  if (!m) return null;
+  return { targetContact: m[1], sequenceId: m[2], label: row.label, name: row.name || null };
+}
+
+async function handleIa360OwnerApproveTextFallback(record) {
+  if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
+  if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) return false;
+  const action = parseIa360OwnerApproveTextCommand(record.message_body);
+  if (!action) return false;
+  const card = await findLatestIa360ApproveCardForOwner({ record, text: record.message_body });
+  if (!card) {
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_approve_text_no_card',
+      body: 'Te entendí, pero no encontré una tarjeta IA360 de aprobación vigente en las últimas 24h. Mándame la vCard otra vez o responde con nombre/número después de que salga la tarjeta.',
+      ownerBudget: true,
+    });
+    return true;
+  }
+  console.log('[ia360-approve-text] action=%s target=%s seq=%s from_text="%s"', action, card.targetContact, card.sequenceId, String(record.message_body || '').slice(0, 80));
+  if (action === 'send') {
+    await handleIa360OwnerApproveSend({ record, targetContact: card.targetContact, sequenceId: card.sequenceId });
+    return true;
+  }
+  if (action === 'keep') {
+    await handleIa360TerminalVcardChoice({ record, targetContact: card.targetContact, terminalChoice: 'guardar' });
+    return true;
+  }
+  if (action === 'dnc') {
+    await handleIa360TerminalVcardChoice({ record, targetContact: card.targetContact, terminalChoice: 'excluir' });
+    return true;
+  }
+  if (action === 'manual') {
+    await handleIa360OwnerApproveManual({ record, targetContact: card.targetContact });
+    return true;
+  }
+  return false;
 }
 
 // G-FIX6: ofrece la SALIDA cuando cliente_expansion (u otra requiresLiveDeal)
@@ -7220,17 +7528,19 @@ async function handleIa360BotFailure({ record, reason, alreadyResponded = false 
   if (failureId != null) {
     try {
       const reasonShort = String(reason || 'no-manejado').slice(0, 80);
+      const contact = await loadIa360ContactContext(record).catch(() => null);
+      const displayName = ia360ContactDisplayName({ contact, record, fallbackNumber: record.contact_number });
       await sendOwnerInteractive({
         record,
         label: 'owner_bot_failure',
-        messageBody: `IA360: el bot no resolvió un mensaje de ${record.contact_number || 'desconocido'}`,
+        messageBody: `IA360: el bot no resolvió un mensaje de ${displayName}`,
         interactive: {
           type: 'button',
-          body: { text: `Alek, el bot no resolvió un mensaje de ${record.contact_number || 'desconocido'}: "${String(record.message_body || '').slice(0, 300)}" (${reasonShort}). ¿Qué hago?` },
+          body: { text: `Alek, el bot no resolvió un mensaje de ${displayName}: "${String(record.message_body || '').slice(0, 300)}" (${reasonShort}). ¿Qué hago?` },
           action: {
             buttons: [
               { type: 'reply', reply: { id: `owner_take_fail:${failureId}`, title: 'Lo tomo' } },
-              { type: 'reply', reply: { id: `owner_comment_fail:${failureId}`, title: 'Comentar' } },
+              { type: 'reply', reply: { id: `owner_comment_fail:${failureId}`, title: 'Responder' } },
               { type: 'reply', reply: { id: `owner_ignore_fail:${failureId}`, title: 'Ignorar' } },
             ],
           },
@@ -7375,10 +7685,14 @@ async function handleIa360FreeText(record) {
   try {
     if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return;
     if (!record.message_body || !String(record.message_body).trim()) return;
-    const deal = await getActiveNonTerminalIa360Deal(record);
-    if (!deal) return; // only inside an active, non-terminal IA360 funnel
+    const preloadedContactContext = await loadIa360ContactContext(record).catch(() => null);
+    let deal = await getActiveNonTerminalIa360Deal(record);
+    if (!deal && isIa360ClienteActivoBetaContact(preloadedContactContext)) {
+      deal = buildIa360ClienteActivoBetaPseudoDeal(preloadedContactContext);
+    }
+    if (!deal) return; // only inside an active IA360 funnel or explicit beta/champion context
     dealFound = true;
-    const contactContext = deal.contact_context || await loadIa360ContactContext(record).catch(() => null);
+    const contactContext = deal.contact_context || preloadedContactContext || await loadIa360ContactContext(record).catch(() => null);
     if (deal.memory_mode === 'cliente_activo_beta_supervisado' || isIa360ClienteActivoBetaContact(contactContext)) {
       // G-LIVE (P0 producción): cliente activo/beta SIEMPRE recibe respuesta real.
       // 1) Captura de memoria: aprendizaje en segundo plano REAL (fire-and-forget,
@@ -7402,6 +7716,24 @@ async function handleIa360FreeText(record) {
           reason: 'handoff: pregunta de datos vivos del portal del cliente (sin acceso desde WhatsApp)',
           alreadyResponded: sentHandoff === true,
         }).catch(e => console.error('[ia360-failure] portal handoff alert error:', e.message));
+        return;
+      }
+
+      // Operaciones beta: no hay contrato certificado para datos vivos de inventario,
+      // taller, sucursales, refacciones, obsolescencia, mercado o compradores en esta
+      // story. Se responde con holding honesto y se registra trazabilidad.
+      if (isIa360OperacionesChampionContact(contactContext) && isIa360OperacionesLiveDataQuestion(record.message_body)) {
+        const sentHandoff = await enqueueIa360Text({
+          record,
+          label: 'ia360_operaciones_live_data_holding',
+          body: buildIa360OperacionesLiveDataHoldingResponse(),
+        });
+        if (sentHandoff) responded = true;
+        await handleIa360BotFailure({
+          record,
+          reason: 'handoff: pregunta Operaciones beta requiere fuente certificada no cableada',
+          alreadyResponded: sentHandoff === true,
+        }).catch(e => console.error('[ia360-failure] operaciones handoff alert error:', e.message));
         return;
       }
 
@@ -7861,6 +8193,49 @@ function extractIa360NfmResponse(record) {
   }
 }
 
+// DIAPAZO — reenvío del nfm_reply de la Sesión de Afinación al intake de n8n,
+// que lo guarda en la Data Table `diapazo_sesion_afinacion` y pide a Brain v2 la
+// lectura. Las respuestas con c1..c6 son v2; v1 no contenía esas seis cuerdas.
+// Mismo patrón que projectSignedWebhook (AbortController + timeout), pero
+// con secreto compartido en el body: aquí no hay firma de Meta que reenviar.
+// Timeout 120 s con holgura DELIBERADA sobre los 90 s del nodo "Llamar Brain v2":
+// medido, Brain v2 tarda entre 7 y 78 s. Si los dos plazos empataran, ForgeChat
+// cortaría justo cuando n8n devuelve el acuse de respaldo y se perdería la lectura.
+// El contacto NO espera esta respuesta (el acuse ya salió antes de llamar aquí).
+const DIAPAZO_SESION_INTAKE_URL = process.env.N8N_DIAPAZO_SESION_INTAKE_URL
+  || 'https://n8n.geekstudio.dev/webhook/diapazo-sesion-afinacion';
+const DIAPAZO_SESION_INTAKE_TIMEOUT_MS = 120000;
+const DIAPAZO_SESION_ACK = 'Recibí tus respuestas. Estoy preparando tu lectura y te la comparto en breve.';
+
+async function postDiapazoSesionAfinacion(record, data) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DIAPAZO_SESION_INTAKE_TIMEOUT_MS);
+  const flowName = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6'].every((campo) => Object.hasOwn(data, campo))
+    ? 'diapazo_sesion_afinacion_v2'
+    : 'diapazo_sesion_afinacion_v1';
+  try {
+    const res = await fetch(DIAPAZO_SESION_INTAKE_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        secret: process.env.DIAPAZO_FLOW_INTAKE_SECRET || '',
+        message_id: record.message_id,
+        contact_wa_number: record.contact_number,
+        flow_name: flowName,
+        flow_token: data.flow_token || '',
+        respuestas: data,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error('diapazo_intake_http_' + res.status);
+    const body = await res.json().catch(() => ({}));
+    if (!body || body.ok !== true) throw new Error('diapazo_intake_not_ok');
+    return typeof body.reply_text === 'string' ? body.reply_text.trim() : '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const URGENCIA_LEGIBLE = {
   esta_semana: 'algo de esta semana',
   este_mes: 'algo de este mes',
@@ -7880,6 +8255,119 @@ const SOLUCION_LEGIBLE = {
   taller_capacitacion: 'un taller de capacitación', servicio_productizado: 'un servicio productizado',
   saas_aiaas: 'una plataforma SaaS/AIaaS', consultoria_premium: 'consultoría premium', aun_no_se: 'la opción que mejor te encaje',
 };
+
+function camionesBetaReplyInfo(replyId, answer) {
+  const id = String(replyId || '').trim().toUpperCase();
+  const title = String(answer || '').trim();
+  const info = {
+    CS_AND_Q1_UTILIDAD: {
+      lane: 'Andrés / prioridad',
+      value: 'Utilidad real',
+      ack: 'Perfecto, tomo utilidad real como prioridad: venta-costo, carrocerías, acondicionamiento y cuentas que deben sumarse al costo.',
+      next: 'Pedir/validar reglas contables: cuentas de costo, excepciones por sucursal/unidad/proveedor y responsable de validación.',
+    },
+    CS_AND_Q1_REFACC: {
+      lane: 'Andrés / prioridad',
+      value: 'Refacciones',
+      ack: 'Perfecto, tomo refacciones como prioridad: motivo de pedido, seguimiento a factura/cobro, días de alerta y stock objetivo.',
+      next: 'Profundizar en flujo pedido → factura/cobro → alerta → responsable.',
+    },
+    CS_AND_Q1_KPIS: {
+      lane: 'Andrés / prioridad',
+      value: 'KPIs generales',
+      ack: 'Perfecto, tomo KPIs generales como prioridad. Lo voy a ordenar como catálogo de indicadores con fuente, frecuencia, responsable, reglas de semáforo y métricas configurables.',
+      next: 'Usar KPIS Presentación 2 como contrato de indicadores, separar fuente TOTVS vs regla/configuración, e incluir un motor donde Finanzas pueda crear métricas con sumas/restas entre cuentas.',
+    },
+    CS_AND_Q2_CUENTAS: {
+      lane: 'Andrés / parametrización',
+      value: 'Cuentas costo',
+      ack: 'Recibido: priorizamos que Finanzas pueda configurar cuentas y cálculos entre cuentas, para que utilidad real y nuevos KPIs no dependan de una regla fija en código.',
+      next: 'Mapear cuentas contables, operaciones permitidas (sumas/restas) y reglas por excepción para construir métricas configurables.',
+    },
+    CS_AND_Q2_MOTIVO: {
+      lane: 'Andrés / parametrización',
+      value: 'Motivo pedido',
+      ack: 'Recibido: priorizamos motivo de pedido como parámetro obligatorio para distinguir mostrador, orden de servicio y stock.',
+      next: 'Diseñar catálogo de motivos y controles posteriores por motivo.',
+    },
+    CS_AND_Q2_SEMAF: {
+      lane: 'Andrés / parametrización',
+      value: 'Semáforos KPI',
+      ack: 'Recibido: priorizamos semáforos de KPI configurables para que los umbrales puedan ajustarse por indicador/sucursal.',
+      next: 'Definir umbrales verde/amarillo/rojo por KPI y responsable de aprobación.',
+    },
+    CS_AND_Q2_STOCK: {
+      lane: 'Andrés / parametrización',
+      value: 'Stock mínimo',
+      ack: 'Recibido: priorizamos stock mínimo/objetivo configurable para controlar refacciones sin depender sólo del histórico.',
+      next: 'Definir stock mínimo/ideal por refacción/sucursal y alertas por antigüedad.',
+    },
+    CS_AND_Q2_RESP: {
+      lane: 'Andrés / parametrización',
+      value: 'Responsables',
+      ack: 'Recibido: priorizamos responsables configurables para que cada desviación tenga dueño claro.',
+      next: 'Mapear responsables por sucursal, área e indicador.',
+    },
+    CS_AND_Q2_EXCEP: {
+      lane: 'Andrés / parametrización',
+      value: 'Excepciones',
+      ack: 'Recibido: priorizamos excepciones configurables para no falsear KPIs cuando haya casos especiales.',
+      next: 'Capturar reglas especiales por sucursal, unidad, proveedor, cuenta o tipo de operación.',
+    },
+    CS_AND_Q2_TODO: {
+      lane: 'Andrés / parametrización',
+      value: 'Todo',
+      ack: 'Perfecto, tomo que conviene parametrizar todo el bloque de control: cuentas, cálculos aritméticos entre cuentas, motivo de pedido, semáforos, stock, responsables y excepciones.',
+      next: 'Diseñar un configurador por módulos, empezando por métricas financieras configurables (sumas/restas entre cuentas) + utilidad real + refacciones.',
+    },
+    CS_MULTI_Q1_IGUAL: {
+      lane: 'Juan Carlos / multi-sucursal',
+      value: 'Sí, igual',
+      ack: 'Perfecto, tomo que la lógica de Tepic aplica igual para las demás sucursales; la diseñamos multi-sucursal con Tepic como validación inicial.',
+      next: 'Parametrizar metas/reglas por sucursal aunque la fórmula base sea común.',
+    },
+    CS_MULTI_Q1_AJUSTES: {
+      lane: 'Juan Carlos / multi-sucursal',
+      value: 'Con ajustes',
+      ack: 'Perfecto, tomo que la lógica de Tepic aplica con ajustes por sucursal. Eso confirma que necesitamos parámetros editables desde UI.',
+      next: 'Preguntar cuáles ajustes cambian: metas, semáforos, responsables, stock/familias o presupuesto.',
+    },
+    CS_MULTI_Q1_REVISAR: {
+      lane: 'Juan Carlos / multi-sucursal',
+      value: 'Hay que revisar',
+      ack: 'Perfecto, tomo que hay que revisar la lógica antes de generalizarla. Usaremos Tepic como caso piloto y separaremos reglas comunes vs reglas por sucursal.',
+      next: 'Pedir diferencias por sucursal y validar fórmula KPI por KPI.',
+    },
+    CSQ2METAS: { lane: 'Juan Carlos / parametrización', value: 'Metas', ack: 'Recibido: priorizamos metas por sucursal/mes/área como primer parámetro de UI.', next: 'Diseñar carga/edición de metas y responsable de autorización.' },
+    CSQ2SEMAF: { lane: 'Juan Carlos / parametrización', value: 'Semáforos', ack: 'Recibido: priorizamos semáforos configurables por KPI y sucursal.', next: 'Definir umbrales por indicador y permisos de edición.' },
+    CSQ2STOCK: { lane: 'Juan Carlos / parametrización', value: 'Stock ideal', ack: 'Recibido: priorizamos stock ideal por sucursal/refacción.', next: 'Mapear si stock ideal viene de Excel, TOTVS o regla administrativa.' },
+    CSQ2FAMIL: { lane: 'Juan Carlos / parametrización', value: 'Familias', ack: 'Recibido: priorizamos familias/clasificación de refacciones como parámetro.', next: 'Definir catálogo y homologación contra TOTVS.' },
+    CSQ2PRESU: { lane: 'Juan Carlos / parametrización', value: 'Presupuesto', ack: 'Recibido: priorizamos presupuesto/metas autorizadas por sucursal.', next: 'Separar paneles de resultado vs presupuesto de gastos.' },
+    CSQ2TODO: { lane: 'Juan Carlos / parametrización', value: 'Todo', ack: 'Perfecto, tomo que conviene parametrizar todo el bloque multi-sucursal.', next: 'Ordenar configurador por fases para no frenar el piloto Tepic.' },
+    CSQ2OTRO: { lane: 'Juan Carlos / parametrización', value: 'Otro', ack: 'Perfecto, dime por texto qué otro parámetro pondrías primero y lo agrego al diseño.', next: 'Esperar aclaración libre del usuario.' },
+  };
+  return info[id] ? { id, title, ...info[id] } : null;
+}
+
+async function handleCamionesBetaInteractiveReply({ record, replyId, answer }) {
+  const info = camionesBetaReplyInfo(replyId, answer);
+  if (!info) return false;
+  const contactName = record.contact_name || record.profile_name || record.contact_number;
+  await enqueueIa360Text({
+    record,
+    label: 'camiones_beta_option_ack',
+    body: `${info.ack}\n\nSiguiente paso: ${info.next}`,
+  });
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_camiones_beta_option_notice',
+    body: `Camiones beta: ${contactName} respondió ${info.lane}: "${info.value}" (${info.id}).\n\nInterpretación: ${info.next}`,
+    targetContact: record.contact_number,
+    ownerBudget: true,
+  }).catch(e => console.error('[camiones-beta] owner notice:', e.message));
+  return true;
+}
 
 async function handleIa360FlowReply(record) {
   try {
@@ -8115,6 +8603,49 @@ async function handleIa360FlowReply(record) {
           body: 'Listo, ajustado. Te mando solo lo útil y sin saturarte. Cuando quieras retomar, aquí estoy.',
         });
       }
+      return true;
+    }
+
+    if (data.cuerda !== undefined && data.camino !== undefined) {
+      // ── DIAPAZO · SESION DE AFINACION ─────────────────────────────────────
+      // Se exigen DOS campos (cuerda + camino) para no colisionar con la rama
+      // `area + urgencia` del diagnóstico ia360, que también trae `urgencia`.
+      // Orden deliberado: el acuse sale PRIMERO y la lectura con IA llega como
+      // segundo mensaje, porque Brain v2 tarda 30-45 s y el Flow no puede dejar
+      // al contacto esperando. NUNCA `return false`: eso caería en el fallback
+      // genérico [ia360-fallback], que le manda un texto que no tiene que ver.
+      console.log('[diapazo-flowwire] event=sesion_afinacion_answered contact=%s cuerda=%s camino=%s', record.contact_number, data.cuerda, data.camino);
+      // Cierra el registro de abandono ANTES de nada: si esta sesión venía de
+      // /api/internal/diapazo-sesion, su flow_token tiene fila en
+      // diapazo_sesion_enviada y contestarla la saca del barrido de
+      // diapazoSesionRecordatorio (nadie recibe un "lo dejaste pendiente"
+      // después de haberlo contestado). Best-effort: un fallo aquí NUNCA puede
+      // romper la respuesta al contacto — el silencio en un contacto real es P0.
+      if (data.flow_token) {
+        try {
+          const cerrada = await pool.query(
+            `UPDATE coexistence.diapazo_sesion_enviada
+                SET respondido_en = NOW()
+              WHERE flow_token = $1 AND respondido_en IS NULL`,
+            [String(data.flow_token)]
+          );
+          if (cerrada.rowCount > 0) console.log('[diapazo-flowwire] sesion respondida flow_token=%s', data.flow_token);
+        } catch (e) {
+          console.error('[diapazo-flowwire] no se pudo marcar respondido_en (degradado):', e.message);
+        }
+      }
+      await enqueueIa360Text({ record, label: 'diapazo_sesion_afinacion_ack', body: DIAPAZO_SESION_ACK });
+      postDiapazoSesionAfinacion(record, data)
+        .then(async (replyText) => {
+          if (!replyText || replyText === DIAPAZO_SESION_ACK) return;
+          await enqueueIa360Text({
+            record,
+            label: 'diapazo_sesion_afinacion_lectura',
+            body: replyText,
+            dedupSuffix: ':diapazo_lectura',
+          });
+        })
+        .catch(e => console.error('[diapazo-flowwire] intake/lectura degradado (el acuse ya salió):', e.message));
       return true;
     }
 
@@ -8360,7 +8891,7 @@ async function handleIa360LiteInteractive(record) {
             customFields: { ia360_awaiting_comment_failure: fid },
           }).catch(e => console.error('[ia360-failure] set awaiting:', e.message));
         }
-        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_comment_fail_prompt', body: 'Escribe tu comentario para mejorar el bot:' });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_comment_fail_prompt', body: 'Escribe la respuesta para el contacto. La enviaré tal cual con prefijo “Alek me confirmó…”.' });
         return;
       }
       // owner_* desconocido: ack neutro + return (NUNCA cae al funnel).
@@ -8443,6 +8974,14 @@ async function handleIa360LiteInteractive(record) {
       console.error('[ia360-flowwire] dispatchContextFlow failed:', ctxErr.message);
     }
   }
+
+  // ── CAMIONES BETA: respuestas a encuestas exploratorias enviadas por Hermes ──
+  // Estas opciones no son parte del funnel IA360; son cuestionarios beta para
+  // Champions de Camiones Selectos. Si no se interceptan aquí, caen al fallback
+  // genérico (“la estoy ubicando”), que confunde al usuario y a Alek. Tratarlas
+  // como intake de producto: acuse contextual al contacto + aviso al owner para
+  // seguimiento humano/agentico.
+  if (await handleCamionesBetaInteractiveReply({ record, replyId, answer })) return;
 
   // IA360 100M WhatsApp prospecting flow: coherent stage machine for approved templates.
   const reply100m = {
@@ -9299,6 +9838,15 @@ async function handleIa360LiteInteractive(record) {
       const _endUtc = (confirmedSlot && confirmedSlot.end) || new Date(new Date(booking.start).getTime() + 3600000).toISOString();
       const _exp = new Date(new Date(booking.start).getTime() + 36*3600000).toISOString();
       await pool.query("INSERT INTO coexistence.ia360_meeting_links (token,event_id,contact_number,kind,start_utc,end_utc,summary,zoom_join_url,expires_at) VALUES ($1,$2,$3,\x27cal\x27,$4,$5,$6,$7,$8) ON CONFLICT (token) DO NOTHING", [_calToken, booking.calendarEventId || "", record.contact_number, booking.start, _endUtc, "Reunion con Alek (TransformIA)", booking.zoomJoinUrl || "", _exp]);
+      // Segundo token, destino Zoom. /r/:token solo redirige a la sala si kind='zoom'
+      // (ia360-calendar.js:43); con un único token kind='cal' el botón "Entrar a la
+      // reunión" acababa en la página de añadir-al-calendario. Un token por destino:
+      // el redirect se queda tonto y explícito. Lo consume quien manda
+      // diapazo_reunion_inicia_v1 / ia360_os_meeting_starting:
+      //   SELECT token FROM coexistence.ia360_meeting_links WHERE event_id=$1 AND kind='zoom'
+      const _zoomToken = require("crypto").randomBytes(18).toString("base64url");
+      await pool.query("INSERT INTO coexistence.ia360_meeting_links (token,event_id,contact_number,kind,start_utc,end_utc,summary,zoom_join_url,expires_at) VALUES ($1,$2,$3,\x27zoom\x27,$4,$5,$6,$7,$8) ON CONFLICT (token) DO NOTHING", [_zoomToken, booking.calendarEventId || "", record.contact_number, booking.start, _endUtc, "Reunion con Alek (TransformIA)", booking.zoomJoinUrl || "", _exp]);
+      console.log('[ia360-cal] event=meeting_links_ready event_id=%s cal=%s… zoom=%s…', booking.calendarEventId || '-', _calToken.slice(0, 6), _zoomToken.slice(0, 6));
       calLink = "\n\nAgrega la cita a tu calendario:\nhttps://wa.geekstudio.dev/api/r/" + _calToken;
     } catch (clErr) { console.error("[ia360-cal] booking token failed:", clErr.message); }
     await enqueueIa360Text({
@@ -10130,6 +10678,16 @@ router.post('/webhook/whatsapp', async (req, res) => {
       client.release();
     }
 
+    // Temporary migration bridge: only project the exact Meta-signed bytes after
+    // ForgeChat has committed them. Failure never suppresses the legacy path.
+    const whatsapp5gProjection = projectSignedWebhook({
+      rawBody: req.rawBody,
+      signature: req.get('x-hub-signature-256'),
+    }).catch((error) => {
+      console.error('[whatsapp5g-bridge] projection failed:', error.message);
+      return { skipped: false, failed: true };
+    });
+
     // Evaluate automation triggers
     // 1. For incoming messages (keyword, anyMessage, newContact triggers)
     //    First: if this conversation has paused executions awaiting a reply,
@@ -10205,6 +10763,22 @@ router.post('/webhook/whatsapp', async (req, res) => {
               .catch(e => { console.error('[ia360-blockexit] reply error:', e.message); return false; });
             if (handledBlockExit) continue;
           }
+          // ── APPROVE-SEND por texto libre ──────────────────────────────
+          // Si WhatsApp no muestra el botón o Alek responde "aprobado / envíalo",
+          // se ejecuta sobre la última tarjeta owner_approve_card vigente. Esto va
+          // ANTES del canary/agent para que jamás conteste "no puedo" ni quede atorado.
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+            const handledApproveText = await handleIa360OwnerApproveTextFallback(record)
+              .catch(e => { console.error('[ia360-approve-text] reply error:', e.message); return false; });
+            if (handledApproveText) continue;
+          }
+          // ── PRODUCTION-HARDENING: CAPTURA DEL COMENTARIO del owner ──────────
+          // Debe ir antes del canary/agent/flows: si Alek tocó “Responder” en una
+          // alerta de fallo, su siguiente texto se manda al contacto, no se procesa
+          // como una conversación normal del owner.
+          if (await captureIa360OwnerFailureComment(record)) continue;
+
           // ── CANARY Brain v2 (reversible, allowlist) ──────────────────
           // Antes de TODO el pipeline del monolito: si el remitente esta en la
           // allowlist y el flag esta on, el texto se enruta al Brain v2 y NO toca
@@ -10214,6 +10788,13 @@ router.post('/webhook/whatsapp', async (req, res) => {
             handleBrainV2Canary(record).catch(e => console.error('[brain-v2-canary] fire-and-forget:', e.message));
             continue;
           }
+          // ── G7 DIAPAZO INBOUND (aditivo, flag-gated, reversible) ───────────
+          // Tras el canary, ANTES del embudo IA360: si DIAPAZO_INBOUND='on' y el
+          // contacto es lead DIAPAZO (custom_fields.project='diapazo'), lo atiende
+          // su handler con voz DIAPAZO y CORTA el flujo (el monolito no contesta).
+          // Owner y no-DIAPAZO => false (siguen al embudo IA360/TransformIA intacto).
+          // Flag off por defecto => return false => CERO cambio de comportamiento.
+          if (await handleDiapazoInbound(record).catch(e => { console.error('[diapazo-inbound] dispatch:', e.message); return false; })) continue;
           // ── PRODUCTION-HARDENING: CAPTURA DEL COMENTARIO del owner ──────────
           // Va ANTES de TODO (paused-resume, flow, funnel): si el owner (Alek) tocó
           // "Comentar" en una alerta de fallo, su SIGUIENTE texto ES el comentario.
@@ -10234,12 +10815,30 @@ router.post('/webhook/whatsapp', async (req, res) => {
               const awaitingFid = awRows[0]?.fid;
               if (awaitingFid && String(awaitingFid).trim() !== '') {
                 const comment = String(record.message_body || '').trim();
+                const fid = String(awaitingFid).replace(/\D/g, '');
                 await pool.query(
                   `UPDATE coexistence.ia360_bot_failures
-                      SET owner_comment=$1, status='comentado'
+                      SET owner_comment=$1, owner_action='respondio_con_comentario', status='comentario_recibido'
                     WHERE id=$2`,
-                  [comment, String(awaitingFid).replace(/\D/g, '')]
+                  [comment, fid]
                 ).catch(e => console.error('[ia360-failure] save comment:', e.message));
+                let supervised = { ok: false, reason: 'not_attempted' };
+                try {
+                  supervised = await sendIa360OwnerCommentToFailureContact({
+                    ownerRecord: record,
+                    failureId: fid,
+                    comment,
+                  });
+                } catch (sendErr) {
+                  supervised = { ok: false, reason: sendErr.message };
+                  console.error('[ia360-failure] send owner comment to contact:', sendErr.message);
+                }
+                await pool.query(
+                  `UPDATE coexistence.ia360_bot_failures
+                      SET status=$1
+                    WHERE id=$2`,
+                  [supervised.ok ? 'respondido_por_comentario_owner' : 'comentado_envio_fallo', fid]
+                ).catch(e => console.error('[ia360-failure] mark comment send:', e.message));
                 // Limpia el flag. mergeContactIa360State NO borra llaves jsonb (solo
                 // concatena), así que lo vaciamos a '' y el check de arriba es `<> ''`.
                 await mergeContactIa360State({
@@ -10247,7 +10846,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
                   contactNumber: record.contact_number,
                   customFields: { ia360_awaiting_comment_failure: '' },
                 }).catch(e => console.error('[ia360-failure] clear awaiting:', e.message));
-                await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_comment_fail_saved', body: 'Gracias, guardado para seguir mejorando.' });
+                const ackName = supervised.contactName || (supervised.contactNumber ? `contacto ${maskIa360Number(supervised.contactNumber)}` : 'el contacto');
+                await sendIa360DirectText({
+                  record,
+                  toNumber: IA360_OWNER_NUMBER,
+                  label: 'owner_comment_fail_saved',
+                  body: supervised.ok
+                    ? `Listo: guardé tu comentario y se lo envié a ${ackName}.`
+                    : `Guardé tu comentario, pero no pude enviarlo al contacto (${supervised.reason || 'error desconocido'}).`,
+                });
                 continue; // NO procesar como mensaje normal (ni paused, ni funnel, ni triggers)
               }
             } catch (capErr) {
@@ -10360,6 +10967,8 @@ router.post('/webhook/whatsapp', async (req, res) => {
         enqueueMediaDownload(r.message_id).catch(() => {});
       }
     }
+
+    await whatsapp5gProjection;
 
     console.log(`[webhook] Stored ${allRecords.length} record(s)`);
     res.status(200).json({
@@ -10494,6 +11103,151 @@ router.post('/internal/ia360-revenue/opener', async (req, res) => {
   } catch (err) {
     console.error('[revenue-os] opener endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'opener_failed' });
+  }
+});
+
+// ── DIAPAZO · entregar la Sesión de Afinación a un contacto ─────────────────
+// Sustituye al script suelto de /tmp. Auth = X-IA360-Directive-Secret (mismo
+// patrón que los demás internos). Egress por los chokepoints únicos
+// (enqueueIa360FlowMessage / enqueueIa360Template → sendQueue).
+//
+// El ruteo lo decide la ventana de 24 h, porque un mensaje interactivo (Flow)
+// FUERA de ventana lo rechaza Meta y el intento se cobra como error, no como
+// mensaje. Ventana abierta → Flow directo; cerrada → template de invitación con
+// botón FLOW, que es el único vehículo que abre una conversación fría.
+//
+// Flow v1 es el único PUBLISHED hoy. Cuando `diapazo_sesion_afinacion_v2` (las
+// seis cuerdas) se publique, sólo cambia el id: la pantalla sigue siendo INICIO.
+// Medido 2026-08-10: Meta responde (#131009) Parameter value is not valid si el
+// mensaje abre el Flow en una pantalla intermedia como AFINA_SEGUIMIENTO, y en
+// INICIO además vive el aviso de privacidad. v1 se deprecia sólo cuando v2 esté
+// publicado: publicar un Flow no se deshace, únicamente se deprecia.
+const DIAPAZO_SESION_FLOW_ID = process.env.DIAPAZO_SESION_FLOW_ID || '2222939365222823';
+const DIAPAZO_SESION_FLOW_SCREEN = process.env.DIAPAZO_SESION_FLOW_SCREEN || 'INICIO';
+const DIAPAZO_SESION_INVITACION_TEMPLATE = 'diapazo_sesion_invitacion_v1';
+const DIAPAZO_SESION_CTA = 'Abrir sesión';
+// Sin nombre no se saluda con un hueco: vocativo neutro que se lee como copy.
+const DIAPAZO_SESION_NOMBRE_FALLBACK = 'qué tal';
+
+// Ventana de servicio de 24 h. Se ignoran los wamid sintéticos ('wamid.e2e%',
+// 'wamid.qa%'): son inbounds fabricados por los harness y darían por abierta una
+// ventana que Meta considera cerrada. Se mide contra `timestamp` (la marca de
+// tiempo de Meta en el mensaje entrante), que es lo que Meta usa para la
+// ventana, no contra created_at (cuándo lo escribimos nosotros).
+async function diapazoVentanaServicio(contactNumber) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(timestamp)))::bigint, 999999999) AS hace
+       FROM coexistence.chat_history
+      WHERE contact_number = $1
+        AND direction = 'incoming'
+        AND message_id NOT LIKE 'wamid.e2e%'
+        AND message_id NOT LIKE 'wamid.qa%'`,
+    [contactNumber]
+  );
+  const segundos = Number(rows[0]?.hace ?? 999999999);
+  return { abierta: segundos <= 86400, segundos };
+}
+
+async function registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre }) {
+  await pool.query(
+    `INSERT INTO coexistence.diapazo_sesion_enviada (flow_token, contact_number, wa_number, nombre)
+     VALUES ($1, $2, $3, $4)`,
+    [flowToken, contactNumber, waNumber, nombre || null]
+  );
+}
+
+router.post('/internal/diapazo-sesion', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const waNumber = normalizePhone(b.wa_number || process.env.DIAPAZO_WA_NUMBER || process.env.IA360_WA_NUMBER || '5213321594582');
+    const contactNumber = normalizePhone(b.contact_number || b.contact?.contact_number || '');
+    const nombreCompleto = String(b.name || b.contact?.name || '').trim();
+    if (!waNumber || !contactNumber) {
+      return res.status(422).json({ ok: false, error: 'wa_number_and_contact_number_required' });
+    }
+    const nombre = nombreCompleto.split(/\s+/).filter(Boolean)[0] || '';
+    // Overrides SÓLO para probar un Flow antes de publicarlo. `modo:'draft'` exige
+    // flow_id explícito: mandar el Flow de producción en modo borrador no tiene
+    // sentido y sería un aviso de prueba en la cara de un cliente.
+    const modo = b.modo === 'draft' ? 'draft' : 'published';
+    const flowId = String(b.flow_id || DIAPAZO_SESION_FLOW_ID);
+    const screen = String(b.screen || DIAPAZO_SESION_FLOW_SCREEN);
+    if (modo === 'draft' && !b.flow_id) {
+      return res.status(422).json({ ok: false, error: 'draft_requires_explicit_flow_id' });
+    }
+
+    const ventana = await diapazoVentanaServicio(contactNumber);
+    // El flow_token es la identidad de esta sesión: viaja con el Flow, vuelve en
+    // el nfm_reply (marca respondido_en) y es la PK del registro de abandono.
+    const flowToken = 'ses_' + randomBytes(12).toString('base64url');
+    const record = {
+      wa_number: waNumber,
+      contact_number: contactNumber,
+      contact_name: nombreCompleto || contactNumber,
+      // Outbound-first: no hay inbound del que colgar el dedupe, así que el
+      // message_id es sintético y único por envío.
+      message_id: `diapazo_sesion:${contactNumber}:${Date.now()}`,
+      message_type: 'diapazo_sesion_send',
+      message_body: '',
+    };
+
+    if (ventana.abierta) {
+      const enviado = await enqueueIa360FlowMessage({
+        record,
+        flowId,
+        screen,
+        cta: DIAPAZO_SESION_CTA,
+        bodyText: `Hola, ${nombre || DIAPAZO_SESION_NOMBRE_FALLBACK}. Soy Alekito, el asistente virtual de Alek. Antes de proponerte nada quiero entender cómo está afinada tu operación: son preguntas cortas y toma cinco minutos. Al terminar te devuelvo tu lectura.`,
+        footer: 'DIAPAZO',
+        flowToken,
+        label: `diapazo_sesion_flow_${flowToken}`,
+        messageBody: `DIAPAZO Sesión de Afinación: ${DIAPAZO_SESION_CTA}`,
+        modo,
+      });
+      if (!enviado) {
+        return res.status(502).json({ schema: 'diapazo_sesion_send.v1', ok: false, via: 'flow', error: 'flow_enqueue_failed' });
+      }
+      await registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre });
+      console.log('[diapazo-sesion] enviada via=flow contact=%s flow_token=%s ventana=%ds modo=%s flow=%s screen=%s', contactNumber, flowToken, ventana.segundos, modo, flowId, screen);
+      return res.json({ schema: 'diapazo_sesion_send.v1', ok: true, via: 'flow', modo, flow_token: flowToken, ventana_segundos: ventana.segundos });
+    }
+
+    // Ventana cerrada: sólo el template puede abrir la conversación. Si Meta aún
+    // no lo aprobó, se falla claro y NO se registra fila: prometer un envío que
+    // Meta va a rechazar deja una sesión fantasma que el barrido de
+    // recordatorios acabaría persiguiendo.
+    const { rows: tplRows } = await pool.query(
+      `SELECT id FROM coexistence.message_templates
+        WHERE name = $1 AND status = 'APPROVED'
+        LIMIT 1`,
+      [DIAPAZO_SESION_INVITACION_TEMPLATE]
+    );
+    if (tplRows.length === 0) {
+      console.warn('[diapazo-sesion] ventana cerrada y %s no APPROVED — no se envía contact=%s', DIAPAZO_SESION_INVITACION_TEMPLATE, contactNumber);
+      return res.status(409).json({ schema: 'diapazo_sesion_send.v1', ok: false, error: 'template_not_approved', via: 'template' });
+    }
+
+    // allowTextFallback:false — fuera de ventana Meta rechaza el texto libre y el
+    // fallback reportaría un éxito falso.
+    const sent = await enqueueIa360Template({
+      record,
+      label: 'diapazo_sesion_invitacion',
+      templateName: DIAPAZO_SESION_INVITACION_TEMPLATE,
+      vars: { 1: nombre || DIAPAZO_SESION_NOMBRE_FALLBACK },
+      allowTextFallback: false,
+    });
+    if (!sent.ok) {
+      return res.status(502).json({ schema: 'diapazo_sesion_send.v1', ok: false, via: 'template', error: sent.error || sent.status });
+    }
+    await registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre });
+    console.log('[diapazo-sesion] enviada via=template contact=%s flow_token=%s ventana=%ds', contactNumber, flowToken, ventana.segundos);
+    return res.json({ schema: 'diapazo_sesion_send.v1', ok: true, via: 'template', flow_token: flowToken, ventana_segundos: ventana.segundos });
+  } catch (err) {
+    console.error('[diapazo-sesion] endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'diapazo_sesion_failed' });
   }
 });
 
@@ -10722,6 +11476,155 @@ router.post('/internal/n8n-directive', async (req, res) => {
     }
     if (action !== 'noop' && !espoId) {
       return res.status(422).json({ ok: false, error: 'espo_id_required' });
+    }
+
+    // 3-owner) Aviso al OWNER (Alek): camino propio, FUERA del gate cero-outbound
+    // de clientes. owner_notify solo egresa al numero del owner (jamas a un
+    // cliente), por eso tiene su PROPIO interruptor IA360_OWNER_NOTIFY_LIVE,
+    // independiente de IA360_DIRECTIVE_EGRESS. Reusa sendIa360DirectText (single
+    // account -> linea de negocio 5213321594582). Inbox Orchestrator / Diapazo.
+    if (action === 'owner_notify') {
+      const ownerLive = process.env.IA360_OWNER_NOTIFY_LIVE === 'on';
+      const texto = String((payload && (payload.texto || payload.body || payload.mensaje || payload.message)) || '').trim();
+      if (!texto) {
+        return res.status(422).json({ ok: false, error: 'owner_notify_requires_payload_texto' });
+      }
+
+      // ── Inbox Orchestrator (Diapazo): enrutamiento categoría -> plantilla UTILITY
+      // es_MX (header IMAGE) aprobada por Meta. Las plantillas NO dependen de la
+      // ventana de 24h del owner, por eso son el canal preferente del clasificador.
+      // AUTO-UPGRADE: en cuanto Meta aprueba la plantilla de una categoría, ese aviso
+      // pasa solo de texto a plantilla; si no está aprobada / falla / no aplica, cae
+      // al texto libre (sendIa360DirectText) SIN romper el camino existente.
+      const norm = (s) => String(s || '')
+        .normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .toLowerCase().trim();
+      const categoria = payload.categoria || payload.category || '';
+      const catKey = norm(categoria);
+      const hasCategoria = !!catKey;
+      const TEMPLATE_BY_CAT = [
+        [/client/, 'diapazo_inbox_cliente'],
+        [/prospect/, 'diapazo_inbox_prospecto'],
+        [/proveedor|operac|\bops\b/, 'diapazo_inbox_proveedor'],
+        [/factur/, 'diapazo_inbox_factura'],
+        [/personal|important/, 'diapazo_inbox_personal'],
+        [/soporte|debug/, 'diapazo_inbox_soporte'],
+        [/idea|mejora/, 'diapazo_inbox_idea'],
+        [/revisar|other|otro/, 'diapazo_inbox_revisar'],
+      ];
+      let templateName = null;
+      if (hasCategoria) {
+        for (const [re, name] of TEMPLATE_BY_CAT) { if (re.test(catKey)) { templateName = name; break; } }
+        if (!templateName) templateName = 'diapazo_inbox_revisar'; // default seguro
+      }
+      // Sólo enrutamos a plantilla cuando viene categoría (los avisos reales del
+      // clasificador SIEMPRE la traen). Mensajes sin categoría (p.ej. estatus del
+      // automator) o con force_text se quedan en texto libre y conservan su prosa.
+      const forceText = payload.force_text === true || payload.forceText === true;
+      const wantsTemplate = !!templateName && !forceText;
+
+      // Extrae remitente / asunto / nota del texto ("... De: X. Asunto: Y. Nota: Z.").
+      const clean = (s, max = 280) => String(s || '')
+        .replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+        .replace(/[\s.·]+$/, '').slice(0, max);
+      const mRem = texto.match(/\bde:\s*(.+?)(?:\s*[.·]\s*asunto:|\s*[.·]\s|\s*[\r\n]|$)/i);
+      const mAsu = texto.match(/\basunto:\s*(.+?)(?:\s*[.·]\s*nota:|\s*[.·]\s|\s*[\r\n]|$)/i);
+      const mNota = texto.match(/\bnota:\s*(.+?)(?:\s*[.·]\s|\s*[\r\n]|$)/i);
+      let remitente = clean(mRem && mRem[1], 120);
+      let asunto = clean(mAsu && mAsu[1], 280);
+      const nota = clean(mNota && mNota[1], 280) || 'Sin nota adicional';
+      if (!remitente) remitente = 'Un contacto';
+      if (!asunto) asunto = clean(texto.split(/\s+/).slice(0, 12).join(' '), 280) || 'Nuevo correo';
+
+      // dry_run: valida el enrutamiento SIN egress (verificación segura del automator).
+      if (payload.dry_run === true || payload.dryRun === true) {
+        let approved = null;
+        if (templateName) {
+          try {
+            const { rows } = await pool.query(
+              `SELECT status FROM coexistence.message_templates WHERE name=$1 ORDER BY updated_at DESC LIMIT 1`,
+              [templateName]
+            );
+            approved = rows[0] ? (String(rows[0].status).toUpperCase() === 'APPROVED') : null;
+          } catch (e) { approved = null; }
+        }
+        return res.status(200).json({
+          ok: true, dry_run: true, action, espo_id: espoId,
+          routing: wantsTemplate ? 'template' : 'text',
+          categoria: categoria || null,
+          template_name: wantsTemplate ? templateName : null,
+          template_approved: wantsTemplate ? approved : null,
+          would_fallback_to_text: wantsTemplate ? (approved !== true) : true,
+          vars: { 1: remitente, 2: asunto, 3: nota },
+        });
+      }
+
+      if (!ownerLive) {
+        return res.status(200).json({
+          ok: true,
+          dry_run: true,
+          action,
+          espo_id: espoId,
+          egress: 'owner_notify gated (IA360_OWNER_NOTIFY_LIVE!=on)'
+        });
+      }
+
+      const ownerRecord = {
+        wa_number: (process.env.IA360_OWNER_NOTIFY_BUSINESS_LINE || '5213321594582'),
+        contact_number: IA360_OWNER_NUMBER,
+        // contact_name = remitente: buildIa360TemplateComponents fija {{1}} con
+        // firstNameForTemplate(record), así {{1}} ≈ remitente SIN tocar el helper
+        // compartido. Se pasa además vars{1} por robustez ante cambios futuros.
+        contact_name: remitente,
+        message_id: 'inbox-' + String(espoId || 'na').replace(/[^a-zA-Z0-9_-]/g, '') + '-' + Date.now()
+      };
+
+      const sendFreeText = (lbl) => sendIa360DirectText({
+        record: ownerRecord, toNumber: IA360_OWNER_NUMBER, body: texto, label: lbl || 'inbox_owner_notify'
+      });
+
+      try {
+        if (wantsTemplate) {
+          const cat = (catKey.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')) || 'revisar';
+          let tplResult = null;
+          try {
+            tplResult = await enqueueIa360Template({
+              record: ownerRecord,
+              label: 'inbox_owner_' + cat,
+              templateName,
+              vars: { 1: remitente, 2: asunto, 3: nota },
+              allowTextFallback: true,
+            });
+          } catch (e) {
+            console.error('[n8n-directive] owner_notify template error:', e && e.message);
+            tplResult = { ok: false, status: 'error', error: (e && e.message) || 'unknown' };
+          }
+          const st = String((tplResult && tplResult.status) || '').toLowerCase();
+          // "handled" = la plantilla (o su fallback interno a texto) ya egresó o pudo
+          // haberlo hecho; sólo caemos a texto libre si NO salió de forma inequívoca,
+          // para evitar doble mensaje al owner.
+          const handled = (tplResult && tplResult.ok) ||
+            ['sent', 'delivered', 'read', 'unknown', 'duplicate', 'text_fallback'].includes(st);
+          if (handled) {
+            return res.status(200).json({
+              ok: true, dry_run: false, action, espo_id: espoId,
+              channel: 'template', template_name: templateName, status: tplResult && tplResult.status
+            });
+          }
+          // Plantilla no aprobada / no encontrada / inválida / fallida -> texto libre
+          // con la prosa original (entrega si la ventana de 24h del owner está abierta).
+          const sent = await sendFreeText('inbox_owner_notify_tplfallback');
+          return res.status(200).json({
+            ok: true, dry_run: false, action, espo_id: espoId,
+            channel: 'text_after_template_miss', template_status: tplResult && tplResult.status, sent: !!sent
+          });
+        }
+        const sent = await sendFreeText('inbox_owner_notify');
+        return res.status(200).json({ ok: true, dry_run: false, action, espo_id: espoId, channel: 'text', sent: !!sent });
+      } catch (e) {
+        console.error('[n8n-directive] owner_notify send error:', e && e.message);
+        return res.status(500).json({ ok: false, error: 'owner_notify_send_failed', detail: (e && e.message) || 'unknown' });
+      }
     }
 
     // 3) GATE EQUIPO-0: cero outbound. Dry-run = valida + ACK, no encola.

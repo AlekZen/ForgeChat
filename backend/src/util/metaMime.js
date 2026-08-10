@@ -8,8 +8,35 @@
 
 const path = require('path');
 
-// Common browser/OS aliases -> Meta's canonical token.
-const ALIASES = {
+const MIB = 1024 * 1024;
+
+// Public G2 input contract. `transport: transcode` is accepted only through the
+// audio route and is converted before Meta upload; direct formats are provider
+// upload formats. Sticker static/animated limits are refined by content
+// preflight because MIME alone cannot distinguish animation.
+const MEDIA_FORMATS = Object.freeze([
+  { extensions: ['.jpg', '.jpeg'], mime: 'image/jpeg', kind: 'image', maxBytes: 5 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.png'], mime: 'image/png', kind: 'image', maxBytes: 5 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.webp'], mime: 'image/webp', kind: 'sticker', maxBytes: 500 * 1024, staticMaxBytes: 100 * 1024, animatedMaxBytes: 500 * 1024, dimensions: [512, 512], caption: false, transport: 'direct' },
+  { extensions: ['.mp4'], mime: 'video/mp4', kind: 'video', maxBytes: 16 * MIB, caption: true, transport: 'direct', videoCodec: 'h264', audioCodec: 'aac' },
+  { extensions: ['.3gp'], mime: 'video/3gp', kind: 'video', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.aac'], mime: 'audio/aac', kind: 'audio', maxBytes: 16 * MIB, caption: false, transport: 'direct', audioCodec: 'aac' },
+  { extensions: ['.amr'], mime: 'audio/amr', kind: 'audio', maxBytes: 16 * MIB, caption: false, transport: 'direct', audioCodec: 'amr' },
+  { extensions: ['.mp3'], mime: 'audio/mpeg', kind: 'audio', maxBytes: 16 * MIB, caption: false, transport: 'direct', audioCodec: 'mp3' },
+  { extensions: ['.ogg', '.opus'], mime: 'audio/ogg', kind: 'audio', maxBytes: 16 * MIB, caption: false, transport: 'direct', audioCodec: 'opus', channels: 1 },
+  { extensions: ['.m4a'], mime: 'audio/mp4', kind: 'audio', maxBytes: 16 * MIB, caption: false, transport: 'direct', audioCodec: 'aac' },
+  { extensions: ['.wav'], mime: 'audio/wav', kind: 'audio', maxBytes: 16 * MIB, caption: false, transport: 'transcode', providerMime: 'audio/ogg', audioCodec: 'readable' },
+  { extensions: ['.pdf'], mime: 'application/pdf', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.txt'], mime: 'text/plain', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.doc'], mime: 'application/msword', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.docx'], mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.xls'], mime: 'application/vnd.ms-excel', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.xlsx'], mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.ppt'], mime: 'application/vnd.ms-powerpoint', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+  { extensions: ['.pptx'], mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', kind: 'document', maxBytes: 16 * MIB, caption: true, transport: 'direct' },
+]);
+
+const ALIASES = Object.freeze({
   'image/jpg': 'image/jpeg',
   'image/pjpeg': 'image/jpeg',
   'image/x-png': 'image/png',
@@ -22,43 +49,18 @@ const ALIASES = {
   'audio/aacp': 'audio/aac',
   'video/3gpp': 'video/3gp',
   'application/x-pdf': 'application/pdf',
-};
-
-// Filename extension -> canonical MIME, used when the reported MIME is missing
-// or generic (e.g. application/octet-stream).
-const EXT_MIME = {
-  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp',
-  '.mp4': 'video/mp4', '.3gp': 'video/3gp',
-  '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg',
-  '.aac': 'audio/aac', '.amr': 'audio/amr', '.m4a': 'audio/mp4',
-  '.pdf': 'application/pdf', '.txt': 'text/plain',
-  '.doc': 'application/msword',
-  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.xls': 'application/vnd.ms-excel',
-  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  '.ppt': 'application/vnd.ms-powerpoint',
-  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-};
-
+});
+const EXT_MIME = Object.freeze(Object.fromEntries(
+  MEDIA_FORMATS.flatMap((format) => format.extensions.map((extension) => [extension, format.mime]))
+));
 const GENERIC = new Set(['', 'application/octet-stream', 'binary/octet-stream', 'application/binary']);
-
-// Meta's supported types per chat media kind.
-const IMAGE = new Set(['image/jpeg', 'image/png']);
-const STICKER = new Set(['image/webp']);
-const VIDEO = new Set(['video/mp4', 'video/3gp']);
-const AUDIO = new Set(['audio/aac', 'audio/amr', 'audio/mpeg', 'audio/mp4', 'audio/ogg']);
-const DOCUMENT = new Set([
-  'application/pdf', 'text/plain',
-  'application/vnd.ms-powerpoint', 'application/msword', 'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-]);
-
-// Template header sample media (Meta resumable upload) — stricter than chat.
+const DIRECT_FORMAT_BY_MIME = new Map(
+  MEDIA_FORMATS.filter((format) => format.transport === 'direct').map((format) => [format.mime, format])
+);
+const FORMAT_BY_MIME = new Map(MEDIA_FORMATS.map((format) => [format.mime, format]));
 const TEMPLATE_HEADER = new Set(['image/jpeg', 'image/png', 'video/mp4', 'application/pdf']);
 
-// Reduce a raw MIME (+ optional filename) to Meta's canonical token.
+// Reduce a raw MIME (+ optional filename) to the canonical contract token.
 function canonicalizeMime(rawMime, filename) {
   let base = String(rawMime || '').split(';')[0].trim().toLowerCase();
   if (ALIASES[base]) base = ALIASES[base];
@@ -69,24 +71,22 @@ function canonicalizeMime(rawMime, filename) {
   return base;
 }
 
-// Chat media kind for a (canonical) MIME, or null if Meta can't send it in chat.
+function mediaFormatFor(mime, { includeTranscodable = false } = {}) {
+  return (includeTranscodable ? FORMAT_BY_MIME : DIRECT_FORMAT_BY_MIME).get(mime) || null;
+}
+
 function chatKindFor(mime) {
-  if (IMAGE.has(mime)) return 'image';
-  if (STICKER.has(mime)) return 'sticker';
-  if (VIDEO.has(mime)) return 'video';
-  if (AUDIO.has(mime)) return 'audio';
-  if (DOCUMENT.has(mime)) return 'document';
-  return null;
+  return mediaFormatFor(mime)?.kind || null;
 }
 function isChatSendable(mime) { return chatKindFor(mime) !== null; }
 function isTemplateHeaderMime(mime) { return TEMPLATE_HEADER.has(mime); }
 
-const CHAT_TYPES_MSG = 'Accepted: JPG, PNG, WEBP, MP4, 3GP, MP3, AAC, AMR, OGG/OPUS, M4A, PDF, TXT, or Office documents (convert HEIC/MOV first).';
+const CHAT_TYPES_MSG = 'Accepted: JPG, PNG, WEBP, MP4, 3GP, AAC, AMR, MP3, mono OGG/OPUS, M4A, WAV (transcoded), PDF, TXT, DOC, DOCX, XLS, XLSX, PPT, or PPTX.';
 const TEMPLATE_TYPES_MSG = 'Template header media must be JPG, PNG, MP4, or PDF.';
 
 module.exports = {
-  canonicalizeMime, chatKindFor, isChatSendable, isTemplateHeaderMime,
-  CHAT_TYPES_MSG, TEMPLATE_TYPES_MSG,
+  canonicalizeMime, mediaFormatFor, chatKindFor, isChatSendable, isTemplateHeaderMime,
+  CHAT_TYPES_MSG, TEMPLATE_TYPES_MSG, MEDIA_FORMATS,
   // exported for tests
   ALIASES, EXT_MIME, TEMPLATE_HEADER,
 };

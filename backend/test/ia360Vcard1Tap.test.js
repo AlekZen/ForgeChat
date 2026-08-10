@@ -29,9 +29,10 @@ const FLOWS = {
 function rankStub(flow) { return { suggestedId: null, ordered: flow.sequences }; }
 
 // Simulacion del orquestador notifyOwnerVcardCaptured (misma logica que el patch).
-function notifyOwnerVcardCaptured(shared, egress) {
+function notifyOwnerVcardCaptured(shared, egress, existingContact = null) {
   const suggestion = suggestIa360Persona(shared);
-  const flowKey = suggestion && suggestion.persona;
+  const persistedPersonaKey = existingContact?.custom_fields?.ia360_persona_first?.classification?.persona_key;
+  const flowKey = (suggestion && suggestion.persona) || persistedPersonaKey;
   const flow = flowKey ? FLOWS[flowKey] : null;
   if (!flow) return sendPersonaList(shared, egress);
   const ranking = rankStub(flow);
@@ -89,6 +90,22 @@ test('boton Cambiar reabre la lista Elegir persona', () => {
   assert.ok(list, 'Cambiar reabre la lista persona');
   assert.strictEqual(list.label, `owner_vcard_captured_${SANDBOX}`);
   assert.strictEqual(list.rows.length, 10, 'lista conserva las 10 filas');
+});
+
+test('sin senal en el nombre pero con persona persistida BNI -> readout 1-tap', () => {
+  const egress = [];
+  const existingContact = {
+    custom_fields: {
+      ia360_persona_first: {
+        classification: { persona_key: 'persona_aliado', relationship_context: 'aliado_socio' },
+      },
+    },
+  };
+  const res = notifyOwnerVcardCaptured({ name: 'Diego Pérez Rodriguez', contactNumber: SANDBOX }, egress, existingContact);
+  assert.strictEqual(res.path, 'one_tap');
+  assert.strictEqual(res.flowKey, 'persona_aliado');
+  assert.ok(!egress.some(e => e.kind === 'persona_list'), 'NO debe pedir reclasificar si el contacto ya trae contexto persistido');
+  assert.ok(egress.some(e => e.kind === 'approve_card'));
 });
 
 test('sin senal de persona -> cae al flujo viejo de lista', () => {

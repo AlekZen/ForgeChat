@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const pool = require('../db');
 const { getAccountByPhoneNumber, getAccountWithToken, getSingleAccount } = require('../routes/whatsappAccounts');
 const { applyPendingOutboundStatus, lockOutboundMessage } = require('./outboundStatusReceipt');
+const TERMINAL_OUTBOUND_STATUSES = new Set(['sent', 'delivered', 'read', 'failed', 'error', 'no_verificable']);
 
 function localMessageId() {
   // Distinct from Meta's wamid format so we can tell them apart in logs
@@ -122,16 +123,28 @@ async function markSent(localId, wamid) {
 }
 
 /**
- * Mark a row as failed (Meta rejected, network error, etc).
+ * Mark a row as failed only while it is non-terminal. A late worker failure
+ * must never overwrite provider acceptance or delivery receipts.
  */
 async function markFailed(localId, errorMessage) {
   const result = await pool.query(
     `UPDATE coexistence.chat_history
         SET status = 'failed', error_message = $1
-      WHERE send_correlation_id = $2`,
+      WHERE send_correlation_id = $2
+        AND status NOT IN ('sent', 'delivered', 'read', 'failed', 'error', 'no_verificable')`,
     [(errorMessage || 'send failed').slice(0, 500), localId]
   );
-  if (result.rowCount !== 1) throw new Error('Outbound correlation missing or ambiguous');
+  if (result.rowCount === 1) return true;
+
+  const correlated = await pool.query(
+    `SELECT status
+       FROM coexistence.chat_history
+      WHERE send_correlation_id = $1`,
+    [localId]
+  );
+  if (correlated.rowCount !== 1) throw new Error('Outbound correlation missing or ambiguous');
+  if (TERMINAL_OUTBOUND_STATUSES.has(correlated.rows[0].status)) return false;
+  throw new Error('Outbound correlation changed without reaching a terminal state');
 }
 
 /**
@@ -160,4 +173,5 @@ module.exports = {
   markFailed,
   secondsSinceLastIncoming,
   localMessageId,
+  TERMINAL_OUTBOUND_STATUSES,
 };

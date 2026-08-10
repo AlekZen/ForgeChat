@@ -34,16 +34,16 @@ test('las 4 opciones rapidas reusan ids owner_pipe:<num>:<key> existentes', () =
   const rows = buildVcardQuickRows({ contactNumber: TARGET });
   const quick = rows.slice(0, 4).map(r => r.id);
   assert.deepEqual(quick, [
-    `owner_pipe:${TARGET}:persona_referido`, // Prospecto / pide info
+    `owner_pipe:${TARGET}:persona_referido`, // Referido / BNI
     `owner_pipe:${TARGET}:persona_beta`,     // Beta / amigo
     `owner_pipe:${TARGET}:persona_cliente`,  // Cliente activo
     `owner_pipe:${TARGET}:guardar`,          // Solo guardar (terminal, sin secuencia)
   ]);
 });
 
-test('"Prospecto / pide info" mapea a persona_referido (persona mas cercana a nuevo que pide info)', () => {
+test('"Referido / BNI" mapea a persona_referido y queda visible en opciones rapidas', () => {
   assert.equal(VCARD_QUICK_OPTIONS[0].key, 'persona_referido');
-  assert.match(VCARD_QUICK_OPTIONS[0].title, /Prospecto/i);
+  assert.match(VCARD_QUICK_OPTIONS[0].title, /BNI/i);
 });
 
 test('"Solo guardar" usa la persona terminal guardar (captura sin envio)', () => {

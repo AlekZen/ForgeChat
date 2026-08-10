@@ -40,6 +40,8 @@ test('correlación saliente usa Postgres y Redis reales en contenedores efímero
   let pool;
   let redis;
   let queue;
+  let outboundQueue;
+  let shutdownSendQueue;
 
   try {
     docker([
@@ -96,6 +98,9 @@ test('correlación saliente usa Postgres y Redis reales en contenedores efímero
     const { recordOutboundStatus } = require('../src/services/outboundStatusReceipt');
     const IORedis = require('ioredis');
     const { Queue } = require('bullmq');
+    const sendQueueModule = require('../src/queue/sendQueue');
+    outboundQueue = sendQueueModule.sendQueue;
+    shutdownSendQueue = sendQueueModule.shutdownSendQueue;
 
     await pool.query('CREATE SCHEMA coexistence');
     await pool.query(`CREATE TABLE coexistence.chat_history (
@@ -226,6 +231,23 @@ test('correlación saliente usa Postgres y Redis reales en contenedores efímero
     );
     assert.equal(result.rows[0].status, 'read');
 
+    const deliveredId = await insertPendingRow({
+      account,
+      toNumber: 'qa-contact',
+      messageType: 'text',
+      messageBody: 'g2 late failure probe',
+    });
+    const deliveredWamid = `wamid.g2.delivered.${suffix}`;
+    await markSent(deliveredId, deliveredWamid);
+    assert.equal(await recordOutboundStatus(pool, { messageId: deliveredWamid, status: 'delivered' }), 1);
+    assert.equal(await markFailed(deliveredId, 'late worker failure'), false);
+    result = await pool.query(
+      'SELECT status, error_message FROM coexistence.chat_history WHERE send_correlation_id = $1',
+      [deliveredId],
+    );
+    assert.equal(result.rows[0].status, 'delivered');
+    assert.equal(result.rows[0].error_message, null);
+
     const staleWamid = `wamid.g1.stale.${suffix}`;
     await pool.query(
       "INSERT INTO coexistence.outbound_status_receipts (message_id, status, received_at) VALUES ($1, 'sent', NOW() - INTERVAL '25 hours')",
@@ -262,7 +284,21 @@ test('correlación saliente usa Postgres y Redis reales en contenedores efímero
     const job = await queue.getJob(`g1-${suffix}`);
     assert.ok(job);
     assert.equal(job.data.correlationId, localId);
+
+    const queuedCorrelation = `g2-at-most-once-${suffix}`;
+    await sendQueueModule.enqueueSend({
+      kind: 'text',
+      accountId: 1,
+      to: 'qa-contact',
+      localMessageId: queuedCorrelation,
+      payload: { body: 'queue options probe' },
+    });
+    const outboundJob = await outboundQueue.getJob(`send-${queuedCorrelation}`);
+    assert.ok(outboundJob);
+    assert.equal(outboundJob.opts.attempts, 1);
   } finally {
+    if (outboundQueue) await outboundQueue.obliterate({ force: true }).catch(() => {});
+    if (shutdownSendQueue) await shutdownSendQueue().catch(() => {});
     if (queue) await queue.obliterate({ force: true }).catch(() => {});
     if (queue) await queue.close().catch(() => {});
     if (redis) await redis.quit().catch(() => {});

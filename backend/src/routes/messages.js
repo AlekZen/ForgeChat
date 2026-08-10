@@ -13,7 +13,7 @@ const storage = require('../util/pgStorage');
 const { syncMediaToAccount } = require('./mediaLibrary');
 const { userWaNumbers, assertWaAccess, assertContactAccess } = require('../middleware/access');
 const { isAdmin } = require('../permissions');
-const { canonicalizeMime, chatKindFor, CHAT_TYPES_MSG } = require('../util/metaMime');
+const { canonicalizeMime, mediaFormatFor, chatKindFor, CHAT_TYPES_MSG } = require('../util/metaMime');
 const ExcelJS = require('exceljs');
 const { Readable } = require('stream');
 
@@ -979,7 +979,9 @@ router.post('/messages/send-media', mediaUpload.single('file'), async (req, res)
 
     const mime = canonicalizeMime(req.file.mimetype, req.file.originalname);
     const kind = chatKindFor(mime);
-    if (!kind) return res.status(400).json({ error: `Unsupported file type "${req.file.mimetype || 'unknown'}". ${CHAT_TYPES_MSG}` });
+    const format = mediaFormatFor(mime);
+    if (!kind || !format) return res.status(400).json({ error: `Unsupported file type "${req.file.mimetype || 'unknown'}". ${CHAT_TYPES_MSG}` });
+    if (req.file.size > format.maxBytes) return res.status(413).json({ error: `File exceeds the ${format.maxBytes}-byte limit for ${mime}.` });
 
     // Step 1: upload binary to Meta to get media_id
     let mediaId;

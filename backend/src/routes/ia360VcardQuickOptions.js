@@ -11,11 +11,10 @@
 // (handleIa360OwnerPipelineChoice → handleIa360PersonaChoice / terminal "guardar").
 // La 5ª fila usa un id propio `owner_vcard_seeall:<num>` que reabre la lista.
 //
-// "Prospecto / pide info": el catálogo NO tiene una persona "prospecto" pura. La
-// más cercana a "alguien nuevo que pide info" es `persona_referido` (journey de
-// contacto entrante nuevo al que se le explica IA360 sin pitch; su secuencia
-// `referido_oneliner` = "one-liner cuidadoso"). Se mapea ahí; el owner elige la
-// secuencia concreta en el siguiente paso, como en cualquier persona.
+// "Referido / BNI": Alek usa mucho este flujo con miembros de BNI Industrial.
+// Antes la primera fila decía "Prospecto / pide info" aunque internamente mapeaba
+// a `persona_referido`; eso ocultaba la opción BNI y llevó a clasificar contactos
+// de capítulo como beta/amigo. La UI debe decir explícitamente BNI.
 //
 // Módulo PURO (cero require/IO) → testeable sin deps externas.
 
@@ -32,7 +31,7 @@ function compact(text, max) {
 // `owner_pipe:<num>:<key>` (existente). "guardar" es un IA360_TERMINAL_VCARD_CHOICES
 // (captura sin secuencia). El title va <=24 y la description <=72.
 const VCARD_QUICK_OPTIONS = [
-  { key: 'persona_referido', title: 'Prospecto / pide info', description: 'Alguien nuevo que pide información' },
+  { key: 'persona_referido', title: 'Referido / BNI', description: 'Miembro BNI, intro o recomendación' },
   { key: 'persona_beta', title: 'Beta / amigo', description: 'Conocido, técnico o prueba de confianza' },
   { key: 'persona_cliente', title: 'Cliente activo', description: 'Ya es cliente: engage o deleitar' },
   { key: 'guardar', title: 'Solo guardar', description: 'Captura el contacto sin enviar nada' },

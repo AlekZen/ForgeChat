@@ -28,6 +28,7 @@ const { router: pipelinesRouter } = require('./routes/pipelines');
 const { startWorker: startMediaWorker, shutdown: shutdownMediaQueue } = require('./queue/mediaQueue');
 const { startSendWorker, shutdownSendQueue } = require('./queue/sendQueue');
 const { startReminderScheduler } = require('./services/ia360Reminders');
+const { startDiapazoSesionRecordatorio } = require('./services/diapazoSesionRecordatorio');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -142,6 +143,7 @@ async function start() {
   startMediaWorker();
   startSendWorker();
   startReminderScheduler(); // IA360 per-meeting reminders (self-contained)
+  startDiapazoSesionRecordatorio(); // DIAPAZO: recordatorio de Sesión de Afinación abandonada (>24 h sin submit)
   startDiapazoPoller(); // G6: poll de taps diapazo_* del owner en chat_history (egress human-gated)
 
   // Stale-pause sweeper: mark paused automation executions that have outlived
