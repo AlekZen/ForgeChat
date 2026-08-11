@@ -3,12 +3,14 @@ const router = express.Router();
 const pool = require('../db');
 const { requirePermission, assertContactAccess } = require('../middleware/access');
 const { canonicalizeMime, isTemplateHeaderMime, TEMPLATE_TYPES_MSG } = require('../util/metaMime');
+const { buildFlowButtonComponents, parseMetaFlowButton } = require('../util/templateFlow');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const extractVars = (t) => {
   const m = [...(t || '').matchAll(/\{\{(\d+)\}\}/g)];
   return [...new Set(m.map(x => x[1]))].sort((a, b) => +a - +b);
 };
+
 
 const nameOk = (n) => /^[a-z0-9_]+$/.test(n);
 
@@ -514,6 +516,7 @@ function parseMetaComponents(components = []) {
         if (bt === 'PHONE_NUMBER') return { type: 'PHONE_NUMBER', text: b.text, value: b.phone_number };
         if (bt === 'COPY_CODE') return { type: 'COPY_CODE', value: (b.example && b.example[0]) || '' };
         if (bt === 'OTP') return { type: 'OTP', text: b.text, otpType: b.otp_type, packageName: b.package_name, signatureHash: b.signature_hash };
+        if (bt === 'FLOW') return parseMetaFlowButton(b);
         return { type: 'QUICK_REPLY', text: b.text };
       });
     }
@@ -531,6 +534,7 @@ async function syncAccountTemplates(account) {
     const status = (r.status || 'PENDING').toUpperCase();
     const localStatus = status === 'PENDING' ? 'SUBMITTED' : status; // PAUSED, DISABLED, APPROVED, REJECTED pass through
     const qs = typeof r.quality_score === 'object' ? r.quality_score?.score : r.quality_score;
+    const p = parseMetaComponents(r.components);
     const result = await pool.query(
       `UPDATE coexistence.message_templates
           SET status = $1,
@@ -539,11 +543,17 @@ async function syncAccountTemplates(account) {
               previous_category = COALESCE($4, previous_category),
               category = COALESCE($5, category),
               meta_template_id = COALESCE(meta_template_id, $6),
+              header_type = $7,
+              header_text = $8,
+              body = $9,
+              footer = $10,
+              buttons = $11,
+              samples = $12,
               last_synced_at = NOW(),
               updated_at = NOW()
-        WHERE whatsapp_account_id = $7
-          AND lower(name) = lower($8)
-          AND language = $9
+        WHERE whatsapp_account_id = $13
+          AND lower(name) = lower($14)
+          AND language = $15
         RETURNING id`,
       [
         localStatus,
@@ -552,6 +562,12 @@ async function syncAccountTemplates(account) {
         r.previous_category || null,
         r.category ? String(r.category).toUpperCase() : null,
         r.id || null,
+        p.header_type,
+        p.header_text,
+        p.body,
+        p.footer,
+        JSON.stringify(p.buttons || []),
+        JSON.stringify(p.samples || {}),
         account.id,
         r.name,
         r.language,
@@ -562,7 +578,7 @@ async function syncAccountTemplates(account) {
     } else {
       // Exists on Meta but not locally → import it so the app can use it
       // (e.g. the pre-approved hello_world, or templates made in Business Manager).
-      const p = parseMetaComponents(r.components);
+
       await pool.query(
         `INSERT INTO coexistence.message_templates
            (name, category, language, header_type, header_text, body, footer, buttons, samples,
@@ -799,7 +815,7 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     if (!to) return res.status(400).json({ error: 'to (recipient phone) required' });
 
     const { rows } = await pool.query(
-      `SELECT id, name, language, body, header_type, whatsapp_account_id FROM coexistence.message_templates WHERE id = $1`,
+      `SELECT id, name, language, body, header_type, buttons, whatsapp_account_id FROM coexistence.message_templates WHERE id = $1`,
       [req.params.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Template not found' });
@@ -828,6 +844,10 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
       tpl.body || ""
     );
 
+    const localId = await insertPendingRow({
+      account, toNumber: to, messageType: 'template', messageBody: renderedBody || tpl.body || `Template: ${tpl.name}`,
+    });
+
     // Build components from sampleValues (sorted numerically by var index)
     const keys = Object.keys(sampleValues).sort((a, b) => +a - +b);
     const components = [];
@@ -846,10 +866,9 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     if (keys.length > 0) {
       components.push({ type: 'body', parameters: keys.map(k => ({ type: 'text', text: String(sampleValues[k] || ' ') })) });
     }
+    components.push(...buildFlowButtonComponents(tpl.buttons, localId));
 
-    const localId = await insertPendingRow({
-      account, toNumber: to, messageType: 'template', messageBody: renderedBody || tpl.body || `Template: ${tpl.name}`,
-    });
+
     await enqueueSend({
       kind: 'template',
       accountId: account.id,
