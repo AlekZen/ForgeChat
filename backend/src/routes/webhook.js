@@ -11,7 +11,7 @@ const { recordOutboundStatus } = require('../services/outboundStatusReceipt');
 const { projectSignedWebhook } = require('../services/whatsapp5gInboundBridge');
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
-const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
+const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
 const { buildIa360MemoryJaulaWhere } = require('../services/ia360MemoryIsolation');
 const { handleDiapazoInbound } = require('./diapazo-inbound'); // G7: ruteo INBOUND DIAPAZO (aditivo, flag-gated, reversible)
@@ -470,6 +470,23 @@ function isIa360DoNotPitchContact(contact) {
     || /cfo|champion|finanzas/i.test(String(role));
 }
 
+// G7-CONGRUENCIA: supresión comercial por PERFIL. Un contacto que ya es cliente,
+// beta de confianza o pidió no ser contactado NUNCA debe recibir un paso de embudo
+// determinístico (Revenue OS, recovery de opener). Antes esto solo modulaba el
+// prompt del agente (do_not_pitch) y la aprobación saliente del owner; los handlers
+// determinísticos no consultaban nada y por eso el 2026-08-11 un beta de soporte TI
+// recibió el PASO 2 y el PASO 3 de Revenue OS.
+function isIa360CommercialSuppressed(contact) {
+  const cf = contact?.custom_fields || {};
+  const tags = Array.isArray(contact?.tags) ? contact.tags.map(t => String(t || '').toLowerCase()) : [];
+  return isIa360DoNotPitchContact(contact)
+    || isIa360ClienteActivoBetaContact(contact)
+    || String(cf.lifecycle_stage || '').startsWith('cliente_activo')
+    || tags.includes('beta-forgechat')
+    || tags.includes('cliente-activo-beta-supervisado')
+    || tags.includes('no-contactar');
+}
+
 function buildIa360ClienteActivoBetaRoleHint(contact) {
   const cf = contact?.custom_fields || {};
   const beta = cf.ia360_cliente_activo_beta || {};
@@ -533,6 +550,21 @@ function buildIa360ConversationRoleHint({ contact, stageName, convState, memory,
   const profile = getIa360ContactProfile(contact);
   const parts = [];
   if (profile.name) parts.push(`hablas con ${profile.name}${profile.role ? ` (${profile.role})` : ''}${profile.accountName ? ` de ${profile.accountName}` : ''}`);
+
+  // G7-CONGRUENCIA: el perfil ya se computaba (getIa360ContactProfile) pero solo
+  // viajaban name/role/accountName. Persona, etapa, área y el entregable pendiente
+  // son justo lo que hace que la respuesta suene a ESTE contacto y no a un genérico.
+  const cfHint = contact?.custom_fields || {};
+  if (profile.persona) parts.push(`Persona: ${profile.persona}`);
+  if (profile.lifecycleStage) parts.push(`Etapa de relación: ${profile.lifecycleStage}`);
+  if (cfHint.area_operacion) parts.push(`Área de operación: ${String(cfHint.area_operacion).slice(0, 120)}`);
+  if (profile.projectName) parts.push(`Proyecto: ${profile.projectName}`);
+  if (String(cfHint.ia360_entrega_pendiente || '').trim()) {
+    parts.push(`Entregable pendiente con este contacto: ${String(cfHint.ia360_entrega_pendiente).slice(0, 200)}`);
+  }
+  if (isIa360CommercialSuppressed(contact)) {
+    parts.push('REGLA DURA: este contacto es cliente o beta activo. PROHIBIDO vender u ofrecer "Revenue OS", pipelines de venta o servicios nuevos. Responde únicamente sobre su operación y sus pendientes reales.');
+  }
 
   // Memoria del contacto (memory-lookup): el modelo DEBE usarla, no re-preguntarla.
   const factBits = [];
@@ -1699,6 +1731,14 @@ async function handleRevenueOsButton({ record, replyId }) {
   const contact = await loadIa360ContactContext(record).catch(() => null);
   const state = contact?.custom_fields?.ia360_revenue_state || '';
 
+  // G7-CONGRUENCIA: cliente/beta/no-contactar => Revenue OS no existe para él.
+  // Devolvemos false (no true): el botón sigue su camino a los handlers de abajo y,
+  // si ninguno calza, al agente genérico — que ya trae post-filtro de pitch.
+  if (isIa360CommercialSuppressed(contact)) {
+    console.log('[revenue-os] suprimido por perfil contact=%s id=%s', record.contact_number, id);
+    return false;
+  }
+
   // PASO 1 — respuesta a la apertura (solo si seguimos en apertura_sent).
   if (isOpenerYes || isOpenerNo) {
     if (state !== 'apertura_sent') return false; // no es de este flujo / ya avanzó
@@ -1782,6 +1822,12 @@ async function handleRevenueOsFreeText(record) {
     if (!body) return false;
     const contact = await loadIa360ContactContext(record).catch(() => null);
     if (!contact || contact.custom_fields?.ia360_revenue_state !== 'calificacion') return false;
+    // G7-CONGRUENCIA: aunque el estado esté sucio de una corrida anterior, un
+    // cliente/beta jamás recibe el PASO 3 (pitch). Sin efectos: pasa al agente.
+    if (isIa360CommercialSuppressed(contact)) {
+      console.log('[revenue-os] free-text suprimido por perfil contact=%s', record.contact_number);
+      return false;
+    }
 
     const { canal, volumen } = extractRevenueSignal(body);
     const cf = {
@@ -1818,6 +1864,92 @@ async function handleRevenueOsFreeText(record) {
     return true;
   } catch (err) {
     console.error('[revenue-os] free-text handler error (no route):', err.message);
+    return false;
+  }
+}
+
+// ============================================================================
+// G7-CONGRUENCIA — botones del template de ENTREGA (ia360_seguimiento_entregable_v1).
+// Sus quick replies llegan con el título visible ("Sí, compártelo" / "Después"), el
+// mismo canal que los openers fríos; sin este handler el afirmativo lo capturaba el
+// clasificador léxico global y respondía con un paso de embudo comercial.
+// Gate DOBLE: título reconocido Y evidencia de que a ESTE contacto se le mandó ese
+// template en los últimos 7 días. Sin las dos cosas declina (return false) y el
+// botón sigue su curso normal. Nunca amplía los lexicones globales: el opener
+// `aliado_caso_reventa` usa "Sí, compártelo" legítimamente y debe seguir funcionando.
+// ============================================================================
+const IA360_ENTREGA_TEMPLATE = 'ia360_seguimiento_entregable_v1';
+
+async function handleEntregaButton({ record, replyId, answer }) {
+  try {
+    if (!record) return false;
+    const key = normalizeOpenerReplyId(replyId || answer);
+    const esSi = key === 'si, compartelo' || key === 'si compartelo';
+    const esDespues = key === 'despues';
+    if (!esSi && !esDespues) return false;
+
+    const { rows } = await pool.query(
+      `SELECT 1
+         FROM coexistence.chat_history
+        WHERE direction='outgoing'
+          AND wa_number=$1 AND contact_number=$2
+          AND message_type='template'
+          AND template_meta->>'template_name' = $3
+          AND created_at >= NOW() - INTERVAL '7 days'
+        LIMIT 1`,
+      [record.wa_number, record.contact_number, IA360_ENTREGA_TEMPLATE]
+    );
+    if (!rows.length) return false; // no hay entrega pendiente: que lo rutee quien corresponda
+
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    const safeName = contact?.name || record.contact_name || record.contact_number;
+
+    if (esDespues) {
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_entrega_pospuesta',
+        body: 'Va, sin prisa. Aquí queda pendiente y me dices cuando quieras verlo.',
+      });
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        customFields: { ia360_entrega_state: 'pospuesto' },
+      }).catch(e => console.error('[ia360-entrega] state pospuesto:', e.message));
+      return true;
+    }
+
+    const pendiente = String(contact?.custom_fields?.ia360_entrega_pendiente || '').trim();
+    if (pendiente) {
+      await enqueueIa360Text({ record, label: 'ia360_entrega_envio', body: pendiente });
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        customFields: { ia360_entrega_state: 'entregado' },
+      }).catch(e => console.error('[ia360-entrega] state entregado:', e.message));
+      return true;
+    }
+
+    await enqueueIa360Text({
+      record,
+      label: 'ia360_entrega_ack',
+      body: '¡Va! Te lo comparto por aquí en un momento.',
+    });
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      customFields: { ia360_entrega_state: 'confirmado' },
+    }).catch(e => console.error('[ia360-entrega] state confirmado:', e.message));
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_entrega_confirmada',
+      body: `Entrega confirmada por ${safeName}: envía el pendiente manualmente.`,
+      targetContact: record.contact_number,
+      ownerBudget: true,
+    }).catch(e => console.error('[ia360-entrega] owner notice:', e.message));
+    return true;
+  } catch (err) {
+    console.error('[ia360-entrega] handler error (no route):', err.message);
     return false;
   }
 }
@@ -8649,6 +8781,75 @@ async function handleIa360FlowReply(record) {
       return true;
     }
 
+    // ── G7-CONGRUENCIA · INTAKE TICKET TI ─────────────────────────────────
+    // Formulario piloto de soporte TI. Detección por campo presente (`tipo_ticket`),
+    // igual que el resto del router. El eco DEVUELVE los campos que el contacto
+    // eligió: es la prueba observable de que el sistema entendió su caso concreto.
+    if (data.tipo_ticket !== undefined) {
+      try {
+        const g = (k) => {
+          const v = data[k];
+          const s = Array.isArray(v) ? v.join(', ') : String(v ?? '').trim();
+          return s || '—';
+        };
+        console.log('[ia360-flowwire] event=ticket_ti_answered contact=%s tipo=%s prioridad=%s', record.contact_number, g('tipo_ticket'), g('prioridad'));
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          customFields: { ia360_ticket_intake_last: { ...data, at: new Date().toISOString() } },
+        }).catch(e => console.error('[ia360-flowwire] ticket state:', e.message));
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_ticket_intake_ack',
+          body: `Recibido y registrado: ${g('tipo_ticket')} · ${g('colaborador')} · ${g('area_sucursal')} · prioridad ${g('prioridad')}. Detalle: "${g('detalle')}". Con esto el ticket entra completo desde el primer mensaje; lo convierto en tarjeta del tablero y le doy seguimiento por aquí.`,
+        });
+        await sendIa360DirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'ia360_flow_intake_owner',
+          body: `Ticket TI capturado por ${record.contact_name || record.contact_number}: ${g('tipo_ticket')} | colaborador ${g('colaborador')} | área ${g('area_sucursal')} | prioridad ${g('prioridad')} | detalle: ${g('detalle')}`,
+          targetContact: record.contact_number,
+          ownerBudget: true,
+        }).catch(e => console.error('[ia360-flowwire] ticket owner notice:', e.message));
+      } catch (ticketErr) {
+        console.error('[ia360-flowwire] ticket intake degradado:', ticketErr.message);
+      }
+      return true;
+    }
+
+    // ── G7-CONGRUENCIA · INTAKE ORDEN DE SERVICIO ─────────────────────────
+    if (data.tipo_entrada !== undefined) {
+      try {
+        const g = (k) => {
+          const v = data[k];
+          const s = Array.isArray(v) ? v.join(', ') : String(v ?? '').trim();
+          return s || '—';
+        };
+        console.log('[ia360-flowwire] event=orden_servicio_answered contact=%s tipo=%s', record.contact_number, g('tipo_entrada'));
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          customFields: { ia360_orden_intake_last: { ...data, at: new Date().toISOString() } },
+        }).catch(e => console.error('[ia360-flowwire] orden state:', e.message));
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_orden_intake_ack',
+          body: `Recibido y registrado: ${g('tipo_entrada')} · cliente ${g('cliente_nombre')} · evidencia esperada: ${g('evidencia')}. Descripción: "${g('descripcion')}". Así entra al carril correcto con etapas y evidencia desde el inicio.`,
+        });
+        await sendIa360DirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'ia360_flow_intake_owner',
+          body: `Orden/prospecto capturado por ${record.contact_name || record.contact_number}: ${g('tipo_entrada')} | cliente ${g('cliente_nombre')} | evidencia ${g('evidencia')} | descripción: ${g('descripcion')}`,
+          targetContact: record.contact_number,
+          ownerBudget: true,
+        }).catch(e => console.error('[ia360-flowwire] orden owner notice:', e.message));
+      } catch (ordenErr) {
+        console.error('[ia360-flowwire] orden intake degradado:', ordenErr.message);
+      }
+      return true;
+    }
+
     // nfm_reply with unrecognized shape → don't route, let normal handling proceed (it won't match either).
     return false;
   } catch (err) {
@@ -8938,6 +9139,11 @@ async function handleIa360LiteInteractive(record) {
   if (await handleIa360FlowReply(record)) return;
   const answer = String(record.message_body || '').trim().toLowerCase();
   const replyId = getInteractiveReplyId(record);
+
+  // G7-CONGRUENCIA: entrega de un pendiente (template ia360_seguimiento_entregable_v1).
+  // Va ANTES de Revenue OS: su "Sí, compártelo" es del carril de entrega, no de un
+  // opener comercial. Declina si no hay ese template reciente para el contacto.
+  if (await handleEntregaButton({ record, replyId, answer })) return;
 
   // Pipeline 5 "WhatsApp Revenue OS": respuesta a la apertura (PASO 1) y bifurcación
   // (PASO 3). Gateado por custom_fields.ia360_revenue_state; si no aplica, devuelve
@@ -10123,7 +10329,33 @@ async function handleIa360LiteInteractive(record) {
   if (openerKind) {
     try {
       const safeName = record.contact_name || record.contact_number;
+      const botonReal = replyId || answer || '-';
       if (openerKind === 'affirmative') {
+        // G7-CONGRUENCIA: este clasificador es LÉXICO y global — "Sí, compártelo" de
+        // un template de entrega caía aquí y disparaba Revenue OS a un beta (incidente
+        // Sergio 2026-08-11). Ahora exige EVIDENCIA de que hubo un opener y respeta la
+        // supresión comercial por perfil; sin ambas, acusa recibo y escala al owner.
+        const openerContact = await loadIa360ContactContext(record).catch(() => null);
+        const openerEvidence = !!openerContact?.custom_fields?.ia360_persona_first?.send?.sent_at
+          || ['apertura_sent', 'calificacion', 'propuesta', 'demo'].includes(String(openerContact?.custom_fields?.ia360_revenue_state || ''));
+        if (isIa360CommercialSuppressed(openerContact) || !openerEvidence) {
+          console.log('[ia360-opener] recovery declinado contact=%s boton=%s suprimido=%s evidencia=%s',
+            record.contact_number, botonReal, isIa360CommercialSuppressed(openerContact), openerEvidence);
+          await enqueueIa360Text({
+            record,
+            label: 'ia360_boton_sin_ruta',
+            body: 'Va, recibido. Lo reviso y te regreso por aquí con el siguiente paso.',
+          });
+          await sendIa360DirectText({
+            record,
+            toNumber: IA360_OWNER_NUMBER,
+            label: 'owner_boton_sin_ruta',
+            body: `Alek, ${safeName} (${record.contact_number}) tocó "${botonReal}" y ningún flujo lo reclamó (sin opener enviado o contacto suprimido comercialmente). Le acusé recibo sin abrir embudo; el siguiente paso lo defines tú.`,
+            targetContact: record.contact_number,
+            ownerBudget: true,
+          }).catch(e => console.error('[ia360-opener] owner notice sin ruta:', e.message));
+          return;
+        }
         // "Sí, cuéntame" → abre la conversación de demo/onboarding con la pregunta
         // de calificación (PASO 2 de Revenue OS) y deja estado para que su texto
         // libre siguiente llegue al agente. NO es el fallback genérico.
@@ -10138,7 +10370,7 @@ async function handleIa360LiteInteractive(record) {
           record,
           toNumber: IA360_OWNER_NUMBER,
           label: 'owner_opener_si_recovery',
-          body: `Alek, ${safeName} (${record.contact_number}) tocó "Sí, cuéntame" de un opener (id: ${replyId || answer || '-'}) sin estado activo. Le respondí con la pregunta de calificación para abrir la demo; quedó en "calificación".`,
+          body: `Alek, ${safeName} (${record.contact_number}) tocó "${botonReal}" de un opener sin estado activo. Le respondí con la pregunta de calificación para abrir la demo; quedó en "calificación".`,
           targetContact: record.contact_number,
           ownerBudget: true,
         }).catch(e => console.error('[ia360-opener] owner notice si:', e.message));

@@ -26,6 +26,10 @@
 #                             "No prioritario" sin botón Aplicarlo.
 #   seq <num_qa> <seq_id> <opcion> <titulo>
 #                             Respuesta del contacto a un opener v2 (ids seq_* G-C).
+#   hijack <num_qa>           Botón afirmativo huérfano sin opener: evita secuestro
+#                             por Revenue OS y responde ia360_boton_sin_ruta.
+#   entrega <num_qa>          Quick replies del template de entregable: cubre ack
+#                             y posposición sin caer al recovery de Revenue OS.
 #   cold-send <num_qa> <persona> <seq_id> [nombre]
 #                             Cadena cold-send completa vía owner: vCard → persona →
 #                             secuencia → tarjeta de aprobación → owner_approve_send.
@@ -278,6 +282,58 @@ cmd_seq(){
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+cmd_hijack(){
+  guard_qa "$1"
+  local QA="$1"
+  banner "BUG HIJACK — botón afirmativo huérfano no debe activar Revenue OS — contacto QA $QA" "forgechat_monolith_e2e"
+
+  echo "--- STEP 0: contacto QA limpio, sin evidencia de opener ni entrega ---"
+  psql_q "INSERT INTO coexistence.contacts (wa_number, contact_number, name) VALUES ('$WA', '$QA', 'QA Hijack') ON CONFLICT (wa_number, contact_number) DO NOTHING" >/dev/null
+  psql_q "UPDATE coexistence.contacts SET custom_fields = custom_fields - 'ia360_persona_first' - 'ia360_revenue_state' - 'ia360_entrega_pendiente' - 'ia360_entrega_state' WHERE wa_number='$WA' AND contact_number='$QA'" >/dev/null
+  local BASE_ID; BASE_ID="$(max_out_id "$QA")"
+
+  echo "--- Inyecta quick reply huérfano 'Sí, compártelo' ---"
+  chk "HTTP" "$(inject_tpl_button "$QA" "Sí, compártelo" "QA Hijack")" "200"
+  sleep 6
+  chk "no emitió recovery afirmativo de Revenue OS" "$(fresh_count_label "$QA" ia360_opener_si_recovery "$BASE_ID")" "0"
+  local REV; REV="$(rev_state "$QA")"
+  if [ "$REV" != "calificacion" ]; then
+    ok "estado Revenue OS no fue secuestrado"
+  else
+    bad "estado Revenue OS no fue secuestrado" "$REV" "distinto de calificacion"
+  fi
+  chk "respondió con fallback seguro de botón sin ruta" "$(fresh_count_label "$QA" ia360_boton_sin_ruta "$BASE_ID")" "1"
+  echo "  labels de la corrida: $(fresh_labels "$QA" "$BASE_ID")"
+  verdict "bug hijack ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+cmd_entrega(){
+  guard_qa "$1"
+  local QA="$1"
+  banner "ENTREGA — quick replies del template de seguimiento — contacto QA $QA" "forgechat_monolith_e2e"
+
+  echo "--- STEP 0: contacto QA limpio y template saliente reciente ---"
+  psql_q "INSERT INTO coexistence.contacts (wa_number, contact_number, name) VALUES ('$WA', '$QA', 'QA Entrega') ON CONFLICT (wa_number, contact_number) DO NOTHING" >/dev/null
+  psql_q "UPDATE coexistence.contacts SET custom_fields = custom_fields - 'ia360_persona_first' - 'ia360_revenue_state' - 'ia360_entrega_pendiente' - 'ia360_entrega_state' WHERE wa_number='$WA' AND contact_number='$QA'" >/dev/null
+  local TPL_MID; TPL_MID="wamid.qa-entrega.$(ts).$RANDOM"
+  psql_q "INSERT INTO coexistence.chat_history (message_id, phone_number_id, wa_number, contact_number, to_number, direction, message_type, message_body, status, timestamp, created_at, template_meta) VALUES ('$TPL_MID', '$PID_NUM', '$WA', '$QA', '$QA', 'outgoing', 'template', 'ia360_seguimiento_entregable_v1', 'sent', NOW(), NOW(), '{\"template_name\":\"ia360_seguimiento_entregable_v1\"}'::jsonb)" >/dev/null
+  local BASE_ID; BASE_ID="$(max_out_id "$QA")"
+
+  echo "--- Rama afirmativa: 'Sí, compártelo' sin entregable precargado ---"
+  chk "ACK HTTP" "$(inject_tpl_button "$QA" "Sí, compártelo" "QA Entrega")" "200"
+  sleep 6
+  echo "--- Rama pospuesta: 'Después' ---"
+  chk "POSPUESTA HTTP" "$(inject_tpl_button "$QA" "Después" "QA Entrega")" "200"
+  sleep 6
+  chk "emitió ack de entrega" "$(fresh_count_label "$QA" ia360_entrega_ack "$BASE_ID")" "1"
+  chk "emitió confirmación de entrega pospuesta" "$(fresh_count_label "$QA" ia360_entrega_pospuesta "$BASE_ID")" "1"
+  chk "no emitió recovery afirmativo de Revenue OS" "$(fresh_count_label "$QA" ia360_opener_si_recovery "$BASE_ID")" "0"
+  echo "  labels de la corrida: $(fresh_labels "$QA" "$BASE_ID")"
+  verdict "entrega ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 cmd_cold_send(){
   local QA="$1" PERSONA="$2" SEQ="$3" NAME="${4:-QA Cold Send}"; guard_qa "$QA"
   banner "COLD-SEND vía owner (starter real de secuencias) — $PERSONA/$SEQ → $QA" "forgechat_monolith_e2e"
@@ -346,6 +402,8 @@ cmd_template_only(){
 case "${1:-help}" in
   revenue-os)     cmd_revenue_os "${2:?num_qa}";;
   gate-slots-bug) cmd_gate_slots_bug "${2:?num_qa}";;
+  hijack)         cmd_hijack "${2:?num_qa}";;
+  entrega)        cmd_entrega "${2:?num_qa}";;
   m100)           cmd_m100 "${2:?num_qa}";;
   seq)            cmd_seq "${2:?num_qa}" "${3:?seq_id}" "${4:?opcion}" "${5:?titulo}";;
   cold-send)      cmd_cold_send "${2:?num_qa}" "${3:?persona}" "${4:?seq_id}" "${5:-}";;
