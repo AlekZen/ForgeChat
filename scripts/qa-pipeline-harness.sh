@@ -486,7 +486,9 @@ process.stdout.write(found);r.disconnect();})();' "$TOKEN" 2>/dev/null)"
 
   echo "--- D4: submit del Flow (nfm_reply con el flow_token real) → sesión cerrada ---"
   local BASE_QA2; BASE_QA2="$(max_out_id "$QA")"
-  chk "D4 HTTP" "$(inject_nfm "$QA" "{\"cuerda\":\"comercial\",\"camino\":\"afinar\",\"flow_token\":\"$TOKEN\"}" "$NAME")" "200"
+  # Payload IDÉNTICO al del Flow publicado (verificado 2026-08-11 contra el submit
+  # real del owner): sin c1..c6 la lectura degrada a "no puedo calcular tu Índice".
+  chk "D4 HTTP" "$(inject_nfm "$QA" "{\"c1\":\"3\",\"c2\":\"2\",\"c3\":\"4\",\"c4\":\"2\",\"c5\":\"3\",\"c6\":\"1\",\"cuerda\":\"comercial\",\"senales\":[\"duplicacion\"],\"sistemas\":[\"whatsapp\"],\"resultado\":\"QA\",\"urgencia\":\"alta\",\"alcance\":\"toda_la_empresa\",\"camino\":\"recibir_lectura\",\"consent_lectura\":true,\"consent_seguimiento\":true,\"flow_token\":\"$TOKEN\"}" "$NAME")" "200"
   sleep 7
   chk "D4 respondido_en sellado" "$(psql_q "SELECT CASE WHEN respondido_en IS NULL THEN 'null' ELSE 'sellado' END FROM coexistence.diapazo_sesion_enviada WHERE flow_token='$TOKEN'")" "sellado"
   echo "  labels de la respuesta: $(fresh_labels "$QA" "$BASE_QA2")"
@@ -546,6 +548,104 @@ cmd_expansion_deal(){
   echo "  opener al QA: $OPENER"
   chk_has "E4 el opener de expansión salió al contacto" "$OPENER" "ia360_seq_opener_cliente_expansion"
   verdict "expansion-deal ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# MATRIZ DE ALTA — corre el camino de DEMO completo para CADA clasificación del
+# catálogo y dice cuál sirve y cuál se rompe. Es la respuesta a "que no me deje
+# en ridículo cuando se lo enseñe a alguien": el mismo camino que haría Alek
+# frente a otra persona (compartir vCard → clasificar → aprobar → el contacto
+# recibe → el contacto responde), pero con números QA y cero egress real.
+#
+# Un contacto QA nuevo SIEMPRE está fuera de la ventana de 24 h, así que cada
+# fila ejerce el camino frío real: template aprobado por Meta, no texto libre.
+alta_matrix_row(){ MATRIX="${MATRIX}$1\n"; }
+
+cmd_alta_matrix(){
+  local BASE_NUM="${2:-5219990013}"   # + 3 dígitos por persona
+  banner "MATRIZ DE ALTA — todas las clasificaciones del catálogo" "forgechat_monolith_e2e"
+  local PERSONAS="persona_beta persona_referido persona_aliado persona_cliente persona_sponsor persona_comercial persona_cfo persona_tecnico persona_diapazo"
+  local MATRIX=""
+  local i=0
+  for P in $PERSONAS; do
+    i=$((i+1))
+    local QA; QA="$(printf '%s%03d' "$BASE_NUM" "$i")"
+    guard_qa "$QA"
+    echo ""
+    echo "═══ $P → $QA ═══"
+    local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
+    local BASE_QA; BASE_QA="$(max_out_id "$QA")"
+
+    # 1) vCard con nombre NEUTRO (sin señal): el camino más común.
+    chk "$P · vCard aceptado" "$(inject_vcard "$OWNER" "QA Alta $i" "$QA")" "200"
+    sleep 7
+    local CARD; CARD="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_vcard_captured_$QA' ORDER BY id DESC LIMIT 1")"
+    if [ -z "$CARD" ]; then bad "$P · tarjeta de clasificación" "(vacío)" "message_id"; alta_matrix_row "$P|SIN TARJETA|-|-|-"; continue; fi
+
+    # 2) tap de la clasificación → readout + tarjeta de aprobación (P5: directo).
+    chk "$P · tap de clasificación" "$(inject_list "$OWNER" "owner_pipe:$QA:$P" "$CARD" "Clasificar" "Alek")" "200"
+    sleep 8
+    local APR; APR="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label' LIKE 'owner_approve_card_${QA}_%' ORDER BY id DESC LIMIT 1")"
+    if [ -z "$APR" ]; then
+      bad "$P · tarjeta de aprobación" "(vacío)" "message_id"
+      echo "  labels emitidos: $(fresh_labels "$OWNER" "$BASE_OWNER")"
+      alta_matrix_row "$P|SIN TARJETA DE APROBACION|-|-|-"; continue
+    fi
+    local SEQ; SEQ="$(psql_q "SELECT substring(template_meta->>'label' from '^owner_approve_card_${QA}_(.*)\$') FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND message_id='$APR'")"
+    ok "$P · tarjeta de aprobación (secuencia=$SEQ)"
+
+    # 3) aprobar → el contacto recibe.
+    local BASE_OWNER2; BASE_OWNER2="$(max_out_id "$OWNER")"
+    chk "$P · aprobar y enviar" "$(inject_list "$OWNER" "owner_approve_send:$QA:$SEQ" "$APR" "Aprobar y enviar" "Alek")" "200"
+    sleep 10
+    local ACK; ACK="$(psql_q "SELECT template_meta->>'label' FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER2 AND template_meta->>'label' IN ('owner_approve_send_done','owner_approve_send_failed','owner_approve_send_blocked','owner_block_exit_offer') ORDER BY id DESC LIMIT 1")"
+    local OUT; OUT="$(psql_q "SELECT COALESCE(template_meta->>'template_name', template_meta->>'label')||' ['||status||']' FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA ORDER BY id DESC LIMIT 1")"
+    echo "  ack owner: ${ACK:-(ninguno)}   salida al contacto: ${OUT:-(ninguna)}"
+    local ENVIO="NO SALIÓ"
+    case "$OUT" in *"[sent]"*|*"[delivered]"*|*"[read]"*) ENVIO="OK";; esac
+    chk "$P · el contacto recibió algo" "$ENVIO" "OK"
+
+    # 4) respuesta del contacto → paso 2 de la secuencia (o cierre de sesión Diapazo).
+    local BASE_QA2; BASE_QA2="$(max_out_id "$QA")"
+    local RESP="-"
+    if [ "$P" = "persona_diapazo" ]; then
+      local TOKEN; TOKEN="$(psql_q "SELECT flow_token FROM coexistence.diapazo_sesion_enviada WHERE contact_number='$QA' ORDER BY enviado_en DESC LIMIT 1")"
+      inject_nfm "$QA" "{\"c1\":\"3\",\"c2\":\"2\",\"c3\":\"4\",\"c4\":\"2\",\"c5\":\"3\",\"c6\":\"1\",\"cuerda\":\"comercial\",\"camino\":\"recibir_lectura\",\"consent_lectura\":true,\"flow_token\":\"$TOKEN\"}" "QA Alta $i" >/dev/null
+      sleep 7
+      RESP="$(psql_q "SELECT CASE WHEN respondido_en IS NULL THEN 'SESION NO CERRÓ' ELSE 'OK' END FROM coexistence.diapazo_sesion_enviada WHERE flow_token='$TOKEN'")"
+    else
+      # id real del primer botón del opener, leído del catálogo que corre en prod.
+      local OPT; OPT="$(docker exec "$BE" node -e "
+const s=require('fs').readFileSync('/app/src/routes/webhook.js','utf8');
+const m=s.match(new RegExp('seq_'+process.argv[1]+':[a-z_]+'));
+process.stdout.write(m?m[0]:'');" "$SEQ" 2>/dev/null)"
+      if [ -z "$OPT" ]; then
+        RESP="SIN OPCIONES DE OPENER"
+      else
+        inject_button "$QA" "$OPT" "Respuesta QA" "QA Alta $i" >/dev/null
+        sleep 7
+        local L; L="$(fresh_labels "$QA" "$BASE_QA2")"
+        # OK = el contacto recibió el PASO 2 real de la secuencia. El acuse
+        # genérico ("registré tu respuesta…") cuenta como gap de contenido: rutea,
+        # pero deja la conversación sin siguiente pregunta.
+        case "$L" in
+          *ia360_seq_step2_*) RESP="OK";;
+          *ia360_seq_ack_*)   RESP="ACK GENÉRICO (falta paso 2)";;
+          *)                  RESP="NO RUTEÓ (${L:-sin salida})";;
+        esac
+      fi
+    fi
+    chk "$P · la respuesta del contacto rutea" "$RESP" "OK"
+    local DEAL; DEAL="$(psql_q "SELECT p.name||' / '||s.name FROM coexistence.deals d JOIN coexistence.pipeline_stages s ON s.id=d.stage_id JOIN coexistence.pipelines p ON p.id=d.pipeline_id WHERE d.contact_number='$QA' ORDER BY d.updated_at DESC NULLS LAST, d.id DESC LIMIT 1")"
+    alta_matrix_row "$P|$SEQ|$ENVIO|$RESP|${DEAL:-(sin deal)}"
+  done
+
+  echo ""
+  echo "=============================================================="
+  echo " MATRIZ DE ALTA (clasificación | secuencia auto | envío | respuesta | deal)"
+  echo "=============================================================="
+  printf "$MATRIX" | column -t -s '|'
+  verdict "alta-matrix"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -615,6 +715,7 @@ case "${1:-help}" in
   cold-send)      cmd_cold_send "${2:?num_qa}" "${3:?persona}" "${4:?seq_id}" "${5:-}";;
   diapazo-alta)   cmd_diapazo_alta "${2:?num_qa}" "${3:-}";;
   expansion-deal) cmd_expansion_deal "${2:?num_qa}" "${3:-}";;
+  alta-matrix)    cmd_alta_matrix "matrix" "${2:-}";;
   template-only)  cmd_template_only "${2:?num_qa}" "${3:?template_name}" "${4:?pipeline}" "${5:-}";;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
 esac

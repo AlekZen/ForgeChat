@@ -3785,6 +3785,13 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'área donde el cliente ya ve oportunidad de continuidad',
         nextAction: 'Alek valida que exista adopción o evidencia antes de proponer expansión.',
         cta: 'identificar siguiente módulo con permiso',
+        step2: {
+          whatsapp: 'WhatsApp, anotado. Ahí suelen doler dos cosas distintas: que tarden en responder o que el hilo se pierda entre varias personas. ¿Cuál de las dos te pega más hoy?',
+          crm: 'CRM y clientes, anotado. El síntoma típico es que la información está, pero nadie confía en ella porque se captura tarde. ¿El CRM lo llena el equipo a mano hoy?',
+          datos: 'Datos y reportes, anotado. Vale más arreglar un reporte que sí usas que construir un tablero completo. ¿Qué reporte armas a mano y te gustaría recibir hecho?',
+          agenda: 'Agenda y citas, anotado. Aquí lo caro no es agendar, es el ida y vuelta para encontrar hueco y los que no llegan. ¿Qué pesa más: coordinar el horario o las ausencias?',
+          seguimiento: 'Seguimiento de ventas, anotado. Con proyecto andando ya tenemos historial, así que se puede medir dónde se enfría en lugar de suponerlo. ¿Le damos seguimiento a lo que ya está cotizado o a lo que apenas empieza?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Te escribo de su parte porque tú y Alek ya tienen un proyecto andando, y Alek quiere ubicar dónde estaría el siguiente paso con más impacto, sin empujarte nada fuera de tiempo. De estas áreas, ¿cuál te quita más tiempo hoy?`,
         requiresLiveDeal: true,
         metaTemplateName: 'ia360_cliente_expansion', // G-COLD: en frío sale como QUICK_REPLY (la lista vive en el flujo caliente)
@@ -3818,6 +3825,12 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'cuello ejecutivo prioritario y disposición a conversar',
         nextAction: 'Alek decide si la pregunta va a operación, ventas, datos o seguimiento.',
         cta: 'detectar cuello ejecutivo',
+        step2: {
+          operacion: 'Operación, anotado. Para no irnos por las ramas conviene aterrizarlo en un proceso concreto. ¿Cuál duele más: atención a clientes, coordinación interna o entregas?',
+          ventas: 'Ventas, anotado. La pregunta útil no es cuánto venden, sino dónde se cae lo que ya estaba en la mesa. ¿Se pierde en prospección, en seguimiento o en el cierre?',
+          datos: 'Datos y reportes, anotado. Casi siempre el problema no es que falten datos, sino que llegan tarde o no cuadran entre sistemas. ¿Qué decisión tomas hoy con información que no te termina de convencer?',
+          seguimiento: 'Seguimiento, anotado. Es la fuga más silenciosa: nadie la reporta porque no aparece en ningún tablero. ¿El seguimiento hoy depende de una persona o de un sistema?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió contactarte antes de mandarte una demo genérica: prefiere ubicar primero dónde habría valor real para tu operación. De estas áreas, ¿dónde sientes el cuello de botella que más mueve la aguja?`,
         metaTemplateName: 'ia360_sponsor_diagnostico', // G-COLD
         openerOptions: {
@@ -3840,6 +3853,12 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'mención de costo, demora, retrabajo o pérdida de visibilidad',
         nextAction: 'Alek prepara una lectura de impacto antes de sugerir solución.',
         cta: 'pedir síntoma de fuga de valor',
+        step2: {
+          tiempo: 'Tiempo perdido, anotado. Para dimensionarlo sirve un solo dato concreto en vez de un diagnóstico largo. ¿Qué tarea manual se repite todos los días en tu equipo y a cuánta gente le toca?',
+          seguimiento: 'Seguimiento que se cae, anotado. Esa fuga casi siempre se puede medir en dinero, que es lo que hace obvia la decisión. ¿Cuántas oportunidades al mes se enfrían por falta de seguimiento, aunque sea a ojo?',
+          datos: 'Datos poco confiables, anotado. El problema real no es el dato, es que nadie firma decisiones con él. ¿Qué reporte te gustaría poder creerte sin mandar a validarlo?',
+          decisiones: 'Decisiones lentas, anotado. Normalmente no falta análisis: falta que la información llegue el día que se decide. ¿Qué decisión se te atora hoy esperando información?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando IA360 sí aplica, se nota en cuatro fugas: tiempo perdido en tareas manuales, seguimiento que se cae, datos poco confiables y decisiones lentas. ¿Cuál de esas te preocupa más hoy?`,
         metaTemplateName: 'ia360_sponsor_fuga_valor', // G-COLD
         openerOptions: {
@@ -3893,6 +3912,11 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'fuga en generación, seguimiento, cierre o visibilidad',
         nextAction: 'Alek confirma si conviene hacer diagnóstico comercial antes de proponer.',
         cta: 'ubicar fuga principal del pipeline',
+        step2: {
+          leads: 'Leads que no llegan, anotado. Antes de meter más prospectos conviene saber si el hueco es de volumen o de calidad. ¿De dónde viene hoy la mayoría: recomendación, redes o prospección en frío?',
+          seguimiento: 'Seguimiento que se cae, anotado. Es el más caro de los tres, porque se pierde gente que ya había levantado la mano. ¿En qué momento se enfría normalmente — después de la primera respuesta o después de la cotización?',
+          contexto: 'WhatsApp sin contexto, anotado. Ahí el costo es doble: el cliente repite su historia y el vendedor decide a ciegas. ¿El WhatsApp comercial lo trae una persona o lo comparten varios?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek trabaja ayudando a equipos comerciales y casi siempre el problema aparece en uno de tres lugares. En tu equipo, ¿cuál duele más hoy?`,
         metaTemplateName: 'ia360_comercial_pipeline', // G-COLD
         openerOptions: {
@@ -3914,6 +3938,12 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'dolor entre conversaciones, CRM y seguimiento comercial',
         nextAction: 'Alek revisa si el caso pide orden operativo o motor de ventas.',
         cta: 'mapear seguimiento WhatsApp/CRM',
+        step2: {
+          historial: 'Historial, anotado. Es el síntoma clásico: el cliente ya contó su caso y lo tiene que repetir porque el hilo vive en el teléfono de alguien. ¿Cuántas personas atienden hoy el mismo WhatsApp?',
+          seguimiento: 'Seguimiento, anotado. Aquí la pregunta que importa no es quién falló, sino cuándo se cae: ¿se pierde antes de la cotización o después de mandarla?',
+          prioridad: 'Prioridad de leads, anotado. Sin criterio, el equipo atiende al que grita más fuerte y no al que va a comprar. ¿Cómo deciden hoy a quién le hablan primero?',
+          datos: 'Datos para decidir, anotado. La mayoría de los equipos tiene datos, pero no a tiempo ni en un solo lugar. ¿Qué número te gustaría ver cada lunes y hoy no tienes?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Muchas fugas comerciales no vienen del vendedor, sino de WhatsApp y el CRM trabajando sin contexto compartido. En tu operación, ¿qué se pierde más hoy?`,
         metaTemplateName: 'ia360_comercial_wa_crm', // G-COLD
         openerOptions: {
@@ -3936,6 +3966,11 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'canal, segmento o proceso que podría convertirse en motor comercial',
         nextAction: 'Alek valida segmento y oferta antes de hablar de prospección.',
         cta: 'detectar si hay motor comercial repetible',
+        step2: {
+          segmento: 'Segmento, anotado. Sin eso el mejor mensaje se desperdicia en gente que nunca iba a comprar. ¿Hoy a quién le venden mejor: por industria, por tamaño de empresa o por el puesto de quien decide?',
+          mensaje: 'Mensaje repetible, anotado. La señal de que falta es cuando cada vendedor escribe su propia versión y ninguna se puede medir. ¿Tienen un primer mensaje escrito o cada quien improvisa el suyo?',
+          seguimiento: 'Seguimiento medible, anotado. Es lo más caro de arreglar a mano y lo más barato de automatizar bien. ¿Cuántos toques dan hoy antes de dar por perdido a un prospecto?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para aplicar IA360 a prospección hacen falta tres piezas: un segmento claro, un mensaje repetible y un seguimiento medible. ¿Qué parte de ese motor está más débil en tu equipo hoy?`,
         metaTemplateName: 'ia360_comercial_motor_prospeccion', // G-COLD
         openerOptions: {
@@ -3966,6 +4001,12 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'dolor de control, visibilidad o retrabajo financiero',
         nextAction: 'Alek decide si el ángulo financiero es control, cartera o comisiones.',
         cta: 'detectar punto de control débil',
+        step2: {
+          cartera: 'Cartera, anotado. Lo que suele doler no es el saldo, sino no saber al día quién debe qué y desde cuándo sin pedirlo por WhatsApp. ¿Hoy la cartera la sacas del ERP, de un Excel o de preguntarle a alguien?',
+          comisiones: 'Comisiones, anotado. Ese cálculo se vuelve caro cuando las reglas cambian y hay excepciones que nadie documentó. ¿Cuánto tiempo del cierre se te va en calcular y aclarar comisiones?',
+          reportes: 'Reportes, anotado. La pregunta clave no es qué reporte falta, sino cuál te piden y todavía armas a mano. ¿Cuál es ese reporte y cada cuándo lo piden?',
+          conciliacion: 'Conciliación, anotado. Ahí el costo real es el retrabajo: revisar dos veces lo mismo porque las fuentes no coinciden. ¿Qué concilias con más dolor hoy — banco, cobranza o inventario?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek trabaja con equipos de finanzas que terminan operando a mano porque no pueden confiar rápido en sus datos. En tu caso, ¿dónde está el mayor dolor hoy?`,
         metaTemplateName: 'ia360_cfo_control', // G-COLD
         openerOptions: {
@@ -4010,6 +4051,11 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'regla manual, conciliación lenta o disputa por cálculo',
         nextAction: 'Alek valida si el caso se puede convertir en diagnóstico de reglas y datos.',
         cta: 'detectar reglas financieras propensas a error',
+        step2: {
+          reglas: 'Reglas manuales, anotado. Casi siempre el costo no es calcular, sino re-calcular cada vez que alguien cambia una regla a mitad de mes. ¿Las reglas de comisión hoy viven en un Excel, en el ERP o en la cabeza de alguien?',
+          excepciones: 'Excepciones, anotado. Son las que rompen cualquier automatización mal hecha, así que hay que mapearlas antes de tocar nada. ¿Qué excepción se repite más: descuentos fuera de política, ventas compartidas o devoluciones?',
+          datos: 'Datos que no cuadran, anotado. Ahí el problema rara vez es el reporte: es que dos sistemas dicen cosas distintas del mismo movimiento. ¿Entre qué dos fuentes se te descuadra más seguido — ERP y banco, ERP y CRM, o el Excel del equipo?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. En comisiones y conciliación, el problema suele estar en reglas manuales, excepciones y datos que no cuadran. ¿Dónde se te va más tiempo revisando o corrigiendo?`,
         metaTemplateName: 'ia360_cfo_comisiones', // G-COLD
         openerOptions: {
@@ -4062,6 +4108,13 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'riesgo técnico prioritario o condición para prueba segura',
         nextAction: 'Alek define guardrails técnicos antes de proponer piloto.',
         cta: 'identificar riesgo técnico principal',
+        step2: {
+          permisos: 'Permisos, buen primer filtro. La regla de Alek es permiso mínimo por integración y nada de accesos de administrador «por si acaso». ¿Qué sistema te preocupa más abrir: el CRM, el ERP o el WhatsApp de la empresa?',
+          datos: 'Datos, correcto. Aquí lo que importa es qué sale del perímetro y qué se queda: IA360 guarda el hilo y el contexto del cliente, no los documentos internos. ¿Hay algún dato que por política no pueda salir de sus servidores?',
+          trazabilidad: 'Trazabilidad, de acuerdo. Cada mensaje que manda el sistema queda con su origen, su responsable y su estado de entrega; sin eso no hay auditoría posible. ¿Necesitas ese registro exportable o basta con poder consultarlo?',
+          reversibilidad: 'Reversibilidad, buena pregunta. La integración se apaga por flag y la operación vuelve al flujo manual sin migrar nada de regreso. ¿Qué tendría que pasar para que ustedes consideraran «apagarlo» y en cuánto tiempo esperarían volver al estado anterior?',
+          dependencia: 'Dependencia operativa, es la objeción más honesta. El diseño es que el sistema ayude sin volverse el único que sabe: la información vive en su CRM, no en la herramienta. ¿Qué proceso NO podría depender de esto ni un día?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de funciones, Alek quiere entender qué riesgo técnico habría que controlar primero en una integración con IA360. ¿Cuál revisarías antes que nada?`,
         metaTemplateName: 'ia360_tecnico_rollback', // G-COLD
         openerOptions: {
