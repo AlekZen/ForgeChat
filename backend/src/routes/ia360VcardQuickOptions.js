@@ -27,13 +27,17 @@ function compact(text, max) {
   return clean.length <= max ? clean : clean.slice(0, Math.max(0, max - 1)).trimEnd() + '…';
 }
 
-// Las 4 opciones rápidas, en orden. `key` es el sufijo del id
+// Las opciones rápidas, en orden. `key` es el sufijo del id
 // `owner_pipe:<num>:<key>` (existente). "guardar" es un IA360_TERMINAL_VCARD_CHOICES
 // (captura sin secuencia). El title va <=24 y la description <=72.
+// P10: «Diapazo · Afinación» es fija: entrega la Sesión de Afinación (Flow real
+// dentro de ventana, template con botón FLOW en frío) sin pasar por la lista
+// completa. Con la fila "Ver todas" la tarjeta queda en 6 filas (tope Meta: 10).
 const VCARD_QUICK_OPTIONS = [
   { key: 'persona_referido', title: 'Referido / BNI', description: 'Miembro BNI, intro o recomendación' },
   { key: 'persona_beta', title: 'Beta / amigo', description: 'Conocido, técnico o prueba de confianza' },
   { key: 'persona_cliente', title: 'Cliente activo', description: 'Ya es cliente: engage o deleitar' },
+  { key: 'persona_diapazo', title: 'Diapazo · Afinación', description: 'Sesión de Afinación (Flow) de Diapazo' },
   { key: 'guardar', title: 'Solo guardar', description: 'Captura el contacto sin enviar nada' },
 ];
 
@@ -42,9 +46,9 @@ function seeAllRowId(contactNumber) {
   return `owner_vcard_seeall:${contactNumber}`;
 }
 
-// Construye las filas (5) de la tarjeta corta de opciones rápidas para un
-// contacto. Las 4 primeras reusan `owner_pipe:<num>:<key>`; la 5ª es
-// `owner_vcard_seeall:<num>`. Conserva SIEMPRE las 5 filas.
+// Construye las filas (6) de la tarjeta corta de opciones rápidas para un
+// contacto. Las 5 primeras reusan `owner_pipe:<num>:<key>`; la última es
+// `owner_vcard_seeall:<num>`. Conserva SIEMPRE todas las filas.
 function buildVcardQuickRows({ contactNumber } = {}) {
   const rows = VCARD_QUICK_OPTIONS.map(o => ({
     id: `owner_pipe:${contactNumber}:${o.key}`,

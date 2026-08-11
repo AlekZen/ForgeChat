@@ -10,6 +10,7 @@ const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('
 const { recordOutboundStatus } = require('../services/outboundStatusReceipt');
 const { projectSignedWebhook } = require('../services/whatsapp5gInboundBridge');
 const { enqueueSend } = require('../queue/sendQueue');
+const { buildFlowButtonComponents } = require('../util/templateFlow');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
@@ -1330,6 +1331,21 @@ async function upsertIa360SharedContact({ record, shared }) {
       console.error('[ia360-vcard] quien_intro lookup:', e.message);
       quienIntro = null;
     }
+  } else if (normalizePhone(record.contact_number || '') === IA360_OWNER_NUMBER && /\bbni\b/i.test(String(shared.name || ''))) {
+    // P7(a): el vCard del owner no trae introductor, pero un nombre con «BNI»
+    // dice de dónde viene la intro. Pre-llenarlo evita que referido_contexto
+    // llegue a la tarjeta con {{quien_intro}} vacío y exija un comando de texto
+    // exacto (caso José Ramón, 07-04). No pisa un introductor ya capturado.
+    try {
+      const { rows: existingRows } = await pool.query(
+        `SELECT custom_fields->>'quien_intro' AS quien_intro FROM coexistence.contacts WHERE wa_number=$1 AND contact_number=$2 LIMIT 1`,
+        [record.wa_number, normalizePhone(shared.contactNumber)]
+      );
+      if (!String(existingRows[0]?.quien_intro || '').trim()) quienIntro = 'BNI';
+    } catch (e) {
+      console.error('[ia360-vcard] quien_intro BNI prefill:', e.message);
+      quienIntro = null;
+    }
   }
   const customFields = {
     ...(quienIntro ? { quien_intro: quienIntro } : {}),
@@ -1415,6 +1431,15 @@ async function recordBlockedOwnerNumberVcard({ record, shared }) {
       ia360_owner_number_vcard_blocked_reason: 'shared_contact_phone_matches_owner',
     },
   }).catch(e => console.error('[ia360-vcard] owner-number block persist:', e.message));
+  // P4: bloquear en silencio dejaba al owner esperando una tarjeta que nunca
+  // llegaba. El bloqueo se mantiene; lo que cambia es que se dice.
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_vcard_self_blocked',
+    body: `Ese vCard${shared?.name ? ` («${shared.name}»)` : ''} es tu propio número; no lo doy de alta. Si querías dar de alta a otra persona, compárteme su contacto.`,
+    critical: true,
+  });
 }
 
 // G8: `pipelineName` enruta el deal. Default = Revenue genérico (no rompe lo
@@ -2638,7 +2663,11 @@ function renderIa360TemplateBody(tpl, record, vars = null) {
   });
 }
 
-async function buildIa360TemplateComponents(tpl, account, record, vars = null) {
+// `flowToken` opcional: cuando la plantilla trae un botón FLOW, Meta exige el
+// componente de botón con el flow_token para que el submit del Flow regrese
+// atado a esta sesión. Sin token, o sin botón FLOW en la plantilla,
+// buildFlowButtonComponents devuelve [] y los componentes son idénticos a antes.
+async function buildIa360TemplateComponents(tpl, account, record, vars = null, flowToken = null) {
   const components = [];
   const headerType = String(tpl.header_type || 'NONE').toUpperCase();
   const headerMediaId = await resolveTemplateHeaderMediaId(tpl, account);
@@ -2669,6 +2698,7 @@ async function buildIa360TemplateComponents(tpl, account, record, vars = null) {
       }),
     });
   }
+  components.push(...buildFlowButtonComponents(tpl.buttons, flowToken));
   return components;
 }
 
@@ -2695,14 +2725,14 @@ async function waitForIa360OutboundStatus(handlerFor, timeoutMs = 9000) {
   return last || { status: 'unknown' };
 }
 
-async function enqueueIa360Template({ record, label, templateName, templateId = null, vars = null, allowTextFallback = true }) {
+async function enqueueIa360Template({ record, label, templateName, templateId = null, vars = null, allowTextFallback = true, flowToken = null }) {
   const resolved = await resolveIa360Outbound(record, `:${label}`);
   if (resolved.duplicate || resolved.error) return { ok: false, status: resolved.duplicate ? 'duplicate' : 'error', error: resolved.error || null };
   const { account } = resolved;
   let tpl = null;
   if (templateId) {
     const { rows } = await pool.query(
-      `SELECT id, name, language, body, status, header_type, header_media_library_id, samples
+      `SELECT id, name, language, body, status, header_type, header_media_library_id, samples, buttons
          FROM coexistence.message_templates
         WHERE id=$1 AND status='APPROVED'
         LIMIT 1`,
@@ -2712,7 +2742,7 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
   }
   if (!tpl && templateName) {
     const { rows } = await pool.query(
-      `SELECT id, name, language, body, status, header_type, header_media_library_id, samples
+      `SELECT id, name, language, body, status, header_type, header_media_library_id, samples, buttons
          FROM coexistence.message_templates
         WHERE name=$1 AND status='APPROVED'
         ORDER BY updated_at DESC
@@ -2727,7 +2757,7 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
   }
   let components;
   try {
-    components = await buildIa360TemplateComponents(tpl, account, record, vars);
+    components = await buildIa360TemplateComponents(tpl, account, record, vars, flowToken);
   } catch (err) {
     console.error('[ia360-owner-pipe] template components error:', err.message);
     return { ok: false, status: 'template_components_error', error: err.message };
@@ -3228,6 +3258,7 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
       body: `Alek, capture a ${who} (${shared.contactNumber}). Auto-elegi persona «${flow.personaContext}» (${suggestionReason}) y la secuencia sugerida. Abajo el borrador: aprueba, o toca «Cambiar» para elegir otra persona/secuencia. Sigo en dry-run: nada sale al contacto sin tu OK.`,
       targetContact,
       ownerBudget: true,
+      critical: true,
     });
     // Saltar directo al readout + tarjeta de aprobacion, con boton "Cambiar".
     return await emitIa360SequenceReadoutCard({
@@ -3251,6 +3282,7 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
         label: 'owner_vcard_capture_error',
         body: `Alek, capture el contacto ${shared && shared.contactNumber || ''} pero no pude armar la tarjeta de clasificacion. Revisalo manual.`,
         ownerBudget: true,
+        critical: true,
       });
     }
   }
@@ -3272,6 +3304,7 @@ async function sendIa360ToneChoiceCard({ record, shared }) {
     messageBody: `IA360: elegir tono ${who}`,
     targetContact,
     ownerBudget: true,
+    critical: true,
     interactive: {
       type: 'button',
       body: { text: compactForWhatsApp(body, 1024) },
@@ -3355,6 +3388,7 @@ No le lei una senal clara en el nombre. Clasificalo rapido con una de estas opci
       messageBody: `IA360: vCard ${who}`,
       targetContact: shared.contactNumber,
       ownerBudget: true,
+      critical: true,
       interactive: {
         type: 'list',
         header: { type: 'text', text: 'Contacto capturado' },
@@ -3396,6 +3430,7 @@ async function sendIa360VcardPersonaList({ record, shared }) {
     messageBody: `IA360: vCard ${who}`,
     targetContact: shared.contactNumber,
     ownerBudget: true,
+    critical: true,
     interactive: {
       type: 'list',
       header: { type: 'text', text: 'Contacto capturado' },
@@ -4063,6 +4098,31 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
             { id: 'seq_tecnico_integracion:ahora_no', title: 'Ahora no' },
           ],
         },
+      },
+    ],
+  },
+  // P10: DIAPAZO como ruta de alta de primera clase. Una sola secuencia: el
+  // contacto nuevo recibe la Sesión de Afinación (Flow real dentro de ventana,
+  // template `diapazo_sesion_invitacion_v1` con botón FLOW en frío). El envío NO
+  // pasa por enqueueIa360Interactive/Template como las demás: lo hace
+  // sendDiapazoSesionAfinacion, que además registra la sesión y su flow_token.
+  persona_diapazo: {
+    personaContext: 'Diapazo · Afinación',
+    relationshipContext: 'diapazo_afinacion',
+    flywheelPhase: 'Attract',
+    riskLevel: 'low',
+    notes: 'Alta directa a la Sesión de Afinación de Diapazo; sus respuestas rutean a G7.',
+    sequences: [
+      {
+        id: 'diapazo_sesion_afinacion',
+        uiTitle: 'Sesión de Afinación',
+        label: 'Diapazo · Sesión de Afinación',
+        goal: 'que el contacto haga su diagnóstico de afinación',
+        expectedSignal: 'sesión respondida (cuerda + camino) con su lectura devuelta',
+        nextAction: 'Diapazo devuelve la lectura al terminar; Alek decide el siguiente paso con ese dato.',
+        cta: 'abrir la Sesión de Afinación',
+        draft: ({ name }) => `A ${name || 'este contacto'} le llega la Sesión de Afinación de DIAPAZO: dentro de la ventana de 24 h como Flow directo («Abrir sesión»), y en frío como el template aprobado diapazo_sesion_invitacion_v1 con su botón de Flow. Son preguntas cortas (cinco minutos) y al terminar recibe su lectura; sus respuestas ya quedan ruteadas al agente de Diapazo.`,
+        metaTemplateName: 'diapazo_sesion_invitacion_v1',
       },
     ],
   },
@@ -4836,6 +4896,14 @@ function rankIa360Sequences({ flow, signals }) {
     bump('beta_memoria', 15, memReason);
     bump('cliente_readout', 10, memReason);
   }
+  // P7(b): referido SIN introductor conocido. `referido_contexto` encabeza el
+  // catálogo y su copy exige {{quien_intro}}: sin el dato el borrador sale con
+  // un hueco y la aprobación se atora (caso José Ramón, 07-04).
+  // `referido_oneliner` dice lo mismo sin nombrar a nadie, así que es el default
+  // honesto mientras no haya introductor.
+  if (String(flow?.relationshipContext || '') === 'referido_bni' && !s.quienIntro) {
+    bump('referido_oneliner', 25, 'Sin introductor registrado: este opener no lo necesita');
+  }
   const ordered = (flow.sequences || [])
     .map((seq, idx) => ({ seq, idx, score: scores.get(seq.id) || 0 }))
     .sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
@@ -5024,6 +5092,39 @@ async function handleIa360PersonaChoice({ record, targetContact, personaChoice }
     await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_persona_unknown', body: `No reconozco la persona elegida para ${name}. No envié nada y queda para revisión de Alek.`, targetContact, ownerBudget: true });
     return;
   }
+  // P5: elegir persona ya NO obliga a un segundo selector. Se resuelve la
+  // secuencia con el mismo ranker del camino con señal (sin señales = orden de
+  // catálogo) y se salta al readout con su tarjeta de aprobación: 2 taps en vez
+  // de 4. La elección de secuencia sigue disponible en el botón «Cambiar
+  // secuencia» de esa tarjeta, que abre el selector completo.
+  const signals = await gatherIa360ContactSignals({ waNumber: record.wa_number, contactNumber: targetContact });
+  const ranking = rankIa360Sequences({ flow, signals });
+  const sequence = ranking.ordered[0] || null;
+  if (!sequence) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_persona_no_sequences', body: `La persona «${flow.personaContext}» no tiene secuencias en el catálogo. No envié nada.`, targetContact, ownerBudget: true, critical: true });
+    return;
+  }
+  await emitIa360SequenceReadoutCard({
+    record,
+    targetContact,
+    flow,
+    sequence,
+    contact,
+    changeSequencePersona: personaChoice,
+  });
+}
+
+// P5: reabre el selector de secuencias de la persona ya elegida. Es el único
+// camino a `sendIa360SequenceSelector` desde que elegir secuencia dejó de ser
+// paso obligatorio del alta.
+async function handleIa360OwnerSequenceChangeRequest({ record, targetContact, personaChoice }) {
+  const flow = IA360_PERSONA_SEQUENCE_FLOWS[personaChoice];
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  if (!flow) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_seq_change_unknown', body: `No reconozco la persona «${personaChoice}» para reabrir sus secuencias de ${name}. No envié nada.`, targetContact, ownerBudget: true, critical: true });
+    return;
+  }
   await sendIa360SequenceSelector({ record, targetContact, contact, flowKey: personaChoice, flow });
 }
 
@@ -5079,7 +5180,7 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
 // duplicar el bloque. `record` llega tal cual del inbound del owner (su
 // contact_number = owner); el callsite Fit re-scopea internamente al
 // targetContact. `contact` es la ficha ya cargada (loadIa360ContactForOwnerAction).
-async function emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact, allowVcardChange = false }) {
+async function emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact, allowVcardChange = false, changeSequencePersona = null }) {
   const name = contact?.name || targetContact;
   const payload = buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction: 'sequence_selected' });
   let readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
@@ -5145,7 +5246,18 @@ async function emitIa360SequenceReadoutCard({ record, targetContact, flow, seque
           console.error('[ia360-cold] readout: lookup de statuses falló; readout sin aviso frío');
         } else {
           const avail = ia360ColdAvailability(statuses[tplName]);
-          if (avail.sendable) {
+          // P7(c): elección manual de `referido_contexto` sin introductor. En
+          // caliente el draft ya evita el placeholder, pero el template frío
+          // exige {{2}}=quien_intro y el approve-send acabaría denegando DESPUÉS
+          // de que el owner aprobó. Se pide el dato AQUÍ y se retira el botón de
+          // aprobar hasta tenerlo.
+          const faltaQuienIntro = sequence.id === 'referido_contexto'
+            && !compactQuienIntroPure(contact?.custom_fields?.quien_intro || '', 60);
+          if (avail.sendable && faltaQuienIntro) {
+            coldBlocked = true;
+            readout += `\n\nFalta quién lo presenta: el template frío «${tplName}» lo lleva como dato y ${name} no lo tiene. Respóndeme \`intro ${name}: <quién presenta>\` y te devuelvo la tarjeta lista, o toca «Cambiar secuencia» para usar el one-liner (no lo necesita).`;
+            coldNotice = 'Falta quién lo presenta para el template frío: no puedo aprobar todavía.';
+          } else if (avail.sendable) {
             readout += `\n\nFuera de ventana de 24h: si apruebas, el opener saldrá como template aprobado de Meta «${tplName}» (mismo copy, con sus botones), no como texto libre.`;
             coldNotice = `Fuera de ventana de 24h: el opener saldrá como template «${tplName}».`;
           } else {
@@ -5171,12 +5283,13 @@ async function emitIa360SequenceReadoutCard({ record, targetContact, flow, seque
     body: readout,
     targetContact,
     ownerBudget: true,
+    critical: true,
   });
   // APPROVE-SEND: tras el readout, el owner decide con una tarjeta (mismo patrón
   // que la tarjeta de cancelación). Solo si el payload realmente requiere
   // aprobación humana (no para solo_guardar / no_contactar / copy bloqueado).
   if (payload.approval.status === 'requires_alek' && payload.sequence_candidate.copy_status !== 'blocked') {
-    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked, coldNotice, allowVcardChange });
+    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked, coldNotice, allowVcardChange, changeSequencePersona });
   }
 }
 
@@ -5194,7 +5307,10 @@ function ia360ApproveSendAllowlist() {
     .filter(Boolean);
 }
 
-async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked = false, coldNotice = null, allowVcardChange = false }) {
+// `changeSequencePersona`: cuando el readout viene de una elección de persona
+// (P5), el botón del medio abre el SELECTOR DE SECUENCIAS de esa persona en vez
+// de la lista de personas — «Cambiar» cambia la última decisión tomada.
+async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked = false, coldNotice = null, allowVcardChange = false, changeSequencePersona = null }) {
   // G-COLD: con coldNotice el owner ve en la tarjeta cómo saldría el opener (o
   // por qué no puede salir); con coldBlocked se RETIRA la fila "Aprobar y
   // enviar" — el owner jamás debe poder aprobar algo imposible.
@@ -5206,7 +5322,9 @@ async function sendIa360ApproveCard({ record, targetContact, name, flow, sequenc
   // ("aprobado", "guardar", "manual") y por el botón Cambiar.
   const buttons = [
     ...(coldBlocked ? [] : [{ type: 'reply', reply: { id: `owner_approve_send:${targetContact}:${sequence.id}`, title: '✅ Aprobar y enviar' } }]),
-    { type: 'reply', reply: { id: allowVcardChange ? `owner_vcard_change:${targetContact}` : `owner_approve_edit:${targetContact}:${sequence.id}`, title: allowVcardChange ? 'Cambiar' : 'Editar copy' } },
+    ...(changeSequencePersona
+      ? [{ type: 'reply', reply: { id: `owner_seq_change:${targetContact}:${changeSequencePersona}`, title: 'Cambiar secuencia' } }]
+      : [{ type: 'reply', reply: { id: allowVcardChange ? `owner_vcard_change:${targetContact}` : `owner_approve_edit:${targetContact}:${sequence.id}`, title: allowVcardChange ? 'Cambiar' : 'Editar copy' } }]),
     { type: 'reply', reply: { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar' } },
   ].slice(0, 3);
   return sendOwnerInteractive({
@@ -5215,6 +5333,7 @@ async function sendIa360ApproveCard({ record, targetContact, name, flow, sequenc
     messageBody: `IA360: aprobar envío a ${name}`,
     targetContact,
     ownerBudget: true,
+    critical: true,
     interactive: {
       type: 'button',
       header: { type: 'text', text: 'Aprobar envío' },
@@ -5245,6 +5364,7 @@ async function ia360ApproveSendDeny({ record, targetContact, reason, body }) {
     body,
     targetContact,
     ownerBudget: true,
+    critical: true,
   });
 }
 
@@ -5353,6 +5473,7 @@ async function emitIa360BlockExitOffer({ record, targetContact, name, sequence }
     body,
     targetContact,
     ownerBudget: true,
+    critical: true,
   });
   // Tarjeta con UN botón (límite 6/60s: un solo botón, el resto es conversación).
   await sendOwnerInteractive({
@@ -5361,6 +5482,7 @@ async function emitIa360BlockExitOffer({ record, targetContact, name, sequence }
     messageBody: `IA360: desbloquear secuencia para ${name}`,
     targetContact,
     ownerBudget: true,
+    critical: true,
     interactive: {
       type: 'button',
       body: { text: `${name} no tiene deal vivo. ¿Le creo uno y sigo con la secuencia «${sequence.label}»? O respóndeme en texto qué prefieres.` },
@@ -5445,6 +5567,20 @@ async function handleIa360BlockExitReply(record) {
   return true;
 }
 
+// Creación del deal que exige una secuencia `requiresLiveDeal`. Es la MISMA
+// operación detrás del botón «Crear el deal y seguir» y del auto-desbloqueo del
+// approve-send: una sola función para que ambos caminos abran exactamente el
+// mismo deal (P2, stage inicial 'open'). Devuelve el deal o null si el CRM falló.
+async function createIa360BlockExitDeal({ record, targetContact, name, sequence }) {
+  return syncIa360Deal({
+    record: { ...record, contact_number: targetContact, contact_name: name },
+    targetStageName: IA360_BLOCKEXIT_DEAL_STAGE,
+    titleSuffix: 'Deal creado (desbloqueo secuencia)',
+    notes: `Deal creado para habilitar la secuencia ${sequence.id} (guardia requiresLiveDeal).`,
+    pipelineName: IA360_BLOCKEXIT_DEAL_PIPELINE,
+  }).catch(e => { console.error('[ia360-blockexit] syncIa360Deal:', e.message); return null; });
+}
+
 // G-FIX6: tap «Crear el deal y seguir» — crea el deal faltante en el pipeline
 // por defecto (P2, stage pos 0 'open' → satisface la guardia requiresLiveDeal)
 // y RE-EMITE el readout, que esta vez pasa la guardia y muestra «Aprobar y
@@ -5464,13 +5600,7 @@ async function handleIa360UnblockCreateDeal({ record, targetContact, sequenceId 
   }
   const { flow, sequence } = found;
   // Crear el deal faltante (P2, stage inicial open).
-  const deal = await syncIa360Deal({
-    record: { ...record, contact_number: targetContact, contact_name: name },
-    targetStageName: IA360_BLOCKEXIT_DEAL_STAGE,
-    titleSuffix: 'Deal creado (desbloqueo secuencia)',
-    notes: `Deal creado por el owner desde la salida de bloqueo G-FIX6 para habilitar la secuencia ${sequence.id}.`,
-    pipelineName: IA360_BLOCKEXIT_DEAL_PIPELINE,
-  }).catch(e => { console.error('[ia360-blockexit] syncIa360Deal:', e.message); return null; });
+  const deal = await createIa360BlockExitDeal({ record, targetContact, name, sequence });
   if (!deal) {
     await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_unblock_deal_failed', body: `No pude crear el deal para ${name} (error de base de datos). No envié nada; reintenta en un momento.`, targetContact, ownerBudget: true });
     return;
@@ -5491,6 +5621,44 @@ async function handleIa360UnblockCreateDeal({ record, targetContact, sequenceId 
   });
   // Re-emitir el readout: la guardia ya pasa (hay deal vivo) → tarjeta «Aprobar y enviar».
   await emitIa360SequenceReadoutCard({ record, targetContact, flow, sequence, contact });
+}
+
+// P8: vigilante post-aprobación. El owner ya recibió su ack al aceptarse el
+// encolado; esto sólo escribe si 30 s después la fila del opener acabó en
+// failed/error o desapareció. Éxito = silencio. Sustituye a la espera bloqueante
+// de 9 s, cuyo `unknown` transitorio reportaba fallos falsos sobre mensajes ya
+// entregados.
+function scheduleIa360OutboundFailureWatch({ record, targetContact, name, handlerFor, sequenceLabel }) {
+  const timer = setTimeout(async () => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT status, error_message
+           FROM coexistence.chat_history
+          WHERE direction='outgoing'
+            AND template_meta->>'ia360_handler_for'=$1
+          ORDER BY id DESC
+          LIMIT 1`,
+        [handlerFor]
+      );
+      const row = rows[0] || null;
+      const status = String(row?.status || '').toLowerCase();
+      if (row && !['failed', 'error'].includes(status)) return; // salió: silencio
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: `owner_approve_send_failed_watch_${Date.now()}`,
+        body: row
+          ? `El opener de «${sequenceLabel}» para ${name} NO salió: ${row.error_message || status}. Puedes reintentar desde la tarjeta de aprobación.`
+          : `No encuentro el envío del opener de «${sequenceLabel}» para ${name} 30 s después de aprobarlo. Revísalo antes de reintentar.`,
+        targetContact,
+        ownerBudget: true,
+        critical: true,
+      });
+    } catch (err) {
+      console.error('[ia360-approve] outbound watch error:', err.message);
+    }
+  }, 30 * 1000);
+  timer.unref?.();
 }
 
 async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }) {
@@ -5574,6 +5742,11 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   // WhatsApp Revenue Pipeline) o P7 (Champions). Sin deal vivo → bloquear con aviso.
   // G-C: con try/catch — si la consulta falla, el owner se entera (nunca mudo) y
   // NO se envía nada (fail-closed).
+  // P6: el deal que la secuencia exige se abre AQUÍ, en el mismo turno, en vez
+  // de mandar al owner a un segundo ciclo de aprobación (caso Juan Carlos 07-16:
+  // aprobar → bloqueo → «Créale el deal» → re-aprobar). Sólo si el CRM falla se
+  // cae a la oferta de desbloqueo: nunca se envía sin el deal que la guardia pide.
+  let autoDealPipeline = null;
   if (sequence.requiresLiveDeal) {
     let liveRows;
     try {
@@ -5593,14 +5766,18 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
       return deny('live_deal_check_failed', `No pude verificar si ${name} tiene un proyecto activo (error de base de datos). Por seguridad no envié nada; reintenta en un momento.`);
     }
     if (!liveRows.length) {
-      // G-FIX6: NO callejón sin salida. La guardia sigue siendo correcta (no
-      // tratar a alguien sin proyecto como cliente activo), pero en vez de
-      // terminar mudo ofrecemos (a) un botón que CREA el deal faltante y
-      // re-emite el readout desbloqueado, y (b) una invitación a responder en
-      // texto libre (se rutea al intérprete heurístico del bloqueo). Cero egress
-      // al contacto: solo tarjeta + texto al owner.
-      await emitIa360BlockExitOffer({ record, targetContact, name, sequence });
-      return;
+      const deal = await createIa360BlockExitDeal({ record, targetContact, name, sequence });
+      if (!deal) {
+        // CRM caído: comportamiento previo (oferta de desbloqueo), cero egress al contacto.
+        await emitIa360BlockExitOffer({ record, targetContact, name, sequence });
+        return;
+      }
+      autoDealPipeline = IA360_BLOCKEXIT_DEAL_PIPELINE;
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: targetContact,
+        customFields: { ia360_block_exit_pending: null },
+      }).catch(e => console.error('[ia360-approve] clear block pending:', e.message));
     }
   }
 
@@ -5618,6 +5795,15 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   const allow = ia360ApproveSendAllowlist();
   if (allowRaw !== '*' && (!allow.length || !allow.includes(normalizePhone(targetContact)))) {
     return deny('not_in_test_allowlist', `Gate de seguridad: ${name} (${targetContact}) no está en IA360_APPROVE_SEND_ALLOWLIST. Aprobación registrada pero NO envié nada al contacto.`);
+  }
+
+  // P10: la ruta Diapazo no manda un opener de catálogo. Entrega la Sesión de
+  // Afinación por el mismo camino que el endpoint interno (Flow dentro de
+  // ventana, template con botón FLOW en frío) y sella el contacto como proyecto
+  // Diapazo para que su respuesta ruteé a G7. Va después de TODOS los gates.
+  if (sequence.id === 'diapazo_sesion_afinacion') {
+    await handleIa360ApproveSendDiapazo({ record, targetContact, name, flow, sequence, pf, deny });
+    return;
   }
 
   // Ventana de servicio 24h: dentro → texto libre (el draft). Fuera → se requiere
@@ -5657,8 +5843,12 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
       handlerFor = `${record.message_id}:direct:${targetContact}:${openerLabel}`;
     }
     if (!sent) return deny('enqueue_failed', `No pude encolar el opener para ${name}. No se envió.`);
-    const status = await waitForIa360OutboundStatus(handlerFor);
-    sendResult = { ok: String(status?.status || '').toLowerCase() === 'sent', status: status?.status || 'unknown', error: status?.error_message || null, message_id: status?.message_id || null };
+    // P8: no se esperan 9 s a que Meta confirme. El encolado aceptado ES el ack;
+    // un vigilante a 30 s avisa SÓLO si la fila acabó en failed. El silencio
+    // significa que salió (antes, un `unknown` transitorio reportaba un fallo
+    // falso con el mensaje ya entregado — caso 07-16).
+    scheduleIa360OutboundFailureWatch({ record, targetContact, name, handlerFor, sequenceLabel: sequence.label });
+    sendResult = { ok: true, status: 'queued', error: null, message_id: null };
   } else if (sequence.metaTemplateName) {
     // G-COLD: cinturón contra tarjetas viejas o races. La tarjeta sin la fila
     // "Aprobar y enviar" protege la UX, pero un tap sobre una tarjeta emitida
@@ -5736,9 +5926,10 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: 'owner_approve_send_failed',
-      body: `Aprobado, pero el envío a ${name} quedó en estado "${sendResult.status}"${sendResult.error ? ' (' + sendResult.error + ')' : ''}. Revisa chat_history; no avancé el pipeline.`,
+      body: `No pude enviar el opener a ${name}: ${sendResult.error || sendResult.status}. No salió nada al contacto y no avancé el pipeline; puedes reintentar desde la tarjeta.`,
       targetContact,
       ownerBudget: true,
+      critical: true,
     });
     return;
   }
@@ -5753,13 +5944,94 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     pipelineName: ia360PipelineForRelationship(flow?.relationshipContext),
   }).catch(e => console.error('[ia360-approve] syncIa360Deal:', e.message));
 
+  const dealLinea = autoDealPipeline ? ` Abrí el deal en «${autoDealPipeline}» para ${name}.` : '';
   await sendIa360DirectText({
     record,
     toNumber: IA360_OWNER_NUMBER,
     label: 'owner_approve_send_done',
-    body: `Listo. Envié el opener de "${sequence.label}" a ${name} (${targetContact}) y moví su deal a "Diagnóstico enviado".`,
+    body: `Aprobado. Enviando el opener de "${sequence.label}" a ${name} (${targetContact}); te aviso solo si falla.${dealLinea} Su deal queda en "Diagnóstico enviado".`,
     targetContact,
     ownerBudget: true,
+    critical: true,
+  });
+}
+
+// P10: entrega de la Sesión de Afinación tras la aprobación del owner. Mismo
+// contrato de evidencia que el resto del approve-send (tags ia360-approve-send /
+// approved-seq:<id>, cf ia360_persona_first.send) más el registro propio de
+// Diapazo (fila en diapazo_sesion_enviada con su flow_token, dentro de
+// sendDiapazoSesionAfinacion).
+async function handleIa360ApproveSendDiapazo({ record, targetContact, name, flow, sequence, pf, deny }) {
+  // El sello de proyecto va ANTES del envío: isDiapazoContact (G7) lo exige para
+  // rutear la respuesta, y el contacto puede contestar en segundos. Merge jsonb
+  // superficial, idéntico al de diapazo.js.
+  try {
+    await pool.query(
+      `INSERT INTO coexistence.contacts (wa_number, contact_number, custom_fields, updated_at)
+       VALUES ($1,$2,$3::jsonb,NOW())
+       ON CONFLICT (wa_number, contact_number) DO UPDATE SET
+         custom_fields = COALESCE(coexistence.contacts.custom_fields,'{}'::jsonb) || EXCLUDED.custom_fields,
+         updated_at = NOW()`,
+      [record.wa_number, targetContact, JSON.stringify({ project: 'diapazo', diapazo_lead: true })]
+    );
+  } catch (e) {
+    console.error('[ia360-approve-diapazo] marca project=diapazo:', e.message);
+    return deny('diapazo_mark_failed', `No pude marcar a ${name} como contacto de Diapazo (error de base de datos). No envié nada; reintenta en un momento.`);
+  }
+
+  const res = await sendDiapazoSesionAfinacion({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    nombreCompleto: name,
+  });
+  if (!res.ok) {
+    return deny('diapazo_sesion_send_failed', `No pude entregarle la Sesión de Afinación a ${name}: ${res.error}. No salió nada al contacto.`);
+  }
+
+  const nowIso = new Date().toISOString();
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    tags: ['ia360-approve-send', `approved-seq:${sequence.id}`],
+    customFields: {
+      ia360_persona_first: {
+        ...(pf || {}),
+        dry_run: false,
+        approval: { status: 'approved', approved_by: IA360_OWNER_NUMBER, approved_at: nowIso, reason: 'Aprobado por Alek desde la tarjeta de aprobación.' },
+        guardrail: { ...((pf || {}).guardrail || {}), current_block: 'none', external_send_allowed: true, allowed_recipient: targetContact },
+        send: {
+          sent_at: nowIso,
+          send_status: 'queued',
+          send_mode: res.via === 'flow' ? 'diapazo_flow_inside_window' : 'diapazo_template_outside_window',
+          outbound_message_id: null,
+          diapazo_flow_token: res.flowToken,
+          error: null,
+        },
+      },
+      approved_by: IA360_OWNER_NUMBER,
+      approved_at: nowIso,
+      sent_at: nowIso,
+      send_status: 'queued',
+      ia360_seq_last_response: null,
+    },
+  }).catch(e => console.error('[ia360-approve-diapazo] persist approval:', e.message));
+
+  await syncIa360Deal({
+    record: { ...record, contact_number: targetContact, contact_name: name },
+    targetStageName: 'Diagnóstico enviado',
+    titleSuffix: 'Sesión de Afinación enviada',
+    notes: `Sesión de Afinación de Diapazo aprobada por Alek y entregada vía ${res.via} (flow_token ${res.flowToken}).`,
+    pipelineName: ia360PipelineForRelationship(flow?.relationshipContext),
+  }).catch(e => console.error('[ia360-approve-diapazo] syncIa360Deal:', e.message));
+
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_approve_send_done',
+    body: `Aprobado. ${name} (${targetContact}) recibe la Sesión de Afinación de DIAPAZO ${res.via === 'flow' ? 'como Flow directo' : `como template «${DIAPAZO_SESION_INVITACION_TEMPLATE}» con su botón de Flow`}; te aviso solo si falla. Sus respuestas ya rutean al agente de Diapazo.`,
+    targetContact,
+    ownerBudget: true,
+    critical: true,
   });
 }
 
@@ -6146,6 +6418,12 @@ function parsePositiveIntEnv(name, fallback, min = 1) {
 
 const IA360_OWNER_NOTIFY_WINDOW_SECONDS = parsePositiveIntEnv('IA360_OWNER_NOTIFY_WINDOW_SECONDS', 60, 10);
 const IA360_OWNER_NOTIFY_MAX_PER_WINDOW = parsePositiveIntEnv('IA360_OWNER_NOTIFY_MAX_PER_WINDOW', 6, 1);
+// La cadena de alta (autosuggest → readout → tarjeta de aprobación → ack) gasta
+// varios avisos por vCard: con el presupuesto normal, dos vCards en menos de un
+// minuto se tragaban la tarjeta de aprobación EN SILENCIO y el contacto quedaba
+// en `staged` sin que el owner lo supiera. Este techo es sólo un freno contra
+// loops, no contra conversaciones.
+const IA360_OWNER_NOTIFY_CRITICAL_MAX = parsePositiveIntEnv('IA360_OWNER_NOTIFY_CRITICAL_MAX', 20, 1);
 
 function inferIa360OwnerNotifyTarget(label) {
   const m = String(label || '').match(/(?:owner_vcard_captured|owner_sequence_selector)_(\d+)/);
@@ -6169,8 +6447,52 @@ async function recordIa360OwnerNotifySuppressed({ record, label, targetContact, 
   }).catch(e => console.error('[ia360-owner] suppress persist:', e.message));
 }
 
-async function canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }) {
+// Resumen diferido: si aun con el techo crítico se suprime un aviso de la cadena
+// de alta, el owner no puede quedarse sin saber que hay contactos esperando su
+// aprobación. Se acumulan los destinos y a los 60 s sale UN solo texto (dedupe
+// por el timer en memoria). El `record` conservado es el del primer suprimido,
+// así el sandbox QA (origen sintético) se preserva: un lote de harness nunca
+// egresa al WhatsApp real.
+const ia360AltaDigest = { record: null, contacts: new Set(), timer: null };
+
+function scheduleIa360AltaPendingDigest({ record, targetContact }) {
+  if (!record?.wa_number || !targetContact) return;
+  ia360AltaDigest.contacts.add(String(targetContact));
+  if (!ia360AltaDigest.record) ia360AltaDigest.record = record;
+  if (ia360AltaDigest.timer) return;
+  ia360AltaDigest.timer = setTimeout(async () => {
+    const base = ia360AltaDigest.record;
+    const numbers = [...ia360AltaDigest.contacts];
+    ia360AltaDigest.record = null;
+    ia360AltaDigest.contacts = new Set();
+    ia360AltaDigest.timer = null;
+    if (!base || numbers.length === 0) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT DISTINCT ON (contact_number) contact_number, name
+           FROM coexistence.contacts
+          WHERE contact_number = ANY($1::text[])
+          ORDER BY contact_number, updated_at DESC`,
+        [numbers]
+      );
+      const nameOf = new Map(rows.map(r => [String(r.contact_number), String(r.name || '').replace(/\s+WhatsApp IA360$/i, '').trim()]));
+      const lista = numbers.map(n => nameOf.get(n) || `+${n}`).join(', ');
+      await sendIa360DirectText({
+        record: base,
+        toNumber: IA360_OWNER_NUMBER,
+        label: `owner_altas_pendientes_${Date.now()}`,
+        body: `Tengo ${numbers.length} alta(s) esperando tu aprobación: ${lista}. Quedaron capturadas sin enviar nada; comparte de nuevo el vCard de quien quieras retomar y te paso la tarjeta.`,
+      });
+    } catch (err) {
+      console.error('[ia360-owner] alta digest error:', err.message);
+    }
+  }, 60 * 1000);
+  ia360AltaDigest.timer.unref?.();
+}
+
+async function canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget, critical = false }) {
   if (!ownerBudget) return true;
+  const max = critical ? IA360_OWNER_NOTIFY_CRITICAL_MAX : IA360_OWNER_NOTIFY_MAX_PER_WINDOW;
   const { rows } = await pool.query(
     `SELECT COUNT(*)::int AS count
        FROM coexistence.chat_history
@@ -6182,13 +6504,14 @@ async function canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerB
     [record.wa_number, IA360_OWNER_NUMBER, IA360_OWNER_NOTIFY_WINDOW_SECONDS]
   );
   const count = rows[0]?.count || 0;
-  if (count < IA360_OWNER_NOTIFY_MAX_PER_WINDOW) return true;
+  if (count < max) return true;
   await recordIa360OwnerNotifySuppressed({
     record,
     label,
     targetContact,
-    reason: `owner_notify_budget_exceeded:${count}/${IA360_OWNER_NOTIFY_MAX_PER_WINDOW}/${IA360_OWNER_NOTIFY_WINDOW_SECONDS}s`,
+    reason: `owner_notify_budget_exceeded:${count}/${max}/${IA360_OWNER_NOTIFY_WINDOW_SECONDS}s${critical ? ':critical' : ''}`,
   });
+  if (critical) scheduleIa360AltaPendingDigest({ record, targetContact });
   return false;
 }
 
@@ -6226,14 +6549,14 @@ async function recordIa360QaEvidence({ record, toNumber, kind, label, messageBod
 // fila + encola apuntando a IA360_OWNER_NUMBER. NO pasa por resolveIa360Outbound
 // (su dedup es por contact_number+ia360_handler_for; aqui el destino es otro
 // numero, no colisiona). try/catch propio: nunca tumba el webhook.
-async function sendOwnerInteractive({ record, interactive, label, messageBody, targetContact = null, ownerBudget = false }) {
+async function sendOwnerInteractive({ record, interactive, label, messageBody, targetContact = null, ownerBudget = false, critical = false }) {
   try {
     // G-BRAIN sandbox: origen sintético (harness E2E) => la tarjeta se persiste en
     // chat_history con status='qa_sandboxed' (los harness la correlacionan por
     // message_id como contexto de taps) pero JAMÁS se encola hacia Meta: cero
     // tarjetas de QA en el WhatsApp real de Alek.
     const qaSandbox = isIa360SyntheticWamid(record?.message_id);
-    if (!qaSandbox && !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
+    if (!qaSandbox && !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget, critical }))) return false;
     const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
     if (error || !account) { console.error('[ia360-owner] account resolve failed:', error || 'unknown'); return false; }
     const localId = await insertPendingRow({
@@ -6259,13 +6582,13 @@ async function sendOwnerInteractive({ record, interactive, label, messageBody, t
 
 // Envia texto libre a un numero ARBITRARIO (p.ej. el contacto cuya cita se cancela
 // desde la rama owner, donde record.contact_number es Alek, no el prospecto).
-async function sendIa360DirectText({ record, toNumber, body, label, targetContact = null, ownerBudget = false }) {
+async function sendIa360DirectText({ record, toNumber, body, label, targetContact = null, ownerBudget = false, critical = false }) {
   try {
     // G-BRAIN sandbox: texto al OWNER real con origen sintético => fila
     // 'qa_sandboxed' (visible para los harness), sin egress a Meta.
     const qaSandbox = normalizePhone(toNumber) === IA360_OWNER_NUMBER && isIa360SyntheticWamid(record?.message_id);
     if (!qaSandbox && normalizePhone(toNumber) === IA360_OWNER_NUMBER &&
-        !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
+        !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget, critical }))) return false;
     const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
     if (error || !account) { console.error('[ia360-owner] direct text account resolve failed:', error || 'unknown'); return false; }
     const localId = await insertPendingRow({
@@ -7116,15 +7439,13 @@ async function handleIa360OwnerIntroCommand({ record, target, introducer }) {
     try {
       preMergeContact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber });
     } catch (e) { console.error('[ia360-intro] pre-merge load:', e.message); }
+    // P7(c): el bloqueo ya no lo produce el placeholder ({{quien_intro}} salió
+    // del draft en G-FIX3b) sino el template frío, que sí exige el dato. El
+    // criterio para auto-reanudar es el mismo que usa el readout: secuencia
+    // referido_contexto pendiente y sin quien_intro capturado.
     const wasReferidoBlockedByQuienIntro =
       String(preMergeContact?.custom_fields?.sequence_candidate || '') === 'referido_contexto'
-      && isIa360SequenceBlockedByMissingQuienIntro({
-        draft: buildIa360ReferidoContextoDraft({
-          name: ia360FirstNameFrom(preMergeContact?.name || contactNumber),
-          quienIntro: preMergeContact?.custom_fields?.quien_intro,
-        }),
-        quienIntro: preMergeContact?.custom_fields?.quien_intro,
-      });
+      && !compactQuienIntroPure(preMergeContact?.custom_fields?.quien_intro || '', 60);
     const customFields = buildIa360IntroCustomFields({
       quienIntroName,
       introducerNumber,
@@ -8952,6 +9273,12 @@ async function handleIa360LiteInteractive(record) {
       // lista completa de 10 (mismo fallback de siempre).
       if (ownerAction === 'owner_vcard_seeall') {
         await handleIa360OwnerVcardChange({ record, targetContact });
+        return;
+      }
+      // P5: «Cambiar secuencia» desde la tarjeta de aprobación — abre el selector
+      // completo de la persona ya elegida (el paso que dejó de ser obligatorio).
+      if (ownerAction === 'owner_seq_change') {
+        await handleIa360OwnerSequenceChangeRequest({ record, targetContact, personaChoice: ownerPipe });
         return;
       }
       // G-FIX4: elección de TONO ante doble señal (canal BNI + relación personal).
@@ -11388,6 +11715,79 @@ async function registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumbe
   );
 }
 
+// P9: el envío de la Sesión de Afinación como FUNCIÓN, para que además del
+// endpoint interno lo pueda invocar el alta persona-first (ruta persona_diapazo)
+// sin duplicar la decisión de ventana ni el registro de la sesión. Devuelve
+// siempre un objeto de estado; nunca lanza salvo error de programación.
+async function sendDiapazoSesionAfinacion({ waNumber, contactNumber, nombreCompleto = '', modo = 'published', flowId = DIAPAZO_SESION_FLOW_ID, screen = DIAPAZO_SESION_FLOW_SCREEN }) {
+  const nombre = String(nombreCompleto || '').trim().split(/\s+/).filter(Boolean)[0] || '';
+  const ventana = await diapazoVentanaServicio(contactNumber);
+  // El flow_token es la identidad de esta sesión: viaja con el Flow, vuelve en
+  // el nfm_reply (marca respondido_en) y es la PK del registro de abandono.
+  const flowToken = 'ses_' + randomBytes(12).toString('base64url');
+  const record = {
+    wa_number: waNumber,
+    contact_number: contactNumber,
+    contact_name: nombreCompleto || contactNumber,
+    // Outbound-first: no hay inbound del que colgar el dedupe, así que el
+    // message_id es sintético y único por envío.
+    message_id: `diapazo_sesion:${contactNumber}:${Date.now()}`,
+    message_type: 'diapazo_sesion_send',
+    message_body: '',
+  };
+
+  if (ventana.abierta) {
+    const enviado = await enqueueIa360FlowMessage({
+      record,
+      flowId,
+      screen,
+      cta: DIAPAZO_SESION_CTA,
+      bodyText: `Hola, ${nombre || DIAPAZO_SESION_NOMBRE_FALLBACK}. Soy Alekito, el asistente virtual de Alek. Antes de proponerte nada quiero entender cómo está afinada tu operación: son preguntas cortas y toma cinco minutos. Al terminar te devuelvo tu lectura.`,
+      footer: 'DIAPAZO',
+      flowToken,
+      label: `diapazo_sesion_flow_${flowToken}`,
+      messageBody: `DIAPAZO Sesión de Afinación: ${DIAPAZO_SESION_CTA}`,
+      modo,
+    });
+    if (!enviado) return { ok: false, via: 'flow', error: 'flow_enqueue_failed', ventanaSegundos: ventana.segundos };
+    await registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre });
+    console.log('[diapazo-sesion] enviada via=flow contact=%s flow_token=%s ventana=%ds modo=%s flow=%s screen=%s', contactNumber, flowToken, ventana.segundos, modo, flowId, screen);
+    return { ok: true, via: 'flow', modo, flowToken, ventanaSegundos: ventana.segundos };
+  }
+
+  // Ventana cerrada: sólo el template puede abrir la conversación. Si Meta aún
+  // no lo aprobó, se falla claro y NO se registra fila: prometer un envío que
+  // Meta va a rechazar deja una sesión fantasma que el barrido de
+  // recordatorios acabaría persiguiendo.
+  const { rows: tplRows } = await pool.query(
+    `SELECT id FROM coexistence.message_templates
+      WHERE name = $1 AND status = 'APPROVED'
+      LIMIT 1`,
+    [DIAPAZO_SESION_INVITACION_TEMPLATE]
+  );
+  if (tplRows.length === 0) {
+    console.warn('[diapazo-sesion] ventana cerrada y %s no APPROVED — no se envía contact=%s', DIAPAZO_SESION_INVITACION_TEMPLATE, contactNumber);
+    return { ok: false, via: 'template', error: 'template_not_approved', ventanaSegundos: ventana.segundos };
+  }
+
+  // allowTextFallback:false — fuera de ventana Meta rechaza el texto libre y el
+  // fallback reportaría un éxito falso.
+  const sent = await enqueueIa360Template({
+    record,
+    label: 'diapazo_sesion_invitacion',
+    templateName: DIAPAZO_SESION_INVITACION_TEMPLATE,
+    vars: { 1: nombre || DIAPAZO_SESION_NOMBRE_FALLBACK },
+    allowTextFallback: false,
+    // Sin este token el botón FLOW del template llega sin sesión: el submit
+    // nunca casa con la fila de diapazo_sesion_enviada y respondido_en no cierra.
+    flowToken,
+  });
+  if (!sent.ok) return { ok: false, via: 'template', error: sent.error || sent.status, ventanaSegundos: ventana.segundos };
+  await registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre });
+  console.log('[diapazo-sesion] enviada via=template contact=%s flow_token=%s ventana=%ds', contactNumber, flowToken, ventana.segundos);
+  return { ok: true, via: 'template', flowToken, ventanaSegundos: ventana.segundos };
+}
+
 router.post('/internal/diapazo-sesion', async (req, res) => {
   if (!isIa360InternalAuthorized(req)) {
     return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -11400,83 +11800,33 @@ router.post('/internal/diapazo-sesion', async (req, res) => {
     if (!waNumber || !contactNumber) {
       return res.status(422).json({ ok: false, error: 'wa_number_and_contact_number_required' });
     }
-    const nombre = nombreCompleto.split(/\s+/).filter(Boolean)[0] || '';
     // Overrides SÓLO para probar un Flow antes de publicarlo. `modo:'draft'` exige
     // flow_id explícito: mandar el Flow de producción en modo borrador no tiene
     // sentido y sería un aviso de prueba en la cara de un cliente.
     const modo = b.modo === 'draft' ? 'draft' : 'published';
-    const flowId = String(b.flow_id || DIAPAZO_SESION_FLOW_ID);
-    const screen = String(b.screen || DIAPAZO_SESION_FLOW_SCREEN);
     if (modo === 'draft' && !b.flow_id) {
       return res.status(422).json({ ok: false, error: 'draft_requires_explicit_flow_id' });
     }
-
-    const ventana = await diapazoVentanaServicio(contactNumber);
-    // El flow_token es la identidad de esta sesión: viaja con el Flow, vuelve en
-    // el nfm_reply (marca respondido_en) y es la PK del registro de abandono.
-    const flowToken = 'ses_' + randomBytes(12).toString('base64url');
-    const record = {
-      wa_number: waNumber,
-      contact_number: contactNumber,
-      contact_name: nombreCompleto || contactNumber,
-      // Outbound-first: no hay inbound del que colgar el dedupe, así que el
-      // message_id es sintético y único por envío.
-      message_id: `diapazo_sesion:${contactNumber}:${Date.now()}`,
-      message_type: 'diapazo_sesion_send',
-      message_body: '',
-    };
-
-    if (ventana.abierta) {
-      const enviado = await enqueueIa360FlowMessage({
-        record,
-        flowId,
-        screen,
-        cta: DIAPAZO_SESION_CTA,
-        bodyText: `Hola, ${nombre || DIAPAZO_SESION_NOMBRE_FALLBACK}. Soy Alekito, el asistente virtual de Alek. Antes de proponerte nada quiero entender cómo está afinada tu operación: son preguntas cortas y toma cinco minutos. Al terminar te devuelvo tu lectura.`,
-        footer: 'DIAPAZO',
-        flowToken,
-        label: `diapazo_sesion_flow_${flowToken}`,
-        messageBody: `DIAPAZO Sesión de Afinación: ${DIAPAZO_SESION_CTA}`,
-        modo,
-      });
-      if (!enviado) {
-        return res.status(502).json({ schema: 'diapazo_sesion_send.v1', ok: false, via: 'flow', error: 'flow_enqueue_failed' });
-      }
-      await registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre });
-      console.log('[diapazo-sesion] enviada via=flow contact=%s flow_token=%s ventana=%ds modo=%s flow=%s screen=%s', contactNumber, flowToken, ventana.segundos, modo, flowId, screen);
-      return res.json({ schema: 'diapazo_sesion_send.v1', ok: true, via: 'flow', modo, flow_token: flowToken, ventana_segundos: ventana.segundos });
-    }
-
-    // Ventana cerrada: sólo el template puede abrir la conversación. Si Meta aún
-    // no lo aprobó, se falla claro y NO se registra fila: prometer un envío que
-    // Meta va a rechazar deja una sesión fantasma que el barrido de
-    // recordatorios acabaría persiguiendo.
-    const { rows: tplRows } = await pool.query(
-      `SELECT id FROM coexistence.message_templates
-        WHERE name = $1 AND status = 'APPROVED'
-        LIMIT 1`,
-      [DIAPAZO_SESION_INVITACION_TEMPLATE]
-    );
-    if (tplRows.length === 0) {
-      console.warn('[diapazo-sesion] ventana cerrada y %s no APPROVED — no se envía contact=%s', DIAPAZO_SESION_INVITACION_TEMPLATE, contactNumber);
-      return res.status(409).json({ schema: 'diapazo_sesion_send.v1', ok: false, error: 'template_not_approved', via: 'template' });
-    }
-
-    // allowTextFallback:false — fuera de ventana Meta rechaza el texto libre y el
-    // fallback reportaría un éxito falso.
-    const sent = await enqueueIa360Template({
-      record,
-      label: 'diapazo_sesion_invitacion',
-      templateName: DIAPAZO_SESION_INVITACION_TEMPLATE,
-      vars: { 1: nombre || DIAPAZO_SESION_NOMBRE_FALLBACK },
-      allowTextFallback: false,
+    const result = await sendDiapazoSesionAfinacion({
+      waNumber,
+      contactNumber,
+      nombreCompleto,
+      modo,
+      flowId: String(b.flow_id || DIAPAZO_SESION_FLOW_ID),
+      screen: String(b.screen || DIAPAZO_SESION_FLOW_SCREEN),
     });
-    if (!sent.ok) {
-      return res.status(502).json({ schema: 'diapazo_sesion_send.v1', ok: false, via: 'template', error: sent.error || sent.status });
+    if (!result.ok) {
+      const code = result.error === 'template_not_approved' ? 409 : 502;
+      return res.status(code).json({ schema: 'diapazo_sesion_send.v1', ok: false, via: result.via, error: result.error });
     }
-    await registrarDiapazoSesionEnviada({ flowToken, contactNumber, waNumber, nombre });
-    console.log('[diapazo-sesion] enviada via=template contact=%s flow_token=%s ventana=%ds', contactNumber, flowToken, ventana.segundos);
-    return res.json({ schema: 'diapazo_sesion_send.v1', ok: true, via: 'template', flow_token: flowToken, ventana_segundos: ventana.segundos });
+    return res.json({
+      schema: 'diapazo_sesion_send.v1',
+      ok: true,
+      via: result.via,
+      ...(result.via === 'flow' ? { modo: result.modo } : {}),
+      flow_token: result.flowToken,
+      ventana_segundos: result.ventanaSegundos,
+    });
   } catch (err) {
     console.error('[diapazo-sesion] endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'diapazo_sesion_failed' });

@@ -21,22 +21,23 @@ const {
 
 const TARGET = '5219990012345';
 
-test('emite exactamente 5 filas: 4 opciones rapidas + Ver todas', () => {
+test('emite 6 filas: 5 opciones rapidas + Ver todas', () => {
   const rows = buildVcardQuickRows({ contactNumber: TARGET });
-  assert.equal(rows.length, 5);
-  const lastId = rows[4].id;
+  assert.equal(rows.length, 6);
+  const lastId = rows[5].id;
   assert.equal(lastId, seeAllRowId(TARGET));
   assert.equal(lastId, `owner_vcard_seeall:${TARGET}`);
-  assert.match(rows[4].title, /Ver todas/i);
+  assert.match(rows[5].title, /Ver todas/i);
 });
 
-test('las 4 opciones rapidas reusan ids owner_pipe:<num>:<key> existentes', () => {
+test('las opciones rapidas reusan ids owner_pipe:<num>:<key> existentes', () => {
   const rows = buildVcardQuickRows({ contactNumber: TARGET });
-  const quick = rows.slice(0, 4).map(r => r.id);
+  const quick = rows.slice(0, 5).map(r => r.id);
   assert.deepEqual(quick, [
     `owner_pipe:${TARGET}:persona_referido`, // Referido / BNI
     `owner_pipe:${TARGET}:persona_beta`,     // Beta / amigo
     `owner_pipe:${TARGET}:persona_cliente`,  // Cliente activo
+    `owner_pipe:${TARGET}:persona_diapazo`,  // P10: Sesion de Afinacion (Diapazo)
     `owner_pipe:${TARGET}:guardar`,          // Solo guardar (terminal, sin secuencia)
   ]);
 });
@@ -46,8 +47,13 @@ test('"Referido / BNI" mapea a persona_referido y queda visible en opciones rapi
   assert.match(VCARD_QUICK_OPTIONS[0].title, /BNI/i);
 });
 
+test('P10: "Diapazo · Afinacion" es opcion fija de la tarjeta corta', () => {
+  assert.equal(VCARD_QUICK_OPTIONS[3].key, 'persona_diapazo');
+  assert.match(VCARD_QUICK_OPTIONS[3].title, /diapazo/i);
+});
+
 test('"Solo guardar" usa la persona terminal guardar (captura sin envio)', () => {
-  assert.equal(VCARD_QUICK_OPTIONS[3].key, 'guardar');
+  assert.equal(VCARD_QUICK_OPTIONS[4].key, 'guardar');
 });
 
 test('titles<=24 y descriptions<=72 (limites WhatsApp list rows)', () => {

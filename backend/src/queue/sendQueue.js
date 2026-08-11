@@ -47,6 +47,23 @@ let queueEvents = null;
  *   }
  * }
  */
+// El carril del operador (nx-forgechat) encola templates sin template_meta, y
+// `handleEntregaButton` del webhook rutea los botones de entrega por
+// `template_meta->>'template_name'`: sin ese sello el botón del contacto cae al
+// clasificador léxico y termina en `ia360_boton_sin_ruta` (medido 2026-08-11).
+// Se sella aquí, el único choke point por el que pasan TODOS los envíos de
+// template, sin pisar las claves que la ruta origen ya haya escrito.
+async function stampTemplateName(localMessageId, templateName) {
+  if (!localMessageId || !templateName) return;
+  await pool.query(
+    `UPDATE coexistence.chat_history
+        SET template_meta = jsonb_set(COALESCE(template_meta, '{}'::jsonb), '{template_name}', to_jsonb($1::text))
+      WHERE send_correlation_id = $2
+        AND COALESCE(template_meta->>'template_name', '') = ''`,
+    [String(templateName), localMessageId]
+  ).catch(err => console.error('[sendQueue] template_name stamp failed:', err.message));
+}
+
 async function processJob(job) {
   const { kind, accountId, to, localMessageId, payload, originRef } = job.data || {};
   const account = await getAccountWithToken(accountId);
@@ -88,6 +105,7 @@ async function processJob(job) {
   if (/^52199900\d{5}$/.test(String(to || ''))) {
     const sandboxWamid = `wamid.qa-sandbox.${Date.now()}.${job.id || '0'}`;
     if (localMessageId) await markSent(localMessageId, sandboxWamid);
+    if (kind === 'template') await stampTemplateName(localMessageId, payload?.name);
     console.log('[sendQueue] QA sandbox: egress a Meta OMITIDO kind=%s to=%s wamid=%s', kind, to, sandboxWamid);
     return { wamid: sandboxWamid, qaSandbox: true };
   }
@@ -128,6 +146,7 @@ async function processJob(job) {
 
   // Swap the optimistic row's local id for the real wamid
   if (localMessageId) await markSent(localMessageId, wamid);
+  if (kind === 'template') await stampTemplateName(localMessageId, payload?.name);
 
   // Update origin-side linkage (broadcast_log etc) if provided
   if (originRef?.kind === 'broadcast_log' && originRef.id) {

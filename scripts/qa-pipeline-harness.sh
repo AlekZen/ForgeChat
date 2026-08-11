@@ -34,8 +34,20 @@
 #                             de servicio): el acuse debe ECO-ear los campos elegidos.
 #   cold-send <num_qa> <persona> <seq_id> [nombre]
 #                             Cadena cold-send completa vía owner: vCard → persona →
-#                             secuencia → tarjeta de aprobación → owner_approve_send.
+#                             readout + tarjeta de aprobación (P5: sin selector
+#                             intermedio; <seq_id> es la secuencia que el ranker DEBE
+#                             auto-elegir) → owner_approve_send. Incluye el caso de
+#                             dos vCards en <60 s (P3: la tarjeta no se traga).
 #                             *** EGRESA AL OWNER: correr UNA SOLA VEZ por sesión. ***
+#   diapazo-alta <num_qa> [nombre]
+#                             Alta Diapazo end-to-end: vCard → «Diapazo · Afinación»
+#                             → aprobar → template diapazo_sesion_invitacion_v1 con
+#                             botón Flow (P1) → submit nfm_reply cierra respondido_en.
+#                             *** EGRESA AL OWNER (tarjetas). ***
+#   expansion-deal <num_qa> [nombre]
+#                             cliente_expansion sin deal vivo: el deal se abre en el
+#                             mismo turno y el envío sigue (P6), pasando por
+#                             «Cambiar secuencia» (P5). *** EGRESA AL OWNER. ***
 #   template-only <num_qa> <template_name> <pipeline> [header_image_url]
 #                             Envío de template aislado con metadata veraz (no
 #                             marca el pipeline como probado).
@@ -365,26 +377,33 @@ cmd_cold_send(){
   if [ -z "$CARD" ]; then bad "C1 tarjeta vCard" "(vacío)" "message_id"; verdict "cold-send"; return; fi
   ok "C1 tarjeta vCard ($CARD)"
 
-  echo "--- C2: persona $PERSONA → selector de secuencias ---"
+  echo "--- C2: persona $PERSONA → readout + tarjeta de aprobación DIRECTOS (P5: sin selector intermedio) ---"
   chk "C2 HTTP" "$(inject_list "$OWNER" "owner_pipe:$QA:$PERSONA" "$CARD" "Persona" "Alek")" "200"
   sleep 8
-  local SEL; SEL="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_sequence_selector_${QA}_${PERSONA}' ORDER BY id DESC LIMIT 1")"
-  if [ -z "$SEL" ]; then bad "C2 selector" "(vacío)" "message_id"; verdict "cold-send"; return; fi
-  ok "C2 selector de secuencias ($SEL)"
+  chk "C2 NO emitió el selector de secuencias (P5: 2 taps, no 4)" \
+      "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_sequence_selector_${QA}_${PERSONA}'")" "0"
+  local APR; APR="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label' LIKE 'owner_approve_card_${QA}_%' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$APR" ]; then bad "C2 tarjeta de aprobación directa" "(vacío)" "message_id"; verdict "cold-send"; return; fi
+  local SEQ_REAL; SEQ_REAL="$(psql_q "SELECT substring(template_meta->>'label' from '^owner_approve_card_${QA}_(.*)\$') FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND message_id='$APR'")"
+  ok "C2 tarjeta de aprobación directa ($APR, secuencia=$SEQ_REAL)"
+  chk "C2 la secuencia auto-elegida es la esperada" "$SEQ_REAL" "$SEQ"
 
-  echo "--- C3: secuencia $SEQ → readout + tarjeta de aprobación ---"
-  chk "C3 HTTP" "$(inject_list "$OWNER" "owner_seq:$QA:$SEQ" "$SEL" "Secuencia" "Alek")" "200"
+  echo "--- C3: segundo vCard en <60 s → la tarjeta de aprobación NO se traga (P3) ---"
+  local QA2="${QA:0:12}$(( (${QA:12:1} + 1) % 10 ))"
+  local BASE_OWNER2; BASE_OWNER2="$(max_out_id "$OWNER")"
+  chk "C3 HTTP" "$(inject_vcard "$OWNER" "QA Cold Send Dos" "$QA2")" "200"
   sleep 8
-  local APR; APR="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_approve_card_${QA}_${SEQ}' ORDER BY id DESC LIMIT 1")"
-  if [ -z "$APR" ]; then bad "C3 tarjeta de aprobación" "(vacío)" "message_id"; verdict "cold-send"; return; fi
-  ok "C3 tarjeta de aprobación ($APR)"
+  chk "C3 el segundo contacto recibió tarjeta (captura o aprobación)" \
+      "$(psql_q "SELECT CASE WHEN count(*)>0 THEN 'si' ELSE 'no' END FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER2 AND (template_meta->>'label'='owner_vcard_captured_$QA2' OR template_meta->>'label' LIKE 'owner_approve_card_${QA2}_%')")" "si"
+  chk "C3 ningún aviso de la cadena de alta quedó suprimido" \
+      "$(psql_q "SELECT COALESCE(custom_fields->>'ia360_owner_notify_suppressed_reason','-') FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$QA2'")" "-"
 
   echo "--- C4: owner_approve_send → opener real al contacto QA ---"
-  chk "C4 HTTP" "$(inject_list "$OWNER" "owner_approve_send:$QA:$SEQ" "$APR" "Aprobar y enviar" "Alek")" "200"
+  chk "C4 HTTP" "$(inject_list "$OWNER" "owner_approve_send:$QA:$SEQ_REAL" "$APR" "Aprobar y enviar" "Alek")" "200"
   sleep 8
   local DONE; DONE="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label' IN ('owner_approve_send_done','owner_approve_send_failed') ORDER BY id DESC LIMIT 1")"
   echo "  resultado owner: $DONE"
-  chk_has "C4 confirmación de envío al owner" "$DONE" "Envié el opener"
+  chk_has "C4 ack inmediato al owner (P8: sin espera de 9 s)" "$DONE" "Enviando el opener"
   local OPENER; OPENER="$(psql_q "SELECT template_meta->>'label'||' | '||status FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA ORDER BY id DESC LIMIT 1")"
   echo "  opener al QA: $OPENER"
   chk_has "C4 opener registrado para el contacto" "$OPENER" "ia360"
@@ -398,6 +417,135 @@ cmd_cold_send(){
   echo "  labels: $L5"
   chk_has "C5 alias ruteado al paso 2 de la secuencia" "$L5" "ia360_seq_"
   verdict "cold-send $PERSONA/$SEQ ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# P10/P12: ALTA DIAPAZO end-to-end. vCard del owner → tap «Diapazo · Afinación»
+# → «Aprobar y enviar» → el contacto recibe la Sesión de Afinación. Un contacto
+# QA nuevo SIEMPRE está fuera de la ventana de 24 h, así que el camino ejercido
+# es el template `diapazo_sesion_invitacion_v1` CON su botón de Flow (P1). Cero
+# egress: sendQueue corta el rango QA y marca la fila con wamid sintético.
+cmd_diapazo_alta(){
+  local QA="$1" NAME="${2:-QA Diapazo Alta}"; guard_qa "$QA"
+  banner "ALTA DIAPAZO — vCard → persona_diapazo → aprobar → Sesión de Afinación — $QA" "forgechat_monolith_e2e"
+  local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
+  local BASE_QA; BASE_QA="$(max_out_id "$QA")"
+
+  # Con señal Diapazo en el nombre (P11) el alta es 1 TAP: el vCard salta directo
+  # al readout + tarjeta de aprobación. Sin señal son 2 taps: tarjeta corta →
+  # «Diapazo · Afinación». El harness cubre los dos caminos según el nombre.
+  echo "--- D1: vCard del owner ---"
+  chk "D1 HTTP" "$(inject_vcard "$OWNER" "$NAME" "$QA")" "200"
+  sleep 8
+  local APR_SQL="SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_approve_card_${QA}_diapazo_sesion_afinacion' ORDER BY id DESC LIMIT 1"
+  local APR; APR="$(psql_q "$APR_SQL")"
+  if [ -n "$APR" ]; then
+    ok "D1 alta de 1 TAP: señal Diapazo en el nombre → tarjeta de aprobación directa ($APR)"
+    chk "D1 no hizo falta la lista de clasificación" \
+        "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_vcard_captured_$QA'")" "0"
+  else
+    local CARD; CARD="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_vcard_captured_$QA' ORDER BY id DESC LIMIT 1")"
+    if [ -z "$CARD" ]; then bad "D1 tarjeta vCard" "(vacío)" "message_id"; verdict "diapazo-alta"; return; fi
+    ok "D1 tarjeta de clasificación ($CARD)"
+    echo "--- D2: tap «Diapazo · Afinación» → readout + tarjeta de aprobación ---"
+    chk "D2 HTTP" "$(inject_list "$OWNER" "owner_pipe:$QA:persona_diapazo" "$CARD" "Diapazo" "Alek")" "200"
+    sleep 8
+    APR="$(psql_q "$APR_SQL")"
+    if [ -z "$APR" ]; then bad "D2 tarjeta de aprobación Diapazo" "(vacío)" "message_id"; verdict "diapazo-alta"; return; fi
+    ok "D2 tarjeta de aprobación ($APR)"
+  fi
+
+  echo "--- D3: «Aprobar y enviar» → sesión entregada + contacto marcado project=diapazo ---"
+  chk "D3 HTTP" "$(inject_list "$OWNER" "owner_approve_send:$QA:diapazo_sesion_afinacion" "$APR" "Aprobar y enviar" "Alek")" "200"
+  sleep 10
+  chk "D3 contacto marcado project=diapazo" "$(cf_of "$QA" project)" "diapazo"
+  chk "D3 contacto marcado diapazo_lead"    "$(cf_of "$QA" diapazo_lead)" "true"
+  local TOKEN; TOKEN="$(psql_q "SELECT flow_token FROM coexistence.diapazo_sesion_enviada WHERE contact_number='$QA' ORDER BY enviado_en DESC LIMIT 1")"
+  echo "  flow_token: $TOKEN"
+  chk_has "D3 sesión registrada con flow_token ses_*" "$TOKEN" "ses_"
+  local OUT; OUT="$(psql_q "SELECT status||' | '||COALESCE(template_meta->>'template_name','-') FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA ORDER BY id DESC LIMIT 1")"
+  echo "  saliente al contacto: $OUT"
+  chk_has "D3 salió el template de invitación Diapazo" "$OUT" "diapazo_sesion_invitacion_v1"
+  chk_has "D3 cero egress real (wamid sintético → status sent por sandbox QA)" "$OUT" "sent"
+  # P1: el componente de botón FLOW con ESTE token es lo que hace que el submit case.
+  local JOB; JOB="$(docker exec "$BE" node -e '
+const IORedis=require("ioredis");const r=new IORedis(process.env.REDIS_URL||"redis://redis:6379");
+(async()=>{const keys=await r.keys("bull:forgecrm-send:*");let found="";
+for(const k of keys){const t=await r.type(k);if(t!=="hash")continue;const d=await r.hget(k,"data");if(!d)continue;
+ if(d.includes(process.argv[1])&&d.includes("sub_type")){found=d;break;}}
+process.stdout.write(found);r.disconnect();})();' "$TOKEN" 2>/dev/null)"
+  if [ -n "$JOB" ]; then
+    chk_has "D3 el job del template llevaba el botón Flow (sub_type:flow)" "$JOB" '"sub_type":"flow"'
+    chk_has "D3 el botón Flow viajó con ESTE flow_token" "$JOB" "$TOKEN"
+  else
+    echo "  [info] el job de BullMQ ya fue removido de Redis; se verifica el token por el submit (D4)."
+  fi
+  local ACKO; ACKO="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label' IN ('owner_approve_send_done','owner_approve_send_blocked') ORDER BY id DESC LIMIT 1")"
+  echo "  ack al owner: $ACKO"
+  chk_has "D3 ack al owner menciona la Sesión de Afinación" "$ACKO" "Sesión de Afinación"
+
+  echo "--- D4: submit del Flow (nfm_reply con el flow_token real) → sesión cerrada ---"
+  local BASE_QA2; BASE_QA2="$(max_out_id "$QA")"
+  chk "D4 HTTP" "$(inject_nfm "$QA" "{\"cuerda\":\"comercial\",\"camino\":\"afinar\",\"flow_token\":\"$TOKEN\"}" "$NAME")" "200"
+  sleep 7
+  chk "D4 respondido_en sellado" "$(psql_q "SELECT CASE WHEN respondido_en IS NULL THEN 'null' ELSE 'sellado' END FROM coexistence.diapazo_sesion_enviada WHERE flow_token='$TOKEN'")" "sellado"
+  echo "  labels de la respuesta: $(fresh_labels "$QA" "$BASE_QA2")"
+  verdict "diapazo-alta ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# P6/P5: `cliente_expansion` sobre un contacto SIN deal vivo. Antes, aprobar
+# terminaba en un bloqueo («Créale el deal y seguir») y obligaba a re-aprobar:
+# 7 interacciones para un alta (caso Juan Carlos, 07-16). Ahora el deal se abre
+# en el mismo turno y el envío continúa. De paso ejercita «Cambiar secuencia»
+# (P5), el único camino al selector completo.
+cmd_expansion_deal(){
+  local QA="$1" NAME="${2:-QA Expansion Deal}"; guard_qa "$QA"
+  banner "EXPANSION SIN DEAL — auto-crear deal y seguir (P6) — $QA" "forgechat_monolith_e2e"
+  local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
+  local BASE_QA; BASE_QA="$(max_out_id "$QA")"
+  psql_q "DELETE FROM coexistence.deals WHERE contact_number='$QA'" >/dev/null
+
+  echo "--- E1: vCard → tarjeta de clasificación ---"
+  chk "E1 HTTP" "$(inject_vcard "$OWNER" "$NAME" "$QA")" "200"
+  sleep 8
+  local CARD; CARD="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_vcard_captured_$QA' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$CARD" ]; then bad "E1 tarjeta vCard" "(vacío)" "message_id"; verdict "expansion-deal"; return; fi
+  ok "E1 tarjeta de clasificación ($CARD)"
+
+  echo "--- E2: persona_cliente → readout directo; luego «Cambiar secuencia» (P5) ---"
+  chk "E2 HTTP" "$(inject_list "$OWNER" "owner_pipe:$QA:persona_cliente" "$CARD" "Cliente activo" "Alek")" "200"
+  sleep 8
+  local APR1; APR1="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label' LIKE 'owner_approve_card_${QA}_%' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$APR1" ]; then bad "E2 tarjeta de aprobación directa" "(vacío)" "message_id"; verdict "expansion-deal"; return; fi
+  ok "E2 tarjeta de aprobación directa ($APR1)"
+  chk "E2 HTTP cambiar-secuencia" "$(inject_button "$OWNER" "owner_seq_change:$QA:persona_cliente" "Cambiar secuencia" "Alek")" "200"
+  sleep 8
+  local SEL; SEL="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_sequence_selector_${QA}_persona_cliente' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$SEL" ]; then bad "E2 selector reabierto por «Cambiar secuencia»" "(vacío)" "message_id"; verdict "expansion-deal"; return; fi
+  ok "E2 selector reabierto ($SEL)"
+
+  echo "--- E3: elegir cliente_expansion (exige deal vivo, y NO hay) ---"
+  chk "E3 HTTP" "$(inject_list "$OWNER" "owner_seq:$QA:cliente_expansion" "$SEL" "Expansión" "Alek")" "200"
+  sleep 8
+  local APR; APR="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_approve_card_${QA}_cliente_expansion' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$APR" ]; then bad "E3 tarjeta de aprobación de expansión" "(vacío)" "message_id"; verdict "expansion-deal"; return; fi
+  ok "E3 tarjeta de aprobación ($APR)"
+
+  echo "--- E4: aprobar → deal creado y envío en el MISMO turno (sin bloqueo) ---"
+  local BASE_OWNER2; BASE_OWNER2="$(max_out_id "$OWNER")"
+  chk "E4 HTTP" "$(inject_list "$OWNER" "owner_approve_send:$QA:cliente_expansion" "$APR" "Aprobar y enviar" "Alek")" "200"
+  sleep 10
+  chk "E4 NO emitió oferta de desbloqueo" "$(fresh_count_label "$OWNER" owner_block_exit_offer "$BASE_OWNER2")" "0"
+  local DONE; DONE="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER2 AND template_meta->>'label' IN ('owner_approve_send_done','owner_approve_send_failed','owner_approve_send_blocked') ORDER BY id DESC LIMIT 1")"
+  echo "  resultado owner: $DONE"
+  chk_has "E4 el ack avisa que abrió el deal" "$DONE" "Abrí el deal"
+  echo "  deal del QA: $(psql_q "SELECT p.name||' / '||s.name FROM coexistence.deals d JOIN coexistence.pipeline_stages s ON s.id=d.stage_id JOIN coexistence.pipelines p ON p.id=d.pipeline_id WHERE d.contact_number='$QA' ORDER BY d.updated_at DESC NULLS LAST, d.id DESC LIMIT 1")"
+  chk "E4 el contacto tiene deal" "$(psql_q "SELECT CASE WHEN count(*)>0 THEN 'si' ELSE 'no' END FROM coexistence.deals WHERE contact_number='$QA'")" "si"
+  local OPENER; OPENER="$(psql_q "SELECT template_meta->>'label'||' | '||status FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA ORDER BY id DESC LIMIT 1")"
+  echo "  opener al QA: $OPENER"
+  chk_has "E4 el opener de expansión salió al contacto" "$OPENER" "ia360_seq_opener_cliente_expansion"
+  verdict "expansion-deal ($QA)"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -465,6 +613,8 @@ case "${1:-help}" in
   m100)           cmd_m100 "${2:?num_qa}";;
   seq)            cmd_seq "${2:?num_qa}" "${3:?seq_id}" "${4:?opcion}" "${5:?titulo}";;
   cold-send)      cmd_cold_send "${2:?num_qa}" "${3:?persona}" "${4:?seq_id}" "${5:-}";;
+  diapazo-alta)   cmd_diapazo_alta "${2:?num_qa}" "${3:-}";;
+  expansion-deal) cmd_expansion_deal "${2:?num_qa}" "${3:-}";;
   template-only)  cmd_template_only "${2:?num_qa}" "${3:?template_name}" "${4:?pipeline}" "${5:-}";;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
 esac

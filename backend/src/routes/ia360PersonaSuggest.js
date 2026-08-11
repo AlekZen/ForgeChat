@@ -35,6 +35,10 @@ function compact(text, max) {
 // señales más fuertes/específicas para el caso de Alek (BNI primero) van arriba.
 // Todas las regex corren contra el nombre YA normalizado (minúsculas, sin acentos).
 const PERSONA_SIGNALS = [
+  // P11: DIAPAZO. Señal determinista sobre el nombre del vCard; sin ella la ruta
+  // sigue disponible en la quick-list y en la lista completa. Va ANTES de BNI:
+  // un "Fulano BNI Diapazo" es alta de Diapazo, no un referido genérico.
+  { persona: 'persona_diapazo', reason: 'diapazo en el nombre', re: /diapazo|afinaci[oó]n/ },
   // BNI / referidos: el caso dominante del owner. Muchos contactos traen "BNI"
   // literal en el nombre ("Carlos Chavez BNI Industrial", "Ing Jorge Samano BNI").
   { persona: 'persona_referido', reason: 'BNI / referido en el nombre', re: /\bbni\b|referid|recomend|me presento|\bintro\b/ },
@@ -75,7 +79,12 @@ const VCARD_PERSONA_ROWS = [
   { key: 'persona_comercial', title: 'Director comercial', description: 'Ventas o pipeline' },
   { key: 'persona_cfo', title: 'CFO / finanzas', description: 'Control, datos o dinero' },
   { key: 'persona_tecnico', title: 'Guardián técnico', description: 'Integración o permisos' },
-  { key: 'guardar', title: 'Solo guardar', description: 'Captura sin envío' },
+  // P10: la Sesión de Afinación de Diapazo es una ruta de alta más. Ocupa el
+  // lugar que tenía «Solo guardar» porque Meta topa la lista en 10 filas y
+  // guardar sin enviar sigue a un tap desde la tarjeta corta, desde la tarjeta
+  // de aprobación y por texto («guardar»). «No contactar» se queda: es la única
+  // salida de seguridad de un tap.
+  { key: 'persona_diapazo', title: 'Diapazo · Afinación', description: 'Sesión de Afinación (Flow) de Diapazo' },
   { key: 'excluir', title: 'No contactar', description: 'Exclusión sin envío' },
 ];
 

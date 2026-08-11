@@ -26,6 +26,7 @@
 const pool = require('../db');
 const { resolveAccount, insertPendingRow } = require('./messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
+const { buildFlowButtonComponents } = require('../util/templateFlow');
 
 const DIAPAZO_WA_NUMBER = process.env.DIAPAZO_WA_NUMBER || process.env.IA360_WA_NUMBER || '5213321594582';
 const RETOMAR_TEMPLATE = 'diapazo_sesion_retomar_v1';
@@ -49,7 +50,7 @@ function bodyComp(texts) {
 
 async function lookupApprovedTemplate(name) {
   const { rows } = await pool.query(
-    `SELECT id, name, language, body, status
+    `SELECT id, name, language, body, status, buttons
        FROM coexistence.message_templates
       WHERE name = $1
       ORDER BY (status = 'APPROVED') DESC, updated_at DESC
@@ -111,7 +112,10 @@ async function fireRecordatorio(account, tpl, row) {
 
   try {
     const nombre = await derivarNombre(row);
-    const components = [bodyComp([nombre, AFINAR_FALLBACK])];
+    // Si la plantilla llegara a traer botón FLOW, el flow_token de ESTA sesión
+    // viaja con él para que el submit case con la fila. Con los botones
+    // QUICK_REPLY actuales devuelve [] y los componentes no cambian.
+    const components = [bodyComp([nombre, AFINAR_FALLBACK]), ...buildFlowButtonComponents(tpl.buttons, row.flow_token)];
     const handlerFor = `diapazo_sesion_retomar:${row.flow_token}`;
     const localId = await insertPendingRow({
       account,
