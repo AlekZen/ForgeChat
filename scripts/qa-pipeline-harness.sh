@@ -30,6 +30,8 @@
 #                             por Revenue OS y responde ia360_boton_sin_ruta.
 #   entrega <num_qa>          Quick replies del template de entregable: cubre ack
 #                             y posposición sin caer al recovery de Revenue OS.
+#   intake <num_qa>           nfm_reply de los dos Flows de intake (ticket TI y orden
+#                             de servicio): el acuse debe ECO-ear los campos elegidos.
 #   cold-send <num_qa> <persona> <seq_id> [nombre]
 #                             Cadena cold-send completa vía owner: vCard → persona →
 #                             secuencia → tarjeta de aprobación → owner_approve_send.
@@ -108,6 +110,21 @@ inject_list(){ # $1=from $2=row_id $3=context_msg_id $4=title $5=profile
 }
 inject_vcard(){ # $1=from(owner) $2=nombre $3=numero
   post_webhook "$(_envelope "$1" "Alek" "{\"from\":\"$1\",\"id\":\"$(wamid vcard)\",\"timestamp\":\"$(ts)\",\"type\":\"contacts\",\"contacts\":[{\"name\":{\"formatted_name\":\"$2\",\"first_name\":\"$2\"},\"phones\":[{\"phone\":\"+$3\",\"wa_id\":\"$3\",\"type\":\"CELL\"}]}]}")"
+}
+inject_nfm(){ # $1=from $2=response_json (JSON plano, se serializa como STRING igual que Meta) $3=profile
+  # Meta manda response_json como CADENA dentro del JSON del mensaje. Construir eso a
+  # mano en bash es una fuente de escapes rotos: lo arma node y se firma igual que el resto.
+  local body
+  body="$(FROM="$1" RJ="$2" PROF="${3:-QA Intake}" WAN="$WA" PID="$PID_NUM" MID="$(wamid nfm)" TSV="$(ts)" node -e '
+const e=process.env;
+process.stdout.write(JSON.stringify({object:"whatsapp_business_account",entry:[{id:"qa-harness",changes:[{field:"messages",value:{
+  messaging_product:"whatsapp",
+  metadata:{display_phone_number:e.WAN,phone_number_id:e.PID},
+  contacts:[{wa_id:e.FROM,profile:{name:e.PROF}}],
+  messages:[{from:e.FROM,id:e.MID,timestamp:e.TSV,type:"interactive",
+    interactive:{type:"nfm_reply",nfm_reply:{name:"flow",body:"Sent",response_json:e.RJ}}}]
+}}]}]}));')"
+  post_webhook "$body"
 }
 
 # Lecturas de auditoría
@@ -399,11 +416,52 @@ cmd_template_only(){
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# G7-CONGRUENCIA: los dos Flows de intake (ticket TI / orden de servicio). Lo que
+# se prueba NO es que responda, sino que el acuse ECO-ee los campos que el contacto
+# eligió: es la evidencia observable de que el sistema entendió SU caso y no soltó
+# una plantilla genérica. Un eco que no refleje el input es un FAIL duro.
+cmd_intake(){
+  local QA="$1"; guard_qa "$QA"
+  banner "INTAKE FLOWS — eco dinámico de ticket TI y orden de servicio — contacto QA $QA" "forgechat_monolith_e2e"
+
+  echo "--- Flow 1: ticket TI (tipo_ticket presente) ---"
+  local BASE1; BASE1="$(max_out_id "$QA")"
+  chk "TICKET HTTP" "$(inject_nfm "$QA" '{"tipo_ticket":"credencial_guardada","colaborador":"Marisol","area_sucursal":"Sucursal Centro","detalle":"Su equipo guarda la credencial y ya no pide contrasena","prioridad":"alta","flow_token":"qa-ticket"}' "QA Intake")" "200"
+  sleep 7
+  local ACK1; ACK1="$(fresh_out_label "$QA" ia360_ticket_intake_ack "$BASE1")"
+  echo "  ack: $ACK1"
+  chk_has "TICKET eco del tipo elegido"      "$ACK1" "credencial_guardada"
+  chk_has "TICKET eco del colaborador"       "$ACK1" "Marisol"
+  chk_has "TICKET eco del area"              "$ACK1" "Sucursal Centro"
+  chk_has "TICKET eco de la prioridad"       "$ACK1" "prioridad alta"
+  chk_has "TICKET eco del detalle escrito"   "$ACK1" "guarda la credencial"
+  chk "TICKET persistido en el contacto"     "$(psql_q "SELECT custom_fields->'ia360_ticket_intake_last'->>'tipo_ticket' FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$QA'")" "credencial_guardada"
+  chk "TICKET no cayó al fallback genérico"  "$(fresh_count_label "$QA" ia360_interactive_fallback "$BASE1")" "0"
+
+  echo "--- Flow 2: orden de servicio (tipo_entrada presente) ---"
+  local BASE2; BASE2="$(max_out_id "$QA")"
+  chk "ORDEN HTTP" "$(inject_nfm "$QA" '{"tipo_entrada":"orden_servicio","cliente_nombre":"Ferreteria del Valle","descripcion":"Instalacion de dos equipos en planta baja","evidencia":["fotos","firma"],"flow_token":"qa-orden"}' "QA Intake")" "200"
+  sleep 7
+  local ACK2; ACK2="$(fresh_out_label "$QA" ia360_orden_intake_ack "$BASE2")"
+  echo "  ack: $ACK2"
+  chk_has "ORDEN eco del carril elegido"     "$ACK2" "orden_servicio"
+  chk_has "ORDEN eco del cliente"            "$ACK2" "Ferreteria del Valle"
+  chk_has "ORDEN eco de la evidencia (lista)" "$ACK2" "fotos, firma"
+  chk_has "ORDEN eco de la descripcion"      "$ACK2" "dos equipos"
+  chk "ORDEN persistida en el contacto"      "$(psql_q "SELECT custom_fields->'ia360_orden_intake_last'->>'tipo_entrada' FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$QA'")" "orden_servicio"
+  chk "ORDEN no cayó al fallback genérico"   "$(fresh_count_label "$QA" ia360_interactive_fallback "$BASE2")" "0"
+
+  echo "  labels de la corrida: $(fresh_labels "$QA" "$BASE1")"
+  verdict "intake flows ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 case "${1:-help}" in
   revenue-os)     cmd_revenue_os "${2:?num_qa}";;
   gate-slots-bug) cmd_gate_slots_bug "${2:?num_qa}";;
   hijack)         cmd_hijack "${2:?num_qa}";;
   entrega)        cmd_entrega "${2:?num_qa}";;
+  intake)         cmd_intake "${2:?num_qa}";;
   m100)           cmd_m100 "${2:?num_qa}";;
   seq)            cmd_seq "${2:?num_qa}" "${3:?seq_id}" "${4:?opcion}" "${5:?titulo}";;
   cold-send)      cmd_cold_send "${2:?num_qa}" "${3:?persona}" "${4:?seq_id}" "${5:-}";;
