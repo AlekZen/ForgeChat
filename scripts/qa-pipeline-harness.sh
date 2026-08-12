@@ -581,6 +581,18 @@ cmd_expansion_deal(){
 cmd_desenlaces(){
   local QA="$1" NAME="${2:-Ramiro Prueba}"; guard_qa "$QA"
   banner "DESENLACES DE ENVÍO — delivered no es fallo; failed sí avisa — $QA" "forgechat_monolith_e2e"
+  # Misma limpieza que la matriz de alta y por la misma razón: sin ella la segunda
+  # corrida sobre el mismo QA no vuelve a ver la tarjeta de clasificación ni puede
+  # reenviar el opener («un solo opener por contacto» es un guardrail real).
+  psql_q "DELETE FROM coexistence.deals WHERE contact_number='$QA'" >/dev/null
+  psql_q "DELETE FROM coexistence.chat_history WHERE contact_number='$QA'" >/dev/null
+  psql_q "UPDATE coexistence.contacts
+             SET custom_fields = COALESCE(custom_fields,'{}'::jsonb)
+                   - 'ia360_persona_first' - 'ia360_selector_ranking'
+                   - 'ia360_seq_last_response' - 'ia360_triaje'
+                   - 'ia360_approve_send_blocked_at' - 'ia360_approve_send_blocked_reason',
+                 tags = '{}'
+           WHERE wa_number='$WA' AND contact_number='$QA'" >/dev/null
   local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
   local BASE_QA; BASE_QA="$(max_out_id "$QA")"
 
@@ -668,6 +680,23 @@ cmd_alta_matrix(){
     i=$((i+1))
     local QA; QA="$(printf '%s%03d' "$BASE_NUM" "$i")"
     guard_qa "$QA"
+    # Re-ejecutable a propósito: sin esta limpieza, una segunda corrida sobre los
+    # mismos números toma el camino «este contacto ya está clasificado», la tarjeta
+    # de clasificación nunca aparece y la matriz reporta SIN TARJETA. Ese falso rojo
+    # ya costó una investigación completa (12-ago-2026).
+    psql_q "DELETE FROM coexistence.deals WHERE contact_number='$QA'" >/dev/null
+    psql_q "UPDATE coexistence.contacts
+               SET custom_fields = COALESCE(custom_fields,'{}'::jsonb)
+                     - 'ia360_persona_first' - 'ia360_selector_ranking'
+                     - 'ia360_seq_last_response' - 'ia360_triaje'
+                     - 'ia360_approve_send_blocked_at' - 'ia360_approve_send_blocked_reason',
+                   tags = '{}'
+             WHERE wa_number='$WA' AND contact_number='$QA'" >/dev/null
+    # Y el historial del QA: «un solo opener por contacto» es un guardrail REAL de
+    # producción (bf9b3e0), así que sin borrar sus salientes la segunda corrida
+    # quedaría bloqueada en opener_ya_enviado y no probaría el envío. Sólo toca
+    # números QA — guard_qa ya lo garantizó.
+    psql_q "DELETE FROM coexistence.chat_history WHERE contact_number='$QA'" >/dev/null
     echo ""
     echo "═══ $P → $QA ═══"
     local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
@@ -1016,6 +1045,112 @@ cmd_auditoria(){
   verdict "auditoria ($QA)"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# TRIAJE DE DESCONOCIDOS (12-ago-2026). Quien escribe sin estar en ningún embudo
+# ya no queda mudo: se le ubica, se le contesta UNA pregunta y el caso queda
+# anotado. Lo que se prueba aquí es la política completa, incluido lo que NO debe
+# pasar (no conversar sin fin, no interrumpir a Alek por difusión).
+#
+#   D1 saludo de un desconocido        → sondeo + caso anotado, sin tarjeta
+#   D2 dice a qué viene (cliente)      → respuesta + tarjeta al owner
+#   D3 sigue escribiendo               → tope de mensajes automáticos: silencio
+#   D4 difusión/promoción              → un cierre honesto, cero tarjeta, silenciado
+#   D5 "gracias" de un desconocido     → cero respuesta (no es una petición)
+cmd_desconocidos(){
+  local QA="$1"; guard_qa "$QA"
+  local QA2=$((QA + 1)); guard_qa "$QA2"
+  local QA3=$((QA + 2)); guard_qa "$QA3"
+  banner "TRIAJE DE DESCONOCIDOS — sondeo, ruteo y silencio donde toca — $QA" "forgechat_monolith_e2e"
+
+  echo "--- D0: los tres QA arrancan como perfectos desconocidos ---"
+  for N in "$QA" "$QA2" "$QA3"; do
+    psql_q "DELETE FROM coexistence.deals WHERE contact_number='$N'" >/dev/null
+    psql_q "UPDATE coexistence.contacts SET custom_fields = COALESCE(custom_fields,'{}'::jsonb) - 'ia360_triaje' - 'ia360_cliente_activo_beta' - 'lifecycle_stage' - 'relationship_context' - 'ia360_revenue_state', tags='{}' WHERE wa_number='$WA' AND contact_number='$N'" >/dev/null
+    psql_q "DELETE FROM coexistence.ia360_bot_failures WHERE contact_number='$N'" >/dev/null
+    # Las tarjetas al owner llevan el número en el label: se cuentan por persona,
+    # no por ventana de tiempo (una corrida anterior falseaba el conteo).
+    psql_q "DELETE FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_desconocido_triaje_$N'" >/dev/null
+  done
+  ok "estado de triaje limpio en $QA, $QA2 y $QA3"
+
+  echo "--- D1: un desconocido saluda ---"
+  local BASE1; BASE1="$(max_out_id "$QA")"
+  chk "D1 saludo HTTP" "$(inject_text "$QA" "Buenos dias amigo como estas? Un gusto en saludarte, mi nombre es Manuel" "Manuel Prospecto")" "200"
+  sleep 15
+  local R1; R1="$(fresh_out_label "$QA" "ia360_triaje_indeterminado" "$BASE1")"
+  echo "  sondeo: ${R1:-(ninguno)}"
+  chk     "D1 el desconocido SÍ recibió respuesta" "$([ -n "$R1" ] && echo si || echo no)" "si"
+  chk_has "D1 se presenta como Alekito"            "$R1" "Alekito, el asistente de Alek"
+  chk_has "D1 pregunta de qué se trata"            "$R1" "de qué se trata"
+  chk     "D1 el caso quedó anotado" \
+          "$(psql_q "SELECT count(*) FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' AND reason LIKE 'desconocido:indeterminado%' AND status='abierto'")" "1"
+  chk     "D1 estado de triaje = sondeado" \
+          "$(psql_q "SELECT custom_fields->'ia360_triaje'->>'estado' FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$QA'")" "sondeado"
+  chk     "D1 un saludo NO interrumpe a Alek" \
+          "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_desconocido_triaje_$QA'")" "0"
+
+  echo "--- D2: dice a qué viene y resulta cliente potencial ---"
+  local BASE2; BASE2="$(max_out_id "$QA")"
+  chk "D2 segundo mensaje HTTP" "$(inject_text "$QA" "necesito automatizar el seguimiento de mis clientes por WhatsApp" "Manuel Prospecto")" "200"
+  sleep 15
+  local R2; R2="$(fresh_out_label "$QA" "ia360_triaje_cliente_potencial" "$BASE2")"
+  echo "  respuesta: ${R2:-(ninguna)}"
+  chk     "D2 respondió como cliente potencial" "$([ -n "$R2" ] && echo si || echo no)" "si"
+  chk_not "D2 ya no se vuelve a presentar"      "$R2" "Soy Alekito"
+  chk     "D2 esta vez SÍ hay tarjeta para Alek" \
+          "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_desconocido_triaje_$QA'")" "1"
+  chk     "D2 la tarjeta NO egresó al WhatsApp real (origen sintético)" \
+          "$(psql_q "SELECT status FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_desconocido_triaje_$QA' ORDER BY id DESC LIMIT 1")" "qa_sandboxed"
+  chk     "D2 estado de triaje = escalado" \
+          "$(psql_q "SELECT custom_fields->'ia360_triaje'->>'estado' FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$QA'")" "escalado"
+
+  echo "--- D3: el tope de mensajes automáticos ---"
+  chk "D3 tercer mensaje HTTP" "$(inject_text "$QA" "sobre todo la parte de cobranza" "Manuel Prospecto")" "200"
+  sleep 15
+  local BASE4; BASE4="$(max_out_id "$QA")"
+  chk "D3 cuarto mensaje HTTP" "$(inject_text "$QA" "y también el reporte mensual" "Manuel Prospecto")" "200"
+  sleep 15
+  chk "D3 al cuarto mensaje el bot ya no contesta" "$(max_out_id "$QA")" "$BASE4"
+  chk "D3 el caso queda cerrado para el bot" \
+      "$(psql_q "SELECT custom_fields->'ia360_triaje'->>'estado' FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$QA'")" "cerrado"
+  # Un caso por persona, no uno por mensaje: cuatro mensajes suyos = una sola fila
+  # en el ledger y una sola tarjeta. Es lo que evita repetir el ruido de las 17
+  # promesas idénticas que recibió Andrés.
+  chk "D3 sigue habiendo UN solo caso abierto de esa persona" \
+      "$(psql_q "SELECT count(*) FROM coexistence.ia360_bot_failures WHERE contact_number='$QA'")" "1"
+  chk "D3 y UNA sola tarjeta para Alek" \
+      "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_desconocido_triaje_$QA'")" "1"
+  chk "D3 el caso acumuló lo que fue diciendo" \
+      "$(psql_q "SELECT CASE WHEN contact_message LIKE '%cobranza%' THEN 'si' ELSE 'no' END FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' ORDER BY id DESC LIMIT 1")" "si"
+
+  echo "--- D4: difusión/promoción ---"
+  local BASE5; BASE5="$(max_out_id "$QA2")"
+  chk "D4 promoción HTTP" "$(inject_text "$QA2" "PROMOCION: ultimos lugares, inscribete al webinar de IA, cupos limitados" "Promotor QA")" "200"
+  sleep 15
+  local R4; R4="$(fresh_out_label "$QA2" "ia360_triaje_marketing_masivo" "$BASE5")"
+  echo "  cierre: ${R4:-(ninguno)}"
+  chk     "D4 se le contesta una vez, con honestidad" "$([ -n "$R4" ] && echo si || echo no)" "si"
+  chk_has "D4 dice que no es lo que se busca"         "$R4" "no es algo que estemos buscando"
+  chk     "D4 la difusión NO interrumpe a Alek" \
+          "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_desconocido_triaje_$QA2'")" "0"
+  chk     "D4 el caso nace cerrado (no es un pendiente)" \
+          "$(psql_q "SELECT status FROM coexistence.ia360_bot_failures WHERE contact_number='$QA2' ORDER BY id DESC LIMIT 1")" "ignorado"
+  local BASE6; BASE6="$(max_out_id "$QA2")"
+  chk "D4 insiste HTTP" "$(inject_text "$QA2" "te comparto el temario, son 8 horas de capacitacion" "Promotor QA")" "200"
+  sleep 15
+  chk "D4 al insistir ya no se le contesta" "$(max_out_id "$QA2")" "$BASE6"
+
+  echo "--- D5: un 'gracias' suelto no es una petición ---"
+  local BASE7; BASE7="$(max_out_id "$QA3")"
+  chk "D5 gracias HTTP" "$(inject_text "$QA3" "gracias" "Ana QA")" "200"
+  sleep 15
+  chk "D5 cero respuesta a un pasivo de desconocido" "$(max_out_id "$QA3")" "$BASE7"
+  chk "D5 y tampoco se le abrió un caso" \
+      "$(psql_q "SELECT count(*) FROM coexistence.ia360_bot_failures WHERE contact_number='$QA3'")" "0"
+
+  verdict "desconocidos ($QA)"
+}
+
 
 # ───────────────────────────────────────────────────────────────────────────
 case "${1:-help}" in
@@ -1031,6 +1166,7 @@ case "${1:-help}" in
   expansion-deal) cmd_expansion_deal "${2:?num_qa}" "${3:-}";;
   desenlaces)     cmd_desenlaces "${2:?num_qa}" "${3:-}";;
   auditoria)      cmd_auditoria "${2:?num_qa}" "${3:-}";;
+  desconocidos)   cmd_desconocidos "${2:?num_qa}";;
   alta-matrix)    cmd_alta_matrix "matrix" "${2:-}";;
   template-only)  cmd_template_only "${2:?num_qa}" "${3:?template_name}" "${4:?pipeline}" "${5:-}";;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;

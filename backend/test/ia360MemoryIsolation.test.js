@@ -73,8 +73,10 @@ test('every ia360 memory INSERT in webhook seals the owning contact', () => {
   }
 });
 
-test('media and document readers never touch cross-contact memory', () => {
-  for (const archivo of ['mediaUnderstanding.js', 'documentUnderstanding.js']) {
+test('media, document and triage services never touch cross-contact memory', () => {
+  // El triaje entra aquí porque le habla a DESCONOCIDOS: si su decisión llegara a
+  // leer memoria, le estaría contando a un extraño lo que dijo un champion.
+  for (const archivo of ['mediaUnderstanding.js', 'documentUnderstanding.js', 'ia360Triaje.js']) {
     const fuente = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', archivo), 'utf8');
     // La lectura se guarda en chat_history.media_lectura, que ya es por mensaje y
     // por contacto. Estos servicios no leen ni escriben memoria.

@@ -122,7 +122,10 @@ test('operaciones beta sin deal entra al camino no-silencio sin telefono hard-co
   assert.match(preBetaBlock, /preloadedContactContext = await loadIa360ContactContext\(record\)/);
   assert.match(preBetaBlock, /!deal && isIa360ClienteActivoBetaContact\(preloadedContactContext\)/);
   assert.match(preBetaBlock, /buildIa360ClienteActivoBetaPseudoDeal\(preloadedContactContext\)/);
-  assert.match(preBetaBlock, /if \(!deal\) return/);
+  // Sin deal se sale SIEMPRE del carril beta (nadie entra a la rama de cliente
+  // activo por accidente), pero ya no en silencio: desde el 12-ago-2026 el
+  // desconocido pasa por el triaje antes del return.
+  assert.match(preBetaBlock, /if \(!deal\) \{[\s\S]{0,600}?handleIa360Desconocido\([\s\S]{0,300}?return;/);
 
   assert.doesNotMatch(src, /Hendri/i, 'la elegibilidad no debe depender del nombre real');
   assert.doesNotMatch(src, /2844/, 'la elegibilidad no debe depender del id real del contacto');

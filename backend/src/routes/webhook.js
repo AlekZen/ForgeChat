@@ -24,6 +24,8 @@ const { ia360MediaCaption } = require('../util/mediaCaption');
 const { leerMedio, componerMensajeConLectura, tipoDeLectura } = require('../services/mediaUnderstanding');
 // Lectura de documentos (Excel/CSV/texto): se parsean en local, no viajan a n8n.
 const { leerDocumento } = require('../services/documentUnderstanding');
+// Triaje de desconocidos: quién es el que escribe cuando no está en ningún embudo.
+const { clasificarDesconocido, decidirTriaje } = require('../services/ia360Triaje');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
@@ -8423,6 +8425,186 @@ const ia360BootRescanTimer = setTimeout(async () => {
 }, 90000);
 if (typeof ia360BootRescanTimer.unref === 'function') ia360BootRescanTimer.unref();
 
+// ── TRIAJE DE DESCONOCIDOS ────────────────────────────────────────────────────
+// 12-ago-2026 (Alek). Al WhatsApp de IA360 le escribe gente que no está en ningún
+// embudo y hasta hoy TODOS quedaban mudos: el gate `if (!deal) return` de
+// handleIa360FreeText los cortaba. Medido: 4 desconocidos en 90 días sin una sola
+// respuesta; el último escribió tres veces el mismo día. No sabemos qué se perdió,
+// que es lo peor de todo.
+//
+// Qué hace ahora: clasifica de qué se trata (cliente, aliado, proveedor, difusión,
+// reclutamiento o sin clasificar), contesta UNA vez con una sola pregunta —sin
+// pitch y sin prometer nada que no quede anotado—, deja el caso en el ledger que el
+// digest ya envejece, e interrumpe a Alek con tarjeta SÓLO cuando puede costar
+// dinero: cliente potencial o propuesta de alianza. La decisión vive en
+// services/ia360Triaje.js (pura y testeable); aquí sólo está el cableado.
+//
+// Se apaga con IA360_TRIAJE_DESCONOCIDOS=off sin tocar código.
+
+const IA360_TRIAJE_TIPO_LEGIBLE = {
+  cliente_potencial: 'un cliente potencial',
+  propuesta_alianza: 'una propuesta de alianza',
+  proveedor: 'un proveedor ofreciendo algo',
+  marketing_masivo: 'difusión/promoción',
+  reclutamiento: 'tema de empleo',
+  indeterminado: 'algo que todavía no se entiende',
+};
+
+// Texto que de verdad escribió el desconocido. Los placeholders de medio ('Audio
+// message'), el nombre del archivo de un documento y el 'Location: lat, lng' NO son
+// algo que él haya dicho: clasificar con eso sería inventar.
+function ia360TriajeTextoDelContacto(record) {
+  const t = String(record?.message_body || '').trim();
+  if (!t) return '';
+  if (record?.message_type === 'document') return '';
+  if (/^(audio message|voice message|sticker|order received)$/i.test(t)) return '';
+  if (/^location:\s/i.test(t)) return '';
+  return t;
+}
+
+function ia360TriajeNombre({ contact, record }) {
+  const n = String(contact?.name || contact?.profile_name || record?.contact_name || '').trim();
+  if (!n || /^\+?\d[\d\s()-]{6,}$/.test(n)) return '';
+  return n;
+}
+
+async function handleIa360Desconocido({ record, contact = null }) {
+  if (String(process.env.IA360_TRIAJE_DESCONOCIDOS || '').trim().toLowerCase() === 'off') return false;
+  if (!record || record.direction !== 'incoming') return false;
+  if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) return false;
+
+  const previo = contact?.custom_fields?.ia360_triaje || {};
+  // Cerrado o silenciado = decisión ya tomada (por el tope de mensajes, por ser
+  // difusión o porque Alek tocó «Ignorar»). No se vuelve a contestar nunca.
+  if (previo.estado === 'silenciado' || previo.estado === 'cerrado') return false;
+
+  const texto = ia360TriajeTextoDelContacto(record);
+  const turnos = Number(previo.turnos || 0);
+  // Un «gracias» de alguien a quien todavía no le hemos dicho nada no es una
+  // petición: contestarlo es el ruido que ya se corrigió en el carril del owner.
+  if (turnos === 0 && texto && isIa360PassiveMessage(texto)) return false;
+
+  // Si otro carril ya le respondió a ESTE inbound, aquí no se dobla la respuesta.
+  if (await ia360HasOutgoingForInbound(record).catch(() => true)) return false;
+
+  const { tipo, confianza } = clasificarDesconocido({ texto, textoPrevio: previo.texto || '' });
+  const nombre = ia360TriajeNombre({ contact, record });
+  const decision = decidirTriaje({ tipo, nombre, turno: turnos + 1, hayTexto: Boolean(texto) });
+
+  let respondido = false;
+  if (decision.responder && decision.cuerpo) {
+    respondido = await enqueueIa360Text({
+      record,
+      label: `ia360_triaje_${tipo}`,
+      body: decision.cuerpo,
+    }).catch(e => { console.error('[ia360-triaje] envío al contacto:', e.message); return false; });
+  }
+
+  // El caso queda anotado SIEMPRE, incluso el que se cierra solo: es la única forma
+  // de saber después qué llegó por esta puerta y qué se hizo con ello.
+  let failureId = null;
+  // UN caso por persona, no uno por mensaje. Si ya hay una fila abierta de este
+  // desconocido, se le añade lo nuevo; abrir una fila por cada cosa que escriba
+  // convierte la bandeja de Alek en el ruido que ya corregimos una vez.
+  try {
+    const abierta = previo.ledger_id
+      ? (await pool.query(
+          `SELECT id FROM coexistence.ia360_bot_failures WHERE id=$1 AND status='abierto'`,
+          [previo.ledger_id]
+        )).rows[0]?.id || null
+      : null;
+    if (abierta) {
+      await pool.query(
+        `UPDATE coexistence.ia360_bot_failures
+            SET contact_message = left(COALESCE(contact_message,'') || E'\n' || $2, 2000),
+                reason = $3,
+                bot_fallback = COALESCE($4, bot_fallback)
+          WHERE id = $1`,
+        [abierta, String(record.message_body || '').slice(0, 500), `desconocido:${tipo}:${decision.motivo}`, decision.cuerpo || null]
+      );
+      failureId = abierta;
+    } else {
+      const { rows } = await pool.query(
+        `INSERT INTO coexistence.ia360_bot_failures
+           (contact_number, contact_message, reason, bot_fallback, status)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id`,
+        [
+          record.contact_number || null,
+          String(record.message_body || '').slice(0, 1000),
+          `desconocido:${tipo}:${decision.motivo}`,
+          decision.cuerpo || null,
+          decision.escalar === 'ledger_cerrado' ? 'ignorado' : 'abierto',
+        ]
+      );
+      failureId = rows[0]?.id || null;
+    }
+  } catch (e) {
+    console.error('[ia360-triaje] no pude anotar el caso:', e.message);
+  }
+
+  // Interrumpir a Alek cuesta atención: sólo cliente potencial y alianza. Los
+  // botones son los del ledger que ya existe, así que «Responder» le deja contestar
+  // al desconocido por el mismo canal sin nada nuevo que aprender.
+  // …y UNA sola vez por persona: una vez que el caso está en manos de Alek, los
+  // mensajes siguientes engordan la misma fila del ledger, no le vuelven a sonar
+  // el teléfono.
+  let escaladoAt = previo.escalado_at || null;
+  if (decision.escalar === 'card' && failureId != null && !escaladoAt) {
+    const quien = nombre || `el número ${maskIa360Number(record.contact_number)}`;
+    const enviada = await sendOwnerInteractive({
+      record,
+      label: `owner_desconocido_triaje_${record.contact_number}`,
+      messageBody: `IA360: te escribió ${quien} (${IA360_TRIAJE_TIPO_LEGIBLE[tipo] || tipo})`,
+      targetContact: record.contact_number,
+      interactive: {
+        type: 'button',
+        body: {
+          text: `Alek, te escribió ${quien} y no está en ningún embudo. Parece ${IA360_TRIAJE_TIPO_LEGIBLE[tipo] || tipo}: "${String(texto || record.message_body || '').slice(0, 280)}". Alekito ya le contestó una pregunta para ubicarlo. ¿Qué hago?`,
+        },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: `owner_take_fail:${failureId}`, title: 'Lo tomo' } },
+            { type: 'reply', reply: { id: `owner_comment_fail:${failureId}`, title: 'Responder' } },
+            { type: 'reply', reply: { id: `owner_ignore_fail:${failureId}`, title: 'Ignorar' } },
+          ],
+        },
+      },
+    }).catch(e => { console.error('[ia360-triaje] tarjeta al owner:', e.message); return false; });
+    // Sólo se marca como escalado si la tarjeta SALIÓ: si falló, el siguiente
+    // mensaje suyo vuelve a intentarlo en vez de dejarlo enterrado.
+    if (enviada) escaladoAt = new Date().toISOString();
+  }
+
+  // Estado del triaje en el contacto: es lo que evita volver a preguntar lo mismo y
+  // lo que hace respetar el tope de mensajes automáticos.
+  const estadoNuevo = {
+    estado: decision.estado,
+    tipo,
+    confianza,
+    turnos: turnos + 1,
+    motivo: decision.motivo,
+    // Se acumula lo que ha escrito para que el segundo mensaje se entienda con el
+    // primero («hola» + «necesito automatizar» sólo se entiende junto).
+    texto: `${previo.texto || ''} ${texto}`.trim().slice(-600),
+    primer_mensaje: previo.primer_mensaje || String(record.message_body || '').slice(0, 300),
+    ledger_id: failureId,
+    escalado_at: escaladoAt,
+    at: new Date().toISOString(),
+  };
+  await pool.query(
+    `UPDATE coexistence.contacts
+        SET custom_fields = COALESCE(custom_fields, '{}'::jsonb) || jsonb_build_object('ia360_triaje', $3::jsonb),
+            updated_at = NOW()
+      WHERE wa_number = $1 AND contact_number = $2`,
+    [record.wa_number, record.contact_number, JSON.stringify(estadoNuevo)]
+  ).catch(e => console.error('[ia360-triaje] no pude guardar el estado:', e.message));
+
+  console.log('[ia360-triaje] %s tipo=%s turno=%d escalar=%s respondido=%s',
+    maskIa360Number(record.contact_number), tipo, turnos + 1, decision.escalar, respondido);
+  return respondido;
+}
+
 async function handleIa360FreeText(record) {
   // PRODUCTION-HARDENING (fallback universal — cero silencio): estos dos flags viven a
   // nivel de FUNCION (no del try) para que el catch terminal pueda verlos.
@@ -8455,7 +8637,14 @@ async function handleIa360FreeText(record) {
     if (!deal && isIa360ClienteActivoBetaContact(preloadedContactContext)) {
       deal = buildIa360ClienteActivoBetaPseudoDeal(preloadedContactContext);
     }
-    if (!deal) return; // only inside an active IA360 funnel or explicit beta/champion context
+    if (!deal) {
+      // Sin embudo y sin marca de beta: es un desconocido. Antes esto era silencio
+      // total —la puerta por la que se perdieron 4 conversaciones en 90 días—; ahora
+      // pasa por el triaje, que lo ubica, le contesta una vez y deja el caso anotado.
+      await handleIa360Desconocido({ record, contact: preloadedContactContext })
+        .catch(e => console.error('[ia360-triaje] error:', e.message));
+      return;
+    }
     dealFound = true;
     const contactContext = deal.contact_context || preloadedContactContext || await loadIa360ContactContext(record).catch(() => null);
     // LECTURA DEL MEDIO: se ve la imagen / se escucha el audio ANTES de responder, y
@@ -12584,4 +12773,7 @@ router.post('/internal/n8n-directive', async (req, res) => {
 });
 
 
-module.exports = { router };
+// handleIa360Desconocido se exporta para el barrido del rezago
+// (scripts/triarDesconocidosRezago.js): el rezago tiene que pasar por EXACTAMENTE
+// el mismo carril que la producción, no por una copia que se desincroniza.
+module.exports = { router, handleIa360Desconocido };
