@@ -34,20 +34,7 @@ const PROMESA_INTERVAL = '24 hours';
 // Tope de filas por digest: un mensaje de WhatsApp legible, no un volcado.
 const MAX_FILAS = 5;
 
-function truncar(texto, max) {
-  const limpio = String(texto == null ? '' : texto).replace(/\s+/g, ' ').trim();
-  if (!limpio) return '(sin texto)';
-  return limpio.length <= max ? limpio : limpio.slice(0, max - 1).trimEnd() + '…';
-}
-
-function dias(desde) {
-  const ms = Date.now() - new Date(desde).getTime();
-  if (!Number.isFinite(ms)) return '';
-  const d = Math.floor(ms / 86400000);
-  if (d >= 1) return `hace ${d} día${d === 1 ? '' : 's'}`;
-  const h = Math.max(1, Math.floor(ms / 3600000));
-  return `hace ${h} h`;
-}
+const { buildDigestBody, truncar, dias } = require('../util/failuresDigestBody');
 
 // Candidatas: promesas abiertas de más de 24 h que aún no entraron a un digest.
 // Los números QA (rango exacto 52199900XXXXX) quedan fuera: son harness, y el
@@ -73,6 +60,36 @@ async function loadCandidatas() {
   return rows;
 }
 
+// F8 (auditoría 2026-08-12): el owner recibió 5 digests en 15 h. Causa: el
+// catch-up de 3 min corre en CADA restart y el LIMIT 5 pagina el backlog de 31
+// en tandas, así que cada arranque mandaba la siguiente tanda. El freno tiene que
+// sobrevivir a los reinicios ⇒ marcador PERSISTENTE en chat_history, no memoria.
+async function digestEnviadoUltimas24h() {
+  const { rows } = await pool.query(
+    `SELECT 1
+       FROM coexistence.chat_history
+      WHERE direction = 'outgoing'
+        AND template_meta->>'label' = 'owner_failures_digest'
+        AND created_at > NOW() - INTERVAL '24 hours'
+      LIMIT 1`
+  );
+  return rows.length > 0;
+}
+
+// Total real de promesas vencidas abiertas (no solo las 5 del detalle): sin esto
+// el digest dice "tienes 5" cuando en realidad arrastra 31.
+async function contarAbiertasVencidas() {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n
+       FROM coexistence.ia360_bot_failures
+      WHERE status = 'abierto'
+        AND created_at < NOW() - ($1)::interval
+        AND contact_number !~ '^52199900[0-9]{5}$'`,
+    [PROMESA_INTERVAL]
+  );
+  return rows[0]?.n || 0;
+}
+
 // Reclamo atómico del lote. Devuelve los ids realmente reclamados: si otro
 // barrido se adelantó, esa fila no vuelve y no se incluye en el digest.
 // `owner_action` sólo se sella si estaba vacío — una acción real del owner
@@ -90,22 +107,11 @@ async function reclamar(ids) {
   return new Set(rows.map(r => r.id));
 }
 
-function buildDigestBody(filas) {
-  const lineas = filas.map(f => {
-    const quien = String(f.name || '').replace(/\s+WhatsApp IA360$/i, '').trim() || f.contact_number;
-    return `• ${quien}: «${truncar(f.contact_message, 90)}» (${dias(f.created_at)})`;
-  });
-  return [
-    `Tienes ${filas.length} promesa${filas.length === 1 ? '' : 's'} de respuesta sin cerrar (les dije "te confirmo por aquí en breve" hace más de 24 h):`,
-    '',
-    ...lineas,
-    '',
-    'No les he escrito nada más: el cierre lo decides tú. Responde en su hilo o tómalo manual.',
-  ].join('\n');
-}
-
 // Un barrido. Invocable a mano para pruebas.
 async function runIa360FailuresDigestSweep() {
+  // Máximo un digest cada 24 h, decidido contra chat_history (sobrevive restarts).
+  if (await digestEnviadoUltimas24h()) return { ok: true, skipped: 'digest_reciente_24h' };
+
   const candidatas = await loadCandidatas();
   if (candidatas.length === 0) return { ok: true, candidates: 0 };
 
@@ -120,7 +126,8 @@ async function runIa360FailuresDigestSweep() {
   const filas = candidatas.filter(r => reclamados.has(r.id));
   if (filas.length === 0) return { ok: true, candidates: candidatas.length, claimed: 0 };
 
-  const body = buildDigestBody(filas);
+  const totalAbiertas = await contarAbiertasVencidas().catch(() => 0);
+  const body = buildDigestBody(filas, totalAbiertas);
   const handlerFor = `ia360_failures_digest:${filas[0].id}:${Date.now()}`;
   try {
     const localId = await insertPendingRow({

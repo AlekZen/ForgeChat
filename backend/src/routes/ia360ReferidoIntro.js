@@ -92,9 +92,9 @@ function buildReferidoContextoDraft({ name, quienIntro }) {
   const who = String(quienIntro || '').trim();
   const saludo = String(name || '').trim() ? `Hola ${String(name).trim()}` : 'Hola';
   if (who) {
-    return `${saludo}, soy la IA de Alek. Te escribo porque nos presentó ${who} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
+    return `${saludo}, soy Alekito, el asistente de Alek. Te escribo porque nos presentó ${who} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
   }
-  return `${saludo}, soy la IA de Alek. Te escribo porque tenemos un contacto en común y, antes de proponerte nada, Alek quiere entender un poco tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
+  return `${saludo}, soy Alekito, el asistente de Alek. Te escribo porque tenemos un contacto en común y, antes de proponerte nada, Alek quiere entender un poco tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`;
 }
 
 // True si el texto trae el placeholder de quien_intro sin resolver.

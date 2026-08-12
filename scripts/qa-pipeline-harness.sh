@@ -51,6 +51,12 @@
 #   template-only <num_qa> <template_name> <pipeline> [header_image_url]
 #                             Envío de template aislado con metadata veraz (no
 #                             marca el pipeline como probado).
+#   auditoria <num_qa> [nombre]
+#                             Correctivas de la auditoría 2026-08-12: fallback
+#                             honesto por clase de mensaje (audio/documento/
+#                             imagen), promesa que no se repite, silencio ante
+#                             el "Ok" del owner, readout sin jerga y aviso de
+#                             contacto con historia previa.
 #
 # Solo números QA 52199900*. El bot 5213321594582 nunca es contacto. Cero egress
 # a contactos reales. Egress técnico a números QA inexistentes: Meta lo acepta o
@@ -793,6 +799,102 @@ cmd_intake(){
   echo "  labels de la corrida: $(fresh_labels "$QA" "$BASE1")"
   verdict "intake flows ($QA)"
 }
+# ───────────────────────────────────────────────────────────────────────────
+# AUDITORÍA WHATSAPP 2026-08-12 — las correctivas de lo que sí pasó en producción.
+#
+#   A1 audio de un cliente activo → el bot dice que no puede escucharlo y pide
+#      el dato en texto; JAMÁS "te confirmo en breve" (17 veces a Andrés).
+#   A2 segunda pregunta con la promesa anterior abierta → reconoce el pendiente
+#      sin volver a prometer.
+#   A3 "Ok" del owner → silencio (antes: el menú completo, 11 veces en 30 días).
+#   A4 alta por vCard → UN mensaje de contexto + readout sin jerga interna
+#      ("flywheel", "persona-first") y sin el mensaje suelto de autosuggest.
+#   A5 contacto con opener previo → el readout avisa que ya le escribimos.
+cmd_auditoria(){
+  local QA="$1" NAME="${2:-Ramiro Auditoria}"; guard_qa "$QA"
+  banner "AUDITORÍA — fallback honesto, digest, silencio y readout limpio — $QA" "forgechat_monolith_e2e"
+  local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
+
+  echo "--- A1: audio de un cliente activo (el bot no puede escucharlo) ---"
+  # El invariante no-silencio sólo vigila clientes activos/beta: se marca el QA
+  # como tal para ejercer exactamente la rama que produjo el daño real.
+  psql_q "INSERT INTO coexistence.contacts (wa_number, contact_number, name, custom_fields)
+          VALUES ('$WA','$QA','$NAME','{\"relationship_context\":\"cliente_activo_beta_supervisado\"}'::jsonb)
+          ON CONFLICT (wa_number, contact_number) DO UPDATE
+          SET custom_fields = COALESCE(coexistence.contacts.custom_fields,'{}'::jsonb)
+                              || '{\"relationship_context\":\"cliente_activo_beta_supervisado\"}'::jsonb" >/dev/null
+  psql_q "UPDATE coexistence.ia360_bot_failures SET status='cerrado' WHERE contact_number='$QA' AND status='abierto'" >/dev/null
+  local BASE_QA; BASE_QA="$(max_out_id "$QA")"
+  local AID; AID="$(wamid audio)"
+  chk "A1 audio HTTP" "$(post_webhook "$(_envelope "$QA" "$NAME" "{\"from\":\"$QA\",\"id\":\"$AID\",\"timestamp\":\"$(ts)\",\"type\":\"audio\",\"audio\":{\"id\":\"qa-audio\",\"mime_type\":\"audio/ogg; codecs=opus\"}}")")" "200"
+  echo "  esperando 80 s al invariante no-silencio…"
+  sleep 80
+  local R1; R1="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA ORDER BY id DESC LIMIT 1")"
+  echo "  respuesta: ${R1:-(ninguna)}"
+  chk_has "A1 dice la verdad sobre el audio" "$R1" "no puedo escuchar audios"
+  chk_has "A1 pide el dato en el formato que sí lee" "$R1" "una línea"
+  chk_not "A1 NO promete confirmación imposible" "$R1" "en breve"
+  chk_has "A1 el ledger guarda la causa real" \
+      "$(psql_q "SELECT reason FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' ORDER BY id DESC LIMIT 1")" "media_audio_no_soportado"
+
+  # A2 mide el copy del FALLBACK, no el del agente: con el agente vivo el contacto
+  # recibe una respuesta real y no hay fallback que juzgar. [qa-force-agent-down]
+  # simula al agente caído (sólo números QA) — exactamente el escenario de Andrés,
+  # donde la promesa se repitió 17 veces porque el agente nunca resolvió.
+  echo "--- A2: segunda pregunta, con el agente caído y una promesa ya abierta ---"
+  local BASE_QA2; BASE_QA2="$(max_out_id "$QA")"
+  chk "A2 texto HTTP" "$(inject_text "$QA" "Oye y como va lo del reporte de comisiones [qa-force-agent-down]" "$NAME")" "200"
+  echo "  esperando 80 s…"
+  sleep 80
+  local R2; R2="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA2 ORDER BY id DESC LIMIT 1")"
+  echo "  respuesta: ${R2:-(ninguna)}"
+  chk_has "A2 reconoce el pendiente" "$R2" "pendientes con Alek"
+  chk_not "A2 no vuelve a prometer" "$R2" "te confirmo"
+  chk_has "A2 el ledger lo marca como promesa repetida" \
+      "$(psql_q "SELECT reason FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' ORDER BY id DESC LIMIT 1")" "promesa_repetida_suprimida"
+
+  echo "--- A3: 'Ok' del owner no merece respuesta ---"
+  local BASE_OK; BASE_OK="$(max_out_id "$OWNER")"
+  chk "A3 Ok HTTP" "$(inject_text "$OWNER" "Ok" "Alek")" "200"
+  sleep 8
+  chk "A3 cero ruido al owner" \
+      "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OK AND template_meta->>'label' IN ('ooa_owner_operator','brainv2_owner_operator_local')")" "0"
+
+  echo "--- A4: el alta llega en un mensaje, sin jerga ---"
+  local QB="${QA:0:12}$(( (${QA:12:1} + 3) % 10 ))"
+  local BASE_OWNER4; BASE_OWNER4="$(max_out_id "$OWNER")"
+  chk "A4 vCard" "$(inject_vcard "$OWNER" "Bruno Aliado BNI" "$QB")" "200"
+  sleep 9
+  local READ4; READ4="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER4 AND template_meta->>'label' LIKE 'owner_sequence_readout_%' ORDER BY id DESC LIMIT 1")"
+  echo "  readout: $(echo "$READ4" | head -3)"
+  chk_has "A4 el readout abre diciendo a quién capturó" "$READ4" "Capturé a"
+  chk_not "A4 sin encabezado interno"    "$READ4" "Readout IA360 persona-first"
+  chk_not "A4 sin jerga de flywheel"     "$READ4" "flywheel"
+  chk_not "A4 sin 'Bloqueo actual'"      "$READ4" "Bloqueo actual"
+  chk_has "A4 conserva lo que sí decide" "$READ4" "Borrador:"
+  chk "A4 ya no sale el aviso suelto de autosuggest" \
+      "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER4 AND template_meta->>'label' LIKE 'owner_vcard_autosuggest%'")" "0"
+
+  # OJO: el aviso sólo cuenta openers que SÍ salieron. Un opener 'failed' nunca
+  # llegó al contacto, así que no hay narrativa previa que contradecir — por eso
+  # el candidato se elige con el mismo filtro que usa producción.
+  echo "--- A5: contacto con opener previo → el readout avisa ---"
+  local PREV; PREV="$(psql_q "SELECT contact_number FROM coexistence.chat_history WHERE direction='outgoing' AND template_meta->>'label' LIKE 'ia360_seq_opener_%' AND contact_number ~ '^52199900[0-9]{5}\$' AND COALESCE(status,'') NOT IN ('failed','error') AND created_at < NOW() - INTERVAL '1 hour' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$PREV" ]; then
+    echo "  (sin contacto QA con opener previo: A5 omitido)"
+  else
+    local BASE_OWNER5; BASE_OWNER5="$(max_out_id "$OWNER")"
+    chk "A5 vCard del contacto con historia" "$(inject_vcard "$OWNER" "Contacto Con Historia" "$PREV")" "200"
+    sleep 9
+    local READ5; READ5="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER5 AND template_meta->>'label' LIKE 'owner_sequence_readout_%' ORDER BY id DESC LIMIT 1")"
+    echo "  aviso: $(echo "$READ5" | grep -i 'ya le escribimos' || echo '(ninguno)')"
+    chk_has "A5 el owner sabe que ya le escribimos" "$READ5" "ya le escribimos antes"
+  fi
+
+  echo "  labels de la corrida al owner: $(fresh_labels "$OWNER" "$BASE_OWNER")"
+  verdict "auditoria ($QA)"
+}
+
 
 # ───────────────────────────────────────────────────────────────────────────
 case "${1:-help}" in
@@ -807,6 +909,7 @@ case "${1:-help}" in
   diapazo-alta)   cmd_diapazo_alta "${2:?num_qa}" "${3:-}";;
   expansion-deal) cmd_expansion_deal "${2:?num_qa}" "${3:-}";;
   desenlaces)     cmd_desenlaces "${2:?num_qa}" "${3:-}";;
+  auditoria)      cmd_auditoria "${2:?num_qa}" "${3:-}";;
   alta-matrix)    cmd_alta_matrix "matrix" "${2:-}";;
   template-only)  cmd_template_only "${2:?num_qa}" "${3:?template_name}" "${4:?pipeline}" "${5:-}";;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
