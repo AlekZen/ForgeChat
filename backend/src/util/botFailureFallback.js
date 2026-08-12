@@ -16,13 +16,20 @@
 //
 // Función pura a propósito: webhook.js no es importable en test (exige DB/Redis),
 // y esta decisión de copy es justo lo que hay que blindar con aserciones reales.
+const { ia360MediaCaption } = require('./mediaCaption');
+
+// OJO con el copy (Alek, 12-ago-2026): PROHIBIDO decir «no puedo escuchar audios»
+// o «no puedo leer imágenes». Es falso — el sistema ya ve y oye (visión y
+// transcripción vía n8n, servicio mediaUnderstanding). Estos textos son la red de
+// seguridad para cuando la lectura FALLA en un intento concreto, y así deben
+// sonar: un tropiezo puntual, no una incapacidad.
 function buildIa360BotFailureFallback({ record, openCount = 0 } = {}) {
   const type = String(record?.message_type || '').toLowerCase();
 
   if (type === 'audio' || type === 'voice') {
     return {
-      body: 'Recibí tu audio. Todavía no puedo escuchar audios: ¿me escribes en una línea qué necesitas? Lo tomo de inmediato, o se lo paso a Alek tal cual.',
-      reason: 'media_audio_no_soportado',
+      body: 'Recibí tu audio pero no logré procesarlo esta vez. Ya quedó guardado y se lo paso a Alek; si es urgente, mándame la idea en una línea y lo atiendo de inmediato.',
+      reason: 'media_audio_lectura_fallida',
     };
   }
 
@@ -34,10 +41,22 @@ function buildIa360BotFailureFallback({ record, openCount = 0 } = {}) {
     };
   }
 
+  // Incidente Andrés 12-ago-2026: mandó una captura CON su petición escrita en el
+  // pie de foto y este fallback le contestó «no puedo leer imágenes, cuéntame en
+  // una línea qué necesitas» — pedirle que repita lo que acababa de escribir era
+  // justo su reclamo. Si hay pie de foto, la petición YA está: se acusa así.
+  const caption = ia360MediaCaption(record);
+  if (caption) {
+    return {
+      body: 'Leí lo que escribiste con la captura y ya quedó anotado; se lo paso a Alek para resolverlo. No necesito que lo repitas.',
+      reason: 'media_con_pie_de_foto',
+    };
+  }
+
   if (type === 'image' || type === 'video' || type === 'sticker') {
     return {
-      body: 'Recibí tu imagen. Aún no puedo leer imágenes: cuéntame en una línea qué muestra o qué necesitas y lo atiendo.',
-      reason: 'media_imagen_no_soportada',
+      body: 'Recibí tu imagen pero no logré procesarla esta vez. Ya quedó guardada y se la paso a Alek; si es urgente, dime en una línea qué muestra y lo atiendo de inmediato.',
+      reason: 'media_imagen_lectura_fallida',
     };
   }
 

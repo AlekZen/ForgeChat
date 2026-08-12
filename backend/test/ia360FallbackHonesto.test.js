@@ -16,20 +16,23 @@ const test = require('node:test');
 const { buildIa360BotFailureFallback } = require('../src/util/botFailureFallback');
 const { buildDigestBody } = require('../src/util/failuresDigestBody');
 const { detectIa360AgentPromise } = require('../src/util/agentPromise');
+const { ia360MediaCaption } = require('../src/util/mediaCaption');
 
-test('audio: dice la verdad (no puede escucharlo) y NO promete confirmación', () => {
+// El copy de respaldo NO puede afirmar una incapacidad: el sistema sí oye y sí ve
+// (mediaUnderstanding). Esto es lo que se dice cuando la lectura falla ese intento.
+test('audio: si la lectura falla, admite el tropiezo sin declararse incapaz', () => {
   const { body, reason } = buildIa360BotFailureFallback({
     record: { message_type: 'audio', message_body: 'Audio message' },
   });
-  assert.equal(reason, 'media_audio_no_soportado');
-  assert.match(body, /no puedo escuchar audios/i);
-  assert.match(body, /me escribes en una línea/i, 'debe pedir el formato que sí puede leer');
-  assert.doesNotMatch(body, /en breve/i, 'la promesa imposible es justo el defecto F1');
+  assert.equal(reason, 'media_audio_lectura_fallida');
+  assert.match(body, /no logré procesarlo esta vez/i);
+  assert.doesNotMatch(body, /no puedo (escuchar|oír)/i, 'es falso: el sistema transcribe');
+  assert.doesNotMatch(body, /en breve/i, 'la promesa imposible es el defecto F1');
 });
 
 test('voice se trata igual que audio', () => {
   const { reason } = buildIa360BotFailureFallback({ record: { message_type: 'voice' } });
-  assert.equal(reason, 'media_audio_no_soportado');
+  assert.equal(reason, 'media_audio_lectura_fallida');
 });
 
 test('documento: nombra el archivo recibido y lo escala al owner', () => {
@@ -51,10 +54,41 @@ test('documento sin nombre no imprime un hueco vacío', () => {
 test('imagen/video/sticker: reconoce el límite y pide el dato en texto', () => {
   for (const message_type of ['image', 'video', 'sticker']) {
     const { body, reason } = buildIa360BotFailureFallback({ record: { message_type } });
-    assert.equal(reason, 'media_imagen_no_soportada', `clase ${message_type}`);
-    assert.match(body, /no puedo leer imágenes/i);
+    assert.equal(reason, 'media_imagen_lectura_fallida', `clase ${message_type}`);
+    assert.match(body, /no logré procesarla/i);
     assert.doesNotMatch(body, /en breve/i);
   }
+});
+
+// Incidente Andrés, 12-ago-2026 17:41: mandó una CAPTURA con toda su petición en
+// el pie de foto («…he intentado cargar el plan piso desde el 22 de julio y me
+// señala un error, te lo he hecho saber compartiendo imagen y no me has podido
+// apoyar…») y el bot le contestó «cuéntame en una línea qué necesitas». Pedirle
+// que repita lo que acababa de escribir era exactamente su reclamo.
+const CAPTURA_ANDRES = {
+  message_type: 'image',
+  message_body: 'quedo bien el Mapa ejecutivo de sistemas, me gustaría ver cuál fue la última fecha de actualización y si ha presentado errores, yo he intentado cargar varias veces el tfs / plan piso desde el 22 de julio y me señala un error',
+};
+
+test('imagen CON pie de foto: nunca le pide repetir lo que ya escribió', () => {
+  const { body, reason } = buildIa360BotFailureFallback({ record: CAPTURA_ANDRES });
+  assert.equal(reason, 'media_con_pie_de_foto');
+  assert.doesNotMatch(body, /en una línea/i, 'es justo lo que le dijimos a Andrés y de lo que se quejaba');
+  assert.doesNotMatch(body, /qué muestra/i);
+  assert.match(body, /Leí lo que escribiste/i);
+});
+
+test('el pie de foto de la captura sí entra al carril conversacional', () => {
+  assert.equal(ia360MediaCaption(CAPTURA_ANDRES), CAPTURA_ANDRES.message_body);
+});
+
+test('una imagen suelta o con pie trivial NO se confunde con una petición', () => {
+  assert.equal(ia360MediaCaption({ message_type: 'image', message_body: '' }), null);
+  assert.equal(ia360MediaCaption({ message_type: 'image', message_body: 'mira' }), null);
+  assert.equal(ia360MediaCaption({ message_type: 'sticker', message_body: 'Sticker' }), null);
+  assert.equal(ia360MediaCaption({ message_type: 'audio', message_body: 'Audio message' }), null);
+  // Un documento trae el NOMBRE del archivo, no algo que el contacto escribió.
+  assert.equal(ia360MediaCaption({ message_type: 'document', message_body: 'Presupuesto_Gastos.xlsx' }), null);
 });
 
 test('texto sin promesas abiertas: la promesa se permite UNA vez', () => {
@@ -82,7 +116,7 @@ test('la clase manda sobre el conteo: un audio nunca cae en el copy de texto', (
     record: { message_type: 'audio' },
     openCount: 9,
   });
-  assert.equal(reason, 'media_audio_no_soportado');
+  assert.equal(reason, 'media_audio_lectura_fallida');
 });
 
 test('record vacío degrada al copy de texto en vez de reventar', () => {

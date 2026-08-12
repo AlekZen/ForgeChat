@@ -815,7 +815,7 @@ cmd_auditoria(){
   banner "AUDITORÍA — fallback honesto, digest, silencio y readout limpio — $QA" "forgechat_monolith_e2e"
   local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
 
-  echo "--- A1: audio de un cliente activo (el bot no puede escucharlo) ---"
+  echo "--- A1: audio de un cliente activo (el sistema lo escucha) ---"
   # El invariante no-silencio sólo vigila clientes activos/beta: se marca el QA
   # como tal para ejercer exactamente la rama que produjo el daño real.
   psql_q "INSERT INTO coexistence.contacts (wa_number, contact_number, name, custom_fields)
@@ -831,19 +831,27 @@ cmd_auditoria(){
   sleep 80
   local R1; R1="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA ORDER BY id DESC LIMIT 1")"
   echo "  respuesta: ${R1:-(ninguna)}"
-  chk_has "A1 dice la verdad sobre el audio" "$R1" "no puedo escuchar audios"
-  chk_has "A1 pide el dato en el formato que sí lee" "$R1" "una línea"
+  # Un audio ya NO cae al fallback: entra al carril conversacional y lo contesta el
+  # agente. Y pase lo que pase con la transcripción de un id de medio sintético, el
+  # bot NO puede declararse incapaz de oír: es falso (mediaUnderstanding transcribe).
+  chk "A1 el contacto recibió respuesta" "$([ -n "$R1" ] && echo si || echo no)" "si"
+  chk_not "A1 NO se declara incapaz de oír" "$R1" "no puedo escuchar"
   chk_not "A1 NO promete confirmación imposible" "$R1" "en breve"
-  chk_has "A1 el ledger guarda la causa real" \
-      "$(psql_q "SELECT reason FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' ORDER BY id DESC LIMIT 1")" "media_audio_no_soportado"
 
   # A2 mide el copy del FALLBACK, no el del agente: con el agente vivo el contacto
   # recibe una respuesta real y no hay fallback que juzgar. [qa-force-agent-down]
   # simula al agente caído (sólo números QA) — exactamente el escenario de Andrés,
-  # donde la promesa se repitió 17 veces porque el agente nunca resolvió.
-  echo "--- A2: segunda pregunta, con el agente caído y una promesa ya abierta ---"
+  # donde la promesa se repitió 17 veces porque el agente nunca resolvió. Hacen falta
+  # DOS mensajes: el primero crea la promesa, el segundo debe reconocerla sin volver
+  # a prometer.
+  echo "--- A2: agente caído dos veces seguidas (la promesa no se repite) ---"
+  chk "A2 primera pregunta HTTP" "$(inject_text "$QA" "Necesito el reporte de comisiones por sucursal [qa-force-agent-down]" "$NAME")" "200"
+  echo "  esperando 80 s (se crea la promesa)…"
+  sleep 80
+  chk_has "A2 la primera sí promete (una vez)" \
+      "$(psql_q "SELECT reason FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' ORDER BY id DESC LIMIT 1")" "texto_primera_promesa"
   local BASE_QA2; BASE_QA2="$(max_out_id "$QA")"
-  chk "A2 texto HTTP" "$(inject_text "$QA" "Oye y como va lo del reporte de comisiones [qa-force-agent-down]" "$NAME")" "200"
+  chk "A2 segunda pregunta HTTP" "$(inject_text "$QA" "Oye y como va lo del reporte de comisiones [qa-force-agent-down]" "$NAME")" "200"
   echo "  esperando 80 s…"
   sleep 80
   local R2; R2="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA2 ORDER BY id DESC LIMIT 1")"
@@ -906,6 +914,50 @@ cmd_auditoria(){
   sleep 12
   local TRAZA; TRAZA="$(docker logs "$BE" --since 60s 2>&1 | grep -c 'ia360-thread. hilo compartido' || true)"
   chk_has "A6 Alekito detecta que el hilo lo atiende otro agente" "traza=$TRAZA" "traza=1"
+
+  # A7 — CAPTURA CON PIE DE FOTO (incidente Andrés, 12-ago 17:41). Mandó una imagen
+  # con toda su petición escrita en el pie y el bot le contestó «no puedo leer
+  # imágenes: cuéntame en una línea qué necesitas» — pedirle que repitiera lo que
+  # acababa de escribir era literalmente su queja. Se reproduce su mensaje real.
+  echo "--- A7: captura con petición en el pie de foto ---"
+  local BASE_QA7; BASE_QA7="$(max_out_id "$QA")"
+  local CAP="quedo bien el Mapa ejecutivo de sistemas, me gustaria ver cual fue la ultima fecha de actualizacion y si ha presentado errores, he intentado cargar el plan piso desde el 22 de julio y me señala un error"
+  chk "A7 imagen con pie de foto HTTP" \
+      "$(post_webhook "$(_envelope "$QA" "$NAME" "{\"from\":\"$QA\",\"id\":\"$(wamid img)\",\"timestamp\":\"$(ts)\",\"type\":\"image\",\"image\":{\"id\":\"qa-img\",\"mime_type\":\"image/jpeg\",\"caption\":\"$CAP\"}}")")" "200"
+  echo "  esperando 85 s (agente + red de seguridad del invariante)…"
+  sleep 85
+  local R7; R7="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA7 ORDER BY id DESC LIMIT 1")"
+  echo "  respuesta: ${R7:-(ninguna)}"
+  chk_not "A7 NO le pide repetir lo que ya escribió" "$R7" "en una línea"
+  chk_not "A7 NO dice que no puede leer imágenes"    "$R7" "Aún no puedo leer imágenes"
+  chk "A7 el contacto sí recibió respuesta"          "$([ -n "$R7" ] && echo si || echo no)" "si"
+
+  # A8 — EL SISTEMA SÍ OYE Y SÍ VE (Alek, 12-ago). Decir «no puedo escuchar audios»
+  # era falso: la capacidad vive en n8n (visión + transcripción) y este servicio la
+  # cablea. Se ejerce el CAMINO REAL (mediaUnderstanding → n8n → columna
+  # media_lectura) sobre una nota de voz que un champion mandó de verdad y que nadie
+  # escuchó nunca. No se puede probar inyectando un webhook sintético: el id de medio
+  # falso no existe en Meta, el downloader marca la fila 'failed' y el inbound
+  # repetido se deduplica — se probaría el harness, no el sistema.
+  echo "--- A8: nota de voz real → el sistema la escucha ---"
+  local FILA8; FILA8="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='incoming' AND message_type IN ('audio','voice') AND media_status='stored' AND media_lectura IS NULL ORDER BY id DESC LIMIT 1")"
+  if [ -z "$FILA8" ]; then
+    echo "  (no hay notas de voz almacenadas sin leer: A8 omitido)"
+  else
+    local OUT8; OUT8="$(docker exec "$BE" node -e "
+      const pool=require('/app/src/db');
+      const {leerMedio}=require('/app/src/services/mediaUnderstanding');
+      (async()=>{
+        const {rows}=await pool.query(\"SELECT message_id, message_type, media_mime_type FROM coexistence.chat_history WHERE message_id=\\\$1\",['$FILA8']);
+        const r=await leerMedio({record:rows[0],contexto:'Champion de Camiones Selectos escribiendo a Alek'});
+        console.log(JSON.stringify({ok:r.ok,motivo:r.motivo||null,chars:(r.texto||'').length}));
+        process.exit(0);})();" 2>/dev/null | tail -1)"
+    echo "  lectura: $OUT8"
+    chk_has "A8 el audio se transcribió" "$OUT8" '"ok":true'
+    local GUARDADO; GUARDADO="$(psql_q "SELECT COALESCE(length(media_lectura),0) FROM coexistence.chat_history WHERE message_id='$FILA8'")"
+    chk "A8 la transcripción quedó guardada en la fila" "$([ "${GUARDADO:-0}" -gt 30 ] && echo si || echo no)" "si"
+    echo "  transcrito: $(psql_q "SELECT left(regexp_replace(media_lectura,'\s+',' ','g'),150) FROM coexistence.chat_history WHERE message_id='$FILA8'")"
+  fi
 
   echo "  labels de la corrida al owner: $(fresh_labels "$OWNER" "$BASE_OWNER")"
   verdict "auditoria ($QA)"

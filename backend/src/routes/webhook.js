@@ -16,6 +16,12 @@ const { buildFlowButtonComponents } = require('../util/templateFlow');
 const { buildIa360BotFailureFallback } = require('../util/botFailureFallback');
 // F4 (auditoría 2026-08-12): detector de promesas del agente para el ledger.
 const { detectIa360AgentPromise } = require('../util/agentPromise');
+// Incidente Andrés 12-ago-2026: una captura CON pie de foto es un mensaje de texto
+// que además trae imagen; el router la descartaba por no ser type=text.
+const { ia360MediaCaption } = require('../util/mediaCaption');
+// Lectura real de medios (visión y transcripción vía n8n): el bot dejó de decir
+// «no puedo leer imágenes / escuchar audios», que además era falso.
+const { leerMedio, componerMensajeConLectura, tipoDeLectura } = require('../services/mediaUnderstanding');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
@@ -617,11 +623,18 @@ async function loadIa360ThreadContext({ record }) {
   return ctx;
 }
 
-function buildIa360ConversationRoleHint({ contact, stageName, convState, memory, messageBody = '', threadContext = null }) {
+function buildIa360ConversationRoleHint({ contact, stageName, convState, memory, messageBody = '', threadContext = null, mediaCaption = null }) {
   const st = convState || loadIa360ConvState(contact);
   const profile = getIa360ContactProfile(contact);
   const parts = [];
   if (profile.name) parts.push(`hablas con ${profile.name}${profile.role ? ` (${profile.role})` : ''}${profile.accountName ? ` de ${profile.accountName}` : ''}`);
+
+  // Incidente Andrés: el contacto mandó una captura y ESCRIBIÓ su petición en el
+  // pie de foto. El modelo no ve la imagen, pero sí ese texto: prohibido pedirle
+  // que repita lo que ya escribió (fue justo su reclamo).
+  if (mediaCaption) {
+    parts.push('el contacto adjuntó una IMAGEN y lo que estás leyendo es su pie de foto: no puedes ver la imagen, pero SÍ tienes lo que escribió. Responde a eso. PROHIBIDO pedirle que te explique lo que ya escribió o que te lo mande "en una línea"; si de verdad necesitas un dato que solo se ve en la captura, pídele ESE dato puntual y nada más');
+  }
 
   // MULTI-AGENTE: si el hilo lo está atendiendo otro agente, el contacto le está
   // contestando A ÉL. Alekito sigue siendo la única voz (decisión de Alek), pero
@@ -8416,8 +8429,18 @@ async function handleIa360FreeText(record) {
   let responded = false;
   let dealFound = false;
   try {
-    if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return;
-    if (!record.message_body || !String(record.message_body).trim()) return;
+    // 12-ago-2026. Dos incidentes del mismo día, misma raíz: este gate sólo dejaba
+    // pasar `type === 'text'`.
+    //   · Andrés mandó una CAPTURA con su pedido escrito en el pie de foto y el bot
+    //     contestó «no puedo leer imágenes, cuéntame en una línea qué necesitas» —
+    //     justo lo que él estaba reclamando.
+    //   · Y el «no puedo» era falso: la capacidad existe (visión y transcripción
+    //     viven en n8n). Ahora el medio se LEE y el texto leído es el mensaje.
+    const mediaCaption = ia360MediaCaption(record);
+    const tipoMedio = tipoDeLectura(record.message_type);
+    if (!record || record.direction !== 'incoming'
+        || (record.message_type !== 'text' && !mediaCaption && !tipoMedio)) return;
+    if (!tipoMedio && (!record.message_body || !String(record.message_body).trim())) return;
     const preloadedContactContext = await loadIa360ContactContext(record).catch(() => null);
     let deal = await getActiveNonTerminalIa360Deal(record);
     if (!deal && isIa360ClienteActivoBetaContact(preloadedContactContext)) {
@@ -8426,6 +8449,20 @@ async function handleIa360FreeText(record) {
     if (!deal) return; // only inside an active IA360 funnel or explicit beta/champion context
     dealFound = true;
     const contactContext = deal.contact_context || preloadedContactContext || await loadIa360ContactContext(record).catch(() => null);
+    // LECTURA DEL MEDIO: se ve la imagen / se escucha el audio ANTES de responder, y
+    // el texto resultante pasa a ser el mensaje del contacto para todo lo que sigue
+    // (agente, ledger, historial). Si la lectura falla, se sigue con lo que haya:
+    // nunca bloquea la respuesta.
+    if (tipoMedio) {
+      const quien = ia360ContactDisplayName({ contact: contactContext, record, fallbackNumber: record.contact_number });
+      const lectura = await leerMedio({
+        record,
+        contexto: `${quien}${contactContext?.custom_fields?.persona_context ? `, ${contactContext.custom_fields.persona_context}` : ''}. Escribe por WhatsApp a Alek sobre su operación.`,
+      }).catch(e => { console.error('[media-lectura] excepción:', e.message); return { ok: false }; });
+      const mensajeConLectura = componerMensajeConLectura({ record, lectura });
+      if (mensajeConLectura) record.message_body = mensajeConLectura;
+      else if (!String(record.message_body || '').trim()) return; // nada que responder
+    }
     if (deal.memory_mode === 'cliente_activo_beta_supervisado' || isIa360ClienteActivoBetaContact(contactContext)) {
       // G-LIVE (P0 producción): cliente activo/beta SIEMPRE recibe respuesta real.
       // 1) Captura de memoria: aprendizaje en segundo plano REAL (fire-and-forget,
@@ -8493,7 +8530,7 @@ async function handleIa360FreeText(record) {
             stageName: deal.stage_name,
             roleHint: [
               buildIa360ClienteActivoBetaRoleHint(contactContext),
-              buildIa360ConversationRoleHint({ contact: contactContext, stageName: deal.stage_name, convState: betaConvState, memory: betaMemory, messageBody: record.message_body, threadContext: betaThread }),
+              buildIa360ConversationRoleHint({ contact: contactContext, stageName: deal.stage_name, convState: betaConvState, memory: betaMemory, messageBody: record.message_body, threadContext: betaThread, mediaCaption }),
             ].join(' | '),
             memory: betaMemory,
           });
@@ -8567,7 +8604,7 @@ async function handleIa360FreeText(record) {
     const agent = await callIa360Agent({
       record,
       stageName: deal.stage_name,
-      roleHint: buildIa360ConversationRoleHint({ contact: convContact, stageName: deal.stage_name, convState, memory: convMemory, messageBody: record.message_body, threadContext: convThread }),
+      roleHint: buildIa360ConversationRoleHint({ contact: convContact, stageName: deal.stage_name, convState, memory: convMemory, messageBody: record.message_body, threadContext: convThread, mediaCaption }),
       memory: convMemory,
     });
     if (!agent || !agent.reply) {
