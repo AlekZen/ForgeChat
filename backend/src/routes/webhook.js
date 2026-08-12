@@ -2725,7 +2725,9 @@ async function waitForIa360OutboundStatus(handlerFor, timeoutMs = 9000) {
   return last || { status: 'unknown' };
 }
 
-async function enqueueIa360Template({ record, label, templateName, templateId = null, vars = null, allowTextFallback = true, flowToken = null }) {
+// `waitForStatus:false` devuelve en cuanto el envío queda ENCOLADO, con
+// `handlerFor` para que el caller vigile el resultado sin bloquear (P8).
+async function enqueueIa360Template({ record, label, templateName, templateId = null, vars = null, allowTextFallback = true, flowToken = null, waitForStatus = true }) {
   const resolved = await resolveIa360Outbound(record, `:${label}`);
   if (resolved.duplicate || resolved.error) return { ok: false, status: resolved.duplicate ? 'duplicate' : 'error', error: resolved.error || null };
   const { account } = resolved;
@@ -2814,11 +2816,19 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
     localMessageId: localId,
     payload: { name: tpl.name, languageCode: tpl.language || 'es_MX', components },
   });
+  if (!waitForStatus) return { ok: true, status: 'queued', error: null, handlerFor };
   const status = await waitForIa360OutboundStatus(handlerFor);
+  // BUG 2026-08-12 (contacto real ElliotEsGenial): sólo 'sent' contaba como
+  // éxito, así que una entrega RÁPIDA de Meta ('delivered' antes de que
+  // expirara el poll) se reportaba como fallo — "no salió nada al contacto"
+  // cuando ya había salido. El owner reclasificó y volvió a aprobar: DOS
+  // openers distintos al mismo prospecto en 17 s. delivered/read son éxito.
+  const st = String(status?.status || '').toLowerCase();
   return {
-    ok: String(status?.status || '').toLowerCase() === 'sent',
+    ok: ['sent', 'delivered', 'read'].includes(st),
     status: status?.status || 'unknown',
     error: status?.error_message || null,
+    handlerFor,
   };
 }
 
@@ -5790,6 +5800,32 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     return;
   }
 
+  // ANTI DOBLE-OPENER (incidente 2026-08-12, contacto real): el dedupe de arriba
+  // sólo cubre la MISMA secuencia. Cuando el ack mintió ("no salió nada"), el
+  // owner reclasificó y aprobó OTRA secuencia: el prospecto recibió dos openers
+  // distintos en 17 segundos. Aquí se mira el hecho, no el estado: ¿ya salió
+  // algún opener a este contacto en las últimas 24 h sin fallar? Entonces no
+  // sale otro; se le dice al owner qué recibió y cuándo, y él decide.
+  const { rows: openerRows } = await pool.query(
+    `SELECT template_meta->>'label' AS label, status, created_at
+       FROM coexistence.chat_history
+      WHERE direction='outgoing'
+        AND contact_number=$1
+        AND (template_meta->>'label' LIKE 'ia360_seq_opener_%'
+             OR template_meta->>'label' = 'diapazo_sesion_invitacion'
+             OR template_meta->>'label' LIKE 'diapazo_sesion_flow_%')
+        AND status NOT IN ('failed','error')
+        AND created_at > NOW() - INTERVAL '24 hours'
+      ORDER BY id DESC
+      LIMIT 1`,
+    [targetContact]
+  ).catch(e => { console.error('[ia360-approve] opener dedupe check:', e.message); return { rows: [] }; });
+  if (openerRows.length) {
+    const previa = String(openerRows[0].label || '').replace('ia360_seq_opener_', '').replace(/^diapazo_sesion.*/, 'Sesión de Afinación Diapazo');
+    const hace = Math.max(1, Math.round((Date.now() - new Date(openerRows[0].created_at).getTime()) / 60000));
+    return deny('opener_ya_enviado', `${name} YA recibió un opener hace ${hace} min (secuencia «${previa}», estado ${openerRows[0].status}). No le mando un segundo mensaje distinto: se ve como spam. Si quieres cambiar el enfoque, escríbele tú o espera su respuesta.`);
+  }
+
   // GUARDIA cliente_expansion (D7): la secuencia presupone un proyecto andando.
   // Solo dispara si el contacto tiene un deal vivo (status='open') en P2 (IA360
   // WhatsApp Revenue Pipeline) o P7 (Champions). Sin deal vivo → bloquear con aviso.
@@ -5935,7 +5971,13 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     }
     // allowTextFallback:false — en frío un fallback a texto libre sería
     // rechazado por Meta y reportaría éxito falso (ver enqueueIa360Template).
-    const res = await enqueueIa360Template({ record: targetRecord, label: openerLabel, templateName: sequence.metaTemplateName, vars: templateVars, allowTextFallback: false });
+    // waitForStatus:false — P8 también aquí: el camino frío es el de TODO
+    // contacto nuevo, y era el que seguía bloqueando 9 s y reportando fallos
+    // falsos sobre mensajes ya entregados.
+    const res = await enqueueIa360Template({ record: targetRecord, label: openerLabel, templateName: sequence.metaTemplateName, vars: templateVars, allowTextFallback: false, waitForStatus: false });
+    if (res.ok && res.handlerFor) {
+      scheduleIa360OutboundFailureWatch({ record, targetContact, name, handlerFor: res.handlerFor, sequenceLabel: sequence.label });
+    }
     sendResult = { ok: res.ok, status: res.status, error: res.error || null, message_id: null };
   } else {
     return deny('outside_window_no_template', `${name} está fuera de la ventana de 24h y la secuencia ${sequence.id} no tiene template aprobado por Meta. No envié nada.`);
