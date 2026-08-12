@@ -10010,15 +10010,21 @@ async function handleIa360LiteInteractive(record) {
   if (replyId && replyId.startsWith('seq_')) {
     if (await handleIa360SequenceReply({ record, replyId })) return;
   } else if (replyId || answer) {
+    // Los quick-reply de un TEMPLATE llegan sin id estable: Meta manda el TÍTULO
+    // visible ("Todo va bien"). El resolver empata ese título contra las opciones
+    // del opener que ESE contacto recibió, y sólo si no hay match usa los sets
+    // semánticos. Se le pregunta SIEMPRE: gatearlo por los sets dejaba muerto el
+    // match por título y un botón legítimo caía al acuse genérico —le pasó a un
+    // contacto real el 12-ago-2026 con «Todo va bien», que sí tiene paso 2 en el
+    // catálogo. El resolver ya se auto-gatea (devuelve null si el opener de ese
+    // contacto no salió o si nada empata).
     const aliasKey = String(replyId || answer || '').trim().toLowerCase();
-    if (IA360_SEQ_ALIAS_NEGATIVE.has(aliasKey) || IA360_SEQ_ALIAS_HANDOFF.has(aliasKey) || IA360_SEQ_ALIAS_AFFIRMATIVE.has(aliasKey)) {
-      try {
-        const aliasContact = await loadIa360ContactContext(record).catch(() => null);
-        const aliased = resolveIa360TemplateButtonAlias({ replyId: aliasKey, contact: aliasContact });
-        if (aliased && await handleIa360SequenceReply({ record, replyId: aliased, contact: aliasContact })) return;
-      } catch (aliasErr) {
-        console.error('[ia360-seq] alias error:', aliasErr.message);
-      }
+    try {
+      const aliasContact = await loadIa360ContactContext(record).catch(() => null);
+      const aliased = resolveIa360TemplateButtonAlias({ replyId: aliasKey, contact: aliasContact });
+      if (aliased && await handleIa360SequenceReply({ record, replyId: aliased, contact: aliasContact })) return;
+    } catch (aliasErr) {
+      console.error('[ia360-seq] alias error:', aliasErr.message);
     }
   }
 

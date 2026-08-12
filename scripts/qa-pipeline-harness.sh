@@ -740,15 +740,21 @@ cmd_alta_matrix(){
       sleep 7
       RESP="$(psql_q "SELECT CASE WHEN respondido_en IS NULL THEN 'SESION NO CERRÓ' ELSE 'OK' END FROM coexistence.diapazo_sesion_enviada WHERE flow_token='$TOKEN'")"
     else
-      # id real del primer botón del opener, leído del catálogo que corre en prod.
+      # TÍTULO real del primer botón del opener, leído del catálogo que corre en
+      # prod. Se responde por TÍTULO y no por id estable a propósito: así es como
+      # llega un quick-reply de TEMPLATE desde Meta. Tocar el id (lo que hacía este
+      # harness) probaba un camino que la realidad no usa — por eso el 12-ago un
+      # contacto real tocó «Todo va bien» y recibió un acuse genérico con la suite
+      # en verde.
       local OPT; OPT="$(docker exec "$BE" node -e "
 const s=require('fs').readFileSync('/app/src/routes/webhook.js','utf8');
-const m=s.match(new RegExp('seq_'+process.argv[1]+':[a-z_]+'));
-process.stdout.write(m?m[0]:'');" "$SEQ" 2>/dev/null)"
+const i=s.indexOf(\"id: '\"+process.argv[1]+\"',\");
+const m=i<0?null:s.slice(i, i+4000).match(/title: '([^']+)'/);
+process.stdout.write(m?m[1]:'');" "$SEQ" 2>/dev/null)"
       if [ -z "$OPT" ]; then
         RESP="SIN OPCIONES DE OPENER"
       else
-        inject_button "$QA" "$OPT" "Respuesta QA" "QA Alta $i" >/dev/null
+        inject_tpl_button "$QA" "$OPT" "QA Alta $i" >/dev/null
         sleep 7
         local L; L="$(fresh_labels "$QA" "$BASE_QA2")"
         # OK = el contacto recibió el PASO 2 real de la secuencia. El acuse
