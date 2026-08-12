@@ -123,6 +123,20 @@ inject_list(){ # $1=from $2=row_id $3=context_msg_id $4=title $5=profile
 inject_vcard(){ # $1=from(owner) $2=nombre $3=numero
   post_webhook "$(_envelope "$1" "Alek" "{\"from\":\"$1\",\"id\":\"$(wamid vcard)\",\"timestamp\":\"$(ts)\",\"type\":\"contacts\",\"contacts\":[{\"name\":{\"formatted_name\":\"$2\",\"first_name\":\"$2\"},\"phones\":[{\"phone\":\"+$3\",\"wa_id\":\"$3\",\"type\":\"CELL\"}]}]}")"
 }
+# HOYO DE QA CERRADO (incidente 2026-08-12): el corte sandbox de sendQueue marca
+# la fila como 'sent' y Meta nunca manda su webhook de estado, así que ninguna
+# corrida ejercitaba jamás `delivered`, `read` ni `failed`. Un bug que sólo
+# aparecía con entrega rápida (delivered) llegó a un contacto real sin que el
+# harness pudiera verlo. Este inyector reproduce esos webhooks tal como los manda
+# Meta, incluido el bloque `errors` de los fallos.
+inject_status(){ # $1=wamid $2=status(sent|delivered|read|failed) $3=recipient $4=error_title(opcional)
+  local errs=""
+  [ -n "${4:-}" ] && errs=",\"errors\":[{\"code\":131049,\"title\":\"$4\",\"message\":\"$4\"}]"
+  post_webhook "$(printf '{"object":"whatsapp_business_account","entry":[{"id":"qa-harness","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"%s","phone_number_id":"%s"},"statuses":[{"id":"%s","status":"%s","timestamp":"%s","recipient_id":"%s"%s}]}}]}]}' "$WA" "$PID_NUM" "$1" "$2" "$(ts)" "$3" "$errs")"
+}
+last_out_wamid(){ # $1=contacto -> wamid real de su última saliente
+  psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$1' ORDER BY id DESC LIMIT 1"
+}
 inject_nfm(){ # $1=from $2=response_json (JSON plano, se serializa como STRING igual que Meta) $3=profile
   # Meta manda response_json como CADENA dentro del JSON del mensaje. Construir eso a
   # mano en bash es una fuente de escapes rotos: lo arma node y se firma igual que el resto.
@@ -551,6 +565,83 @@ cmd_expansion_deal(){
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# DESENLACES DE ENVÍO — lo que el sandbox nunca ejercitaba y por eso se escapó a
+# producción. Dos casos, los dos con webhooks de estado reales de Meta:
+#
+#   A) ENTREGA RÁPIDA (delivered): el contacto recibió. El owner NO debe recibir
+#      ningún aviso de fallo, y un segundo opener distinto debe quedar bloqueado.
+#   B) FALLO REAL (failed): el contacto NO recibió. El owner SÍ debe enterarse,
+#      por el vigilante de 30 s.
+cmd_desenlaces(){
+  local QA="$1" NAME="${2:-Ramiro Prueba}"; guard_qa "$QA"
+  banner "DESENLACES DE ENVÍO — delivered no es fallo; failed sí avisa — $QA" "forgechat_monolith_e2e"
+  local BASE_OWNER; BASE_OWNER="$(max_out_id "$OWNER")"
+  local BASE_QA; BASE_QA="$(max_out_id "$QA")"
+
+  echo "--- S1: alta hasta la tarjeta de aprobación ---"
+  chk "S1 vCard" "$(inject_vcard "$OWNER" "$NAME" "$QA")" "200"
+  sleep 7
+  local CARD; CARD="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label'='owner_vcard_captured_$QA' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$CARD" ]; then bad "S1 tarjeta de clasificación" "(vacío)" "message_id"; verdict "desenlaces"; return; fi
+  chk "S1 clasificar" "$(inject_list "$OWNER" "owner_pipe:$QA:persona_beta" "$CARD" "Beta" "Alek")" "200"
+  sleep 8
+  local APR; APR="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER AND template_meta->>'label' LIKE 'owner_approve_card_${QA}_%' ORDER BY id DESC LIMIT 1")"
+  local SEQ; SEQ="$(psql_q "SELECT substring(template_meta->>'label' from '^owner_approve_card_${QA}_(.*)\$') FROM coexistence.chat_history WHERE message_id='$APR'")"
+  if [ -z "$APR" ]; then bad "S1 tarjeta de aprobación" "(vacío)" "message_id"; verdict "desenlaces"; return; fi
+  ok "S1 tarjeta de aprobación (secuencia=$SEQ)"
+
+  echo "--- S2 (caso A): aprobar → Meta entrega RÁPIDO (delivered) ---"
+  local BASE_OWNER2; BASE_OWNER2="$(max_out_id "$OWNER")"
+  chk "S2 aprobar" "$(inject_list "$OWNER" "owner_approve_send:$QA:$SEQ" "$APR" "Aprobar y enviar" "Alek")" "200"
+  sleep 8
+  local WAMID; WAMID="$(last_out_wamid "$QA")"
+  chk "S2 delivered aceptado" "$(inject_status "$WAMID" "delivered" "$QA")" "200"
+  sleep 3
+  chk "S2 la fila quedó delivered" "$(psql_q "SELECT status FROM coexistence.chat_history WHERE message_id='$WAMID'")" "delivered"
+  # El ack correcto salió y NINGÚN aviso de fallo lo contradice.
+  chk_has "S2 ack honesto al owner" "$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER2 AND template_meta->>'label'='owner_approve_send_done' ORDER BY id DESC LIMIT 1")" "Enviando el opener"
+  echo "  esperando 35 s al vigilante de fallo (no debe decir nada)…"
+  sleep 35
+  chk "S2 CERO avisos de fallo sobre un mensaje entregado" \
+      "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER2 AND template_meta->>'label' LIKE 'owner_approve_send_failed%'")" "0"
+
+  echo "--- S3: reclasificar y volver a aprobar → NO puede salir un segundo opener ---"
+  chk "S3 Cambiar" "$(inject_button "$OWNER" "owner_vcard_change:$QA" "Cambiar" "Alek")" "200"
+  sleep 7
+  local CARD2; CARD2="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_vcard_captured_$QA' ORDER BY id DESC LIMIT 1")"
+  chk "S3 otra clasificación" "$(inject_list "$OWNER" "owner_pipe:$QA:persona_referido" "$CARD2" "Referido" "Alek")" "200"
+  sleep 8
+  local APR2; APR2="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label' LIKE 'owner_approve_card_${QA}_%' ORDER BY id DESC LIMIT 1")"
+  local SEQ2; SEQ2="$(psql_q "SELECT substring(template_meta->>'label' from '^owner_approve_card_${QA}_(.*)\$') FROM coexistence.chat_history WHERE message_id='$APR2'")"
+  local ANTES; ANTES="$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA")"
+  chk "S3 aprobar la segunda" "$(inject_list "$OWNER" "owner_approve_send:$QA:$SEQ2" "$APR2" "Aprobar y enviar" "Alek")" "200"
+  sleep 8
+  chk "S3 el contacto NO recibió un segundo mensaje" \
+      "$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA")" "$ANTES"
+  chk_has "S3 el owner sabe por qué" \
+      "$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' ORDER BY id DESC LIMIT 1")" "YA recibió un opener"
+
+  echo "--- S4 (caso B): un envío que SÍ falla debe avisar ---"
+  local QAB="${QA:0:12}$(( (${QA:12:1} + 5) % 10 ))"
+  local BASE_OWNER3; BASE_OWNER3="$(max_out_id "$OWNER")"
+  inject_vcard "$OWNER" "Fabiola Prueba" "$QAB" >/dev/null; sleep 7
+  local CARDB; CARDB="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_vcard_captured_$QAB' ORDER BY id DESC LIMIT 1")"
+  inject_list "$OWNER" "owner_pipe:$QAB:persona_beta" "$CARDB" "Beta" "Alek" >/dev/null; sleep 8
+  local APRB; APRB="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label' LIKE 'owner_approve_card_${QAB}_%' ORDER BY id DESC LIMIT 1")"
+  local SEQB; SEQB="$(psql_q "SELECT substring(template_meta->>'label' from '^owner_approve_card_${QAB}_(.*)\$') FROM coexistence.chat_history WHERE message_id='$APRB'")"
+  if [ -z "$APRB" ]; then bad "S4 tarjeta de aprobación" "(vacío)" "message_id"; verdict "desenlaces"; return; fi
+  inject_list "$OWNER" "owner_approve_send:$QAB:$SEQB" "$APRB" "Aprobar y enviar" "Alek" >/dev/null; sleep 8
+  local WAMIDB; WAMIDB="$(last_out_wamid "$QAB")"
+  chk "S4 failed aceptado" "$(inject_status "$WAMIDB" "failed" "$QAB" "Re-engagement message")" "200"
+  echo "  esperando 35 s al vigilante…"
+  sleep 35
+  local AVISO; AVISO="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND id>$BASE_OWNER3 AND template_meta->>'label' LIKE 'owner_approve_send_failed%' ORDER BY id DESC LIMIT 1")"
+  echo "  aviso: ${AVISO:-(ninguno)}"
+  chk_has "S4 el owner SÍ se entera del fallo real" "$AVISO" "NO salió"
+  verdict "desenlaces ($QA)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # MATRIZ DE ALTA — corre el camino de DEMO completo para CADA clasificación del
 # catálogo y dice cuál sirve y cuál se rompe. Es la respuesta a "que no me deje
 # en ridículo cuando se lo enseñe a alguien": el mismo camino que haría Alek
@@ -715,6 +806,7 @@ case "${1:-help}" in
   cold-send)      cmd_cold_send "${2:?num_qa}" "${3:?persona}" "${4:?seq_id}" "${5:-}";;
   diapazo-alta)   cmd_diapazo_alta "${2:?num_qa}" "${3:-}";;
   expansion-deal) cmd_expansion_deal "${2:?num_qa}" "${3:-}";;
+  desenlaces)     cmd_desenlaces "${2:?num_qa}" "${3:-}";;
   alta-matrix)    cmd_alta_matrix "matrix" "${2:-}";;
   template-only)  cmd_template_only "${2:?num_qa}" "${3:?template_name}" "${4:?pipeline}" "${5:-}";;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
