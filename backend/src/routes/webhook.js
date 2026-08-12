@@ -551,11 +551,94 @@ function ia360StageMode(stageName) {
     ? 'proponer' : 'excavar';
 }
 
-function buildIa360ConversationRoleHint({ contact, stageName, convState, memory, messageBody = '' }) {
+// ── MULTI-AGENTE (12-ago-2026) ───────────────────────────────────────────────
+// ForgeChat dejó de ser el único que le escribe a estos contactos: agentes de
+// código de otros repos (Camiones Selectos, Hermes) mandan avisos a los MISMOS
+// usuarios por este WhatsApp, y el usuario contesta. Incidente que lo obligó:
+// 12-ago 16:32, Juan Carlos le respondió al agente de Camiones Selectos y Alekito
+// contestó 23 s después prometiendo borrar un registro en un sistema al que no
+// tiene acceso. La decisión de Alek NO es callar a Alekito —es que Alekito se
+// entere—: una sola voz de cara al usuario, con el contexto de lo que hicieron
+// los demás. Esto carga ese contexto desde la única fuente que ya comparten
+// todos: la base de datos (chat_history + el ledger de promesas).
+async function loadIa360ThreadContext({ record }) {
+  const ctx = { otroAgente: null, promesas: [] };
+  if (!record?.contact_number) return ctx;
+  try {
+    // ¿El último saliente del hilo lo mandó alguien que NO es Alekito? Si sí, lo
+    // que el contacto está contestando es ESO, no a nosotros.
+    const { rows } = await pool.query(
+      `SELECT message_body,
+              EXTRACT(EPOCH FROM (NOW() - created_at))/60 AS minutos,
+              CASE WHEN template_meta->>'label' LIKE 'ia360%'
+                     OR template_meta->>'source' LIKE 'webhook%' THEN 'alekito'
+                   ELSE 'otro_agente' END AS autor
+         FROM coexistence.chat_history
+        WHERE direction = 'outgoing'
+          AND contact_number = $1
+          AND COALESCE(status, '') NOT IN ('failed', 'error')
+          AND created_at > NOW() - INTERVAL '24 hours'
+        ORDER BY id DESC
+        LIMIT 1`,
+      [record.contact_number]
+    );
+    if (rows.length && rows[0].autor === 'otro_agente') {
+      ctx.otroAgente = {
+        texto: String(rows[0].message_body || '').replace(/\s+/g, ' ').slice(0, 300),
+        minutos: Math.max(1, Math.round(Number(rows[0].minutos) || 1)),
+      };
+      console.log('[ia360-thread] hilo compartido: otro agente escribió hace %d min a %s',
+        ctx.otroAgente.minutos, maskIa360Number(record.contact_number));
+    }
+  } catch (e) {
+    console.error('[ia360-thread] último autor:', e.message);
+  }
+  try {
+    // Lo que YA se le prometió a este contacto y sigue sin cerrarse, con su folio
+    // de Plane cuando el puente ya lo subió. Sin esto el agente vuelve a prometer
+    // lo mismo como si fuera nuevo.
+    const { rows } = await pool.query(
+      `SELECT contact_message, plane_issue_key,
+              GREATEST(0, EXTRACT(DAY FROM (NOW() - created_at))::int) AS dias
+         FROM coexistence.ia360_bot_failures
+        WHERE contact_number = $1 AND status = 'abierto'
+        ORDER BY id DESC
+        LIMIT 3`,
+      [record.contact_number]
+    );
+    ctx.promesas = rows.map(r => ({
+      texto: String(r.contact_message || '').replace(/\s+/g, ' ').slice(0, 120),
+      dias: r.dias,
+      plane: r.plane_issue_key || null,
+    }));
+  } catch (e) {
+    console.error('[ia360-thread] promesas abiertas:', e.message);
+  }
+  return ctx;
+}
+
+function buildIa360ConversationRoleHint({ contact, stageName, convState, memory, messageBody = '', threadContext = null }) {
   const st = convState || loadIa360ConvState(contact);
   const profile = getIa360ContactProfile(contact);
   const parts = [];
   if (profile.name) parts.push(`hablas con ${profile.name}${profile.role ? ` (${profile.role})` : ''}${profile.accountName ? ` de ${profile.accountName}` : ''}`);
+
+  // MULTI-AGENTE: si el hilo lo está atendiendo otro agente, el contacto le está
+  // contestando A ÉL. Alekito sigue siendo la única voz (decisión de Alek), pero
+  // con dos límites: no pisar lo que el otro ya dijo y no prometer ejecución en
+  // sistemas ajenos. El daño real que esto evita: «Tomo "Apoyo por venta de 3
+  // buses" como el registro a eliminar… te confirmo en cuanto quede» — Alekito no
+  // puede borrar nada en la plataforma de Camiones Selectos.
+  if (threadContext?.otroAgente) {
+    parts.push(`ATENCIÓN — hace ${threadContext.otroAgente.minutos} min OTRO agente del equipo (de otro sistema, con acceso a plataformas que tú NO tienes) le escribió a este contacto: «${threadContext.otroAgente.texto}». Lo que el contacto acaba de mandar probablemente responde A ESO`);
+    parts.push('REGLA DURA con hilo compartido: PROHIBIDO decir que TÚ vas a ejecutar, borrar, corregir, configurar o dar de alta algo en esas plataformas, y PROHIBIDO decir "te confirmo cuando quede". Lo que SÍ haces: confirmar que entendiste con el dato textual (folio, nombre del registro, monto), decir que queda registrado para el equipo que sí puede ejecutarlo, y responder lo que sí sabes de tu propio alcance');
+  }
+  if (threadContext?.promesas?.length) {
+    const pend = threadContext.promesas
+      .map(p => `«${p.texto}» (hace ${p.dias} d${p.plane ? `, va como ${p.plane}` : ''})`)
+      .join('; ');
+    parts.push(`YA le debemos respuesta sobre: ${pend} — no lo vuelvas a prometer como si fuera nuevo; si pregunta, dile en qué va con ese folio`);
+  }
 
   // G7-CONGRUENCIA: el perfil ya se computaba (getIa360ContactProfile) pero solo
   // viajaban name/role/accountName. Persona, etapa, área y el entregable pendiente
@@ -3092,15 +3175,26 @@ async function shadowIa360ContactIntelligence({ record, stageName, history }) {
 }
 
 async function callIa360Agent({ record, stageName, roleHint = null, memory = null }) {
-  // Recent conversation for context (last 8 messages).
+  // Conversación reciente (últimos 8 mensajes) CON AUTORÍA. Hasta 12-ago-2026 el
+  // historial iba como {dir, body}: todo lo saliente parecía dicho por Alekito.
+  // Ya no es cierto — a estos mismos contactos les escriben otros agentes de
+  // código (el de Camiones Selectos, Hermes) desde otros repos. Sin autoría el
+  // agente creía haber dicho cosas que no dijo y contestaba encima del otro.
   const { rows: hist } = await pool.query(
-    `SELECT direction AS dir, message_body AS body
+    `SELECT direction AS dir,
+            message_body AS body,
+            CASE
+              WHEN direction = 'incoming' THEN 'contacto'
+              WHEN template_meta->>'label' LIKE 'ia360%'
+                OR template_meta->>'source' LIKE 'webhook%' THEN 'alekito'
+              ELSE 'otro_agente'
+            END AS autor
        FROM coexistence.chat_history
       WHERE wa_number = $1 AND contact_number = $2
       ORDER BY timestamp DESC LIMIT 8`,
     [record.wa_number, record.contact_number]
   );
-  const history = hist.reverse().map(h => ({ dir: h.dir, body: h.body }));
+  const history = hist.reverse().map(h => ({ dir: h.dir, body: h.body, autor: h.autor }));
 
   // EXPEDIENTE: memoria por contacto (facts+events) para que el agente responda
   // con contexto real del negocio del contacto, no en frio. Best-effort.
@@ -8390,6 +8484,8 @@ async function handleIa360FreeText(record) {
       } catch (e) {
         console.error('[ia360-agent] beta memory lookup failed:', e.message);
       }
+      // MULTI-AGENTE: qué le dijo otro agente y qué le debemos ya.
+      const betaThread = await loadIa360ThreadContext({ record });
       const agentBeta = qaForceDown
         ? null
         : await callIa360Agent({
@@ -8397,7 +8493,7 @@ async function handleIa360FreeText(record) {
             stageName: deal.stage_name,
             roleHint: [
               buildIa360ClienteActivoBetaRoleHint(contactContext),
-              buildIa360ConversationRoleHint({ contact: contactContext, stageName: deal.stage_name, convState: betaConvState, memory: betaMemory, messageBody: record.message_body }),
+              buildIa360ConversationRoleHint({ contact: contactContext, stageName: deal.stage_name, convState: betaConvState, memory: betaMemory, messageBody: record.message_body, threadContext: betaThread }),
             ].join(' | '),
             memory: betaMemory,
           });
@@ -8466,10 +8562,12 @@ async function handleIa360FreeText(record) {
     } catch (e) {
       console.error('[ia360-agent] conv memory lookup failed:', e.message);
     }
+    // MULTI-AGENTE: qué le dijo otro agente y qué le debemos ya.
+    const convThread = await loadIa360ThreadContext({ record });
     const agent = await callIa360Agent({
       record,
       stageName: deal.stage_name,
-      roleHint: buildIa360ConversationRoleHint({ contact: convContact, stageName: deal.stage_name, convState, memory: convMemory, messageBody: record.message_body }),
+      roleHint: buildIa360ConversationRoleHint({ contact: convContact, stageName: deal.stage_name, convState, memory: convMemory, messageBody: record.message_body, threadContext: convThread }),
       memory: convMemory,
     });
     if (!agent || !agent.reply) {

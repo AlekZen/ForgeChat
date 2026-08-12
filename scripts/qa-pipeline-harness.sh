@@ -891,6 +891,22 @@ cmd_auditoria(){
     chk_has "A5 el owner sabe que ya le escribimos" "$READ5" "ya le escribimos antes"
   fi
 
+  # A6 — HILO COMPARTIDO (12-ago-2026). Otros agentes de código ya le escriben a
+  # los mismos usuarios por este WhatsApp. Se simula un saliente SIN label (así se
+  # ven los de otros agentes en chat_history), el contacto contesta a ESO, y se
+  # comprueba que Alekito cargó el contexto en vez de creer que hablaba solo.
+  echo "--- A6: otro agente en el hilo → Alekito se entera ---"
+  psql_q "INSERT INTO coexistence.chat_history
+            (message_id, wa_number, contact_number, direction, message_type, message_body, status, timestamp, template_meta)
+          VALUES ('wamid.otroagente.$RANDOM.$(ts)','$WA','$QA','outgoing','text',
+                  'Ya quedó arriba el panel que pediste; dime si te sirve así.','sent',NOW(), NULL)" >/dev/null
+  # (ventana relativa: `--since` con timestamp absoluto lo interpreta docker en su
+  # propia zona y se comía la traza aunque estuviera en el log)
+  chk "A6 el contacto responde a ese mensaje" "$(inject_text "$QA" "sí me sirve, pero el total no cuadra con lo que veo en el ERP" "$NAME")" "200"
+  sleep 12
+  local TRAZA; TRAZA="$(docker logs "$BE" --since 60s 2>&1 | grep -c 'ia360-thread. hilo compartido' || true)"
+  chk_has "A6 Alekito detecta que el hilo lo atiende otro agente" "traza=$TRAZA" "traza=1"
+
   echo "  labels de la corrida al owner: $(fresh_labels "$OWNER" "$BASE_OWNER")"
   verdict "auditoria ($QA)"
 }
