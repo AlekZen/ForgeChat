@@ -36,7 +36,9 @@ const TIMEOUT_MS = parseInt(process.env.IA360_MEDIA_READ_TIMEOUT_MS || '', 10) |
 // 8 MB el viaje deja de valer la pena y se degrada al aviso honesto.
 const MAX_BYTES = parseInt(process.env.IA360_MEDIA_READ_MAX_BYTES || '', 10) || 8 * 1024 * 1024;
 
-const TIPO_POR_MENSAJE = { image: 'imagen', video: 'imagen', audio: 'audio', voice: 'audio' };
+// `document` no viaja a n8n: lo parsea documentUnderstanding.js en local. Aparece
+// aquí porque este mapa es el que decide qué tipos llegan al agente con lectura.
+const TIPO_POR_MENSAJE = { image: 'imagen', video: 'imagen', audio: 'audio', voice: 'audio', document: 'documento' };
 
 function tipoDeLectura(messageType) {
   return TIPO_POR_MENSAJE[String(messageType || '').toLowerCase()] || null;
@@ -61,7 +63,8 @@ async function esperarArchivo(messageId, intentos = 8, esperaMs = 1500) {
 
 async function leerMedio({ record, contexto = '' }) {
   const tipo = tipoDeLectura(record?.message_type);
-  if (!tipo || !record?.message_id) return { ok: false, motivo: 'tipo_no_leible' };
+  // Los documentos no viajan a n8n: los parsea documentUnderstanding.leerDocumento.
+  if (!tipo || tipo === 'documento' || !record?.message_id) return { ok: false, motivo: 'tipo_no_leible' };
 
   const fila = await esperarArchivo(record.message_id).catch(() => null);
   if (!fila) return { ok: false, motivo: 'archivo_no_disponible' };
@@ -142,6 +145,12 @@ function componerMensajeConLectura({ record, lectura }) {
   const partes = [];
   if (escrito && !esPlaceholder) partes.push(escrito);
   if (lectura?.ok && lectura.texto) {
+    // Para un documento, message_body es el NOMBRE del archivo (no algo que el
+    // contacto escribió): va dentro del encabezado, no como texto suelto, o el
+    // mensaje saldría con el nombre repetido.
+    if (lectura.tipo === 'documento') {
+      return `[contenido del archivo «${escrito || 'sin nombre'}»] ${lectura.texto}`;
+    }
     partes.push(lectura.tipo === 'audio'
       ? `[transcripción de su nota de voz] ${lectura.texto}`
       : `[lo que se ve en la imagen que mandó] ${lectura.texto}`);
@@ -149,4 +158,4 @@ function componerMensajeConLectura({ record, lectura }) {
   return partes.join('\n\n');
 }
 
-module.exports = { leerMedio, componerMensajeConLectura, tipoDeLectura };
+module.exports = { leerMedio, componerMensajeConLectura, tipoDeLectura, esperarArchivo };

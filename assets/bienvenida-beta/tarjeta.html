@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- Tarjeta de bienvenida para usuarios beta / aliados BNI.
+     Se renderiza a PNG con Chromium headless (scripts/render-tarjeta.js) en vez de
+     generarla con IA: la tarjeta lleva TEXTO y un modelo de imagen lo deforma.
+     Editable: los datos del destinatario entran por querystring (?nombre=&empresa=). -->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    width:1080px; height:1080px;
+    font-family:'Inter',-apple-system,system-ui,sans-serif;
+    background:#0B1020;
+    color:#F5F7FF;
+    display:flex; flex-direction:column;
+    position:relative; overflow:hidden;
+  }
+  /* Halo de marca: dos focos fríos en diagonal, nada de degradados de plantilla. */
+  body::before {
+    content:''; position:absolute; width:900px; height:900px; border-radius:50%;
+    background:radial-gradient(circle, rgba(56,189,248,.28) 0%, transparent 62%);
+    top:-320px; right:-280px;
+  }
+  body::after {
+    content:''; position:absolute; width:820px; height:820px; border-radius:50%;
+    background:radial-gradient(circle, rgba(129,90,255,.22) 0%, transparent 64%);
+    bottom:-340px; left:-260px;
+  }
+  .marco { position:relative; z-index:2; padding:88px 90px; display:flex; flex-direction:column; height:100%; }
+  .top { display:flex; align-items:center; gap:16px; }
+  .punto { width:14px; height:14px; border-radius:50%; background:#38BDF8; box-shadow:0 0 22px #38BDF8; }
+  .marca { font-size:23px; font-weight:600; letter-spacing:.24em; text-transform:uppercase; color:#9FB3D9; }
+  .centro { flex:1; display:flex; flex-direction:column; justify-content:center; }
+  .saluda { font-size:31px; font-weight:400; color:#9FB3D9; margin-bottom:14px; }
+  .nombre { font-size:96px; font-weight:800; line-height:1.02; letter-spacing:-.03em; }
+  .empresa { font-size:34px; font-weight:400; color:#7EA0D4; margin-top:20px; }
+  .linea { width:96px; height:5px; background:#38BDF8; border-radius:3px; margin:44px 0 40px; }
+  .rol { font-size:44px; font-weight:600; line-height:1.34; max-width:830px; }
+  .rol b { color:#38BDF8; font-weight:800; }
+  .pie { display:flex; justify-content:space-between; align-items:flex-end; }
+  .sello {
+    border:2px solid rgba(159,179,217,.34); border-radius:100px;
+    padding:16px 34px; font-size:25px; font-weight:600; color:#CFE0FF;
+  }
+  .firma { text-align:right; font-size:26px; color:#7EA0D4; line-height:1.5; }
+  .firma b { display:block; color:#F5F7FF; font-size:31px; font-weight:600; }
+</style>
+</head>
+<body>
+  <div class="marco">
+    <div class="top"><span class="punto"></span><span class="marca" id="marca">IA360 · Programa Beta</span></div>
+    <div class="centro">
+      <div class="saluda">Bienvenido,</div>
+      <div class="nombre" id="nombre">Elliot</div>
+      <div class="empresa" id="empresa">Zamna Dev · IT y Redes</div>
+      <div class="linea"></div>
+      <div class="rol" id="rol">Aliado del capítulo<br><b>BNI Industrial Jalisco</b><br>y usuario beta de IA360.</div>
+    </div>
+    <div class="pie">
+      <div class="sello" id="sello">Acceso beta · 2026</div>
+      <div class="firma">de parte de<b id="firma">Alek</b></div>
+    </div>
+  </div>
+<script>
+  const q = new URLSearchParams(location.search);
+  for (const [k, v] of q) { const el = document.getElementById(k); if (el) el.innerHTML = v; }
+</script>
+</body>
+</html>

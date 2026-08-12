@@ -7,8 +7,9 @@
 // Este script es para el REZAGO: recorre lo viejo y lo deja leído en la columna
 // chat_history.media_lectura, que es de donde el agente y el ledger toman contexto.
 //
-// Los documentos (xlsx/csv/pdf) quedan fuera: el workflow de n8n resuelve imagen y
-// audio. Los archivos son otra ronda.
+// Desde el 12-ago-2026 también recorre los DOCUMENTOS: los Excel/CSV/texto los
+// parsea documentUnderstanding en local (no viajan a n8n). PDF y DOCX se reportan
+// como `formato_no_parseable` a propósito: son 1 y 1 en todo el histórico.
 //
 //   docker exec forgecrm-backend node /app/scripts/leerMediosRezago.js
 //   docker exec forgecrm-backend node /app/scripts/leerMediosRezago.js --apply
@@ -16,6 +17,7 @@
 
 const pool = require('/app/src/db');
 const { leerMedio } = require('/app/src/services/mediaUnderstanding');
+const { leerDocumento } = require('/app/src/services/documentUnderstanding');
 
 const args = process.argv.slice(2);
 const APPLY = args.includes('--apply');
@@ -37,7 +39,7 @@ const CONTACTO = valorDe('--contacto', '');
       WHERE h.direction = 'incoming'
         AND h.media_status = 'stored'
         AND h.media_lectura IS NULL
-        AND h.message_type IN ('audio', 'voice', 'image')
+        AND h.message_type IN ('audio', 'voice', 'image', 'document')
         AND h.contact_number !~ '^52199900[0-9]{5}$'
         AND ($1 = '' OR h.contact_number = $1)
       ORDER BY h.created_at
@@ -54,10 +56,12 @@ const CONTACTO = valorDe('--contacto', '');
     const fecha = r.fecha instanceof Date ? r.fecha.toISOString().slice(0, 10) : String(r.fecha);
     const kb = Math.round((r.media_size_bytes || 0) / 1024);
     const t0 = Date.now();
-    const res = await leerMedio({
-      record: r,
-      contexto: `${quien}, champion de Camiones Selectos escribiendo a Alek sobre su operación`,
-    });
+    const res = r.message_type === 'document'
+      ? await leerDocumento({ record: r })
+      : await leerMedio({
+          record: r,
+          contexto: `${quien}, champion de Camiones Selectos escribiendo a Alek sobre su operación`,
+        });
     const seg = ((Date.now() - t0) / 1000).toFixed(1);
     if (res.ok) {
       ok++;

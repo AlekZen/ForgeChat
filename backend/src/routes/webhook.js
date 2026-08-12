@@ -22,6 +22,8 @@ const { ia360MediaCaption } = require('../util/mediaCaption');
 // Lectura real de medios (visión y transcripción vía n8n): el bot dejó de decir
 // «no puedo leer imágenes / escuchar audios», que además era falso.
 const { leerMedio, componerMensajeConLectura, tipoDeLectura } = require('../services/mediaUnderstanding');
+// Lectura de documentos (Excel/CSV/texto): se parsean en local, no viajan a n8n.
+const { leerDocumento } = require('../services/documentUnderstanding');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
@@ -8364,7 +8366,10 @@ async function ia360NoSilenceWatchdogCheck(record) {
 function scheduleIa360NoSilenceWatchdog(record) {
   try {
     if (!record || record.direction !== 'incoming') return;
-    if (record.message_type === 'status' || record.message_type === 'reaction' || record.message_type === 'sticker') return;
+    // `system` es un aviso de la plataforma (el contacto cambió de número) y
+    // `unknown` un error de entrega de Meta: contestarlos con «Recibí tu pregunta…»
+    // es responderle a nadie, el mismo ruido que ya se corrigió en el carril owner.
+    if (['status', 'reaction', 'sticker', 'system', 'unknown'].includes(record.message_type)) return;
     if (!record.message_id) return; // sin wamid no hay forma confiable de verificar el egress
     const n = normalizePhone(record.contact_number);
     if (!n || n === IA360_OWNER_NUMBER) return;
@@ -8399,7 +8404,7 @@ const ia360BootRescanTimer = setTimeout(async () => {
       `SELECT message_id, wa_number, contact_number, message_type, message_body
          FROM coexistence.chat_history
         WHERE direction = 'incoming'
-          AND message_type NOT IN ('status', 'reaction', 'sticker')
+          AND message_type NOT IN ('status', 'reaction', 'sticker', 'system', 'unknown')
           AND timestamp > NOW() - INTERVAL '15 minutes'`
     );
     let checked = 0;
@@ -8438,8 +8443,12 @@ async function handleIa360FreeText(record) {
     //     viven en n8n). Ahora el medio se LEE y el texto leído es el mensaje.
     const mediaCaption = ia360MediaCaption(record);
     const tipoMedio = tipoDeLectura(record.message_type);
+    // `location` entra con su texto crudo («Location: <lat>, <lng>»), que ya es
+    // interpretable: mandar una ubicación es una petición y quedarse callado es
+    // el mismo defecto que se corrigió con las capturas.
     if (!record || record.direction !== 'incoming'
-        || (record.message_type !== 'text' && !mediaCaption && !tipoMedio)) return;
+        || (record.message_type !== 'text' && record.message_type !== 'location'
+            && !mediaCaption && !tipoMedio)) return;
     if (!tipoMedio && (!record.message_body || !String(record.message_body).trim())) return;
     const preloadedContactContext = await loadIa360ContactContext(record).catch(() => null);
     let deal = await getActiveNonTerminalIa360Deal(record);
@@ -8455,10 +8464,17 @@ async function handleIa360FreeText(record) {
     // nunca bloquea la respuesta.
     if (tipoMedio) {
       const quien = ia360ContactDisplayName({ contact: contactContext, record, fallbackNumber: record.contact_number });
-      const lectura = await leerMedio({
-        record,
-        contexto: `${quien}${contactContext?.custom_fields?.persona_context ? `, ${contactContext.custom_fields.persona_context}` : ''}. Escribe por WhatsApp a Alek sobre su operación.`,
-      }).catch(e => { console.error('[media-lectura] excepción:', e.message); return { ok: false }; });
+      // El `contexto` que sale del proceso se arma SÓLO con datos del dueño de este
+      // record (su nombre y su persona). Nunca memoria ni historial de nadie más:
+      // saldría del proceso y volvería dentro de una lectura que se guarda como
+      // contexto de ESTE contacto.
+      const lectura = tipoMedio === 'documento'
+        ? await leerDocumento({ record })
+            .catch(e => { console.error('[doc-lectura] excepción:', e.message); return { ok: false, tipo: 'documento' }; })
+        : await leerMedio({
+            record,
+            contexto: `${quien}${contactContext?.custom_fields?.persona_context ? `, ${contactContext.custom_fields.persona_context}` : ''}. Escribe por WhatsApp a Alek sobre su operación.`,
+          }).catch(e => { console.error('[media-lectura] excepción:', e.message); return { ok: false }; });
       const mensajeConLectura = componerMensajeConLectura({ record, lectura });
       if (mensajeConLectura) record.message_body = mensajeConLectura;
       else if (!String(record.message_body || '').trim()) return; // nada que responder

@@ -810,6 +810,11 @@ cmd_intake(){
 #   A4 alta por vCard → UN mensaje de contexto + readout sin jerga interna
 #      ("flywheel", "persona-first") y sin el mensaje suelto de autosuggest.
 #   A5 contacto con opener previo → el readout avisa que ya le escribimos.
+#   A6 otro agente de código en el mismo hilo → Alekito carga ese contexto.
+#   A7 captura con la petición en el pie de foto → nunca "no puedo leer imágenes".
+#   A8 nota de voz real → se transcribe y queda en chat_history.media_lectura.
+#   A9 tipos huérfanos: location recibe respuesta, system no dispara nada y un
+#      documento (xlsx) se lee en local con documentUnderstanding.
 cmd_auditoria(){
   local QA="$1" NAME="${2:-Ramiro Auditoria}"; guard_qa "$QA"
   banner "AUDITORÍA — fallback honesto, digest, silencio y readout limpio — $QA" "forgechat_monolith_e2e"
@@ -957,6 +962,54 @@ cmd_auditoria(){
     local GUARDADO; GUARDADO="$(psql_q "SELECT COALESCE(length(media_lectura),0) FROM coexistence.chat_history WHERE message_id='$FILA8'")"
     chk "A8 la transcripción quedó guardada en la fila" "$([ "${GUARDADO:-0}" -gt 30 ] && echo si || echo no)" "si"
     echo "  transcrito: $(psql_q "SELECT left(regexp_replace(media_lectura,'\s+',' ','g'),150) FROM coexistence.chat_history WHERE message_id='$FILA8'")"
+  fi
+
+  # A9 — NINGÚN TIPO CON CONTENIDO QUEDA HUÉRFANO (12-ago-2026). El inventario por
+  # tipo de mensaje dejó ver tres huecos: `location` llegaba con su texto crudo y
+  # nadie lo atendía; `system`/`unknown` no son una petición pero SÍ disparaban el
+  # watchdog de no-silencio (contestarle a un aviso de plataforma es responderle a
+  # nadie); y `document` sólo guardaba el nombre del archivo.
+  echo "--- A9: tipos huérfanos (location, system, document) ---"
+
+  local BASE_QA9; BASE_QA9="$(max_out_id "$QA")"
+  chk "A9 ubicación HTTP" \
+      "$(post_webhook "$(_envelope "$QA" "$NAME" "{\"from\":\"$QA\",\"id\":\"$(wamid loc)\",\"timestamp\":\"$(ts)\",\"type\":\"location\",\"location\":{\"latitude\":20.67,\"longitude\":-103.35}}")")" "200"
+  echo "  esperando 85 s (agente + red de seguridad del invariante)…"
+  sleep 85
+  local R9; R9="$(psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$QA' AND id>$BASE_QA9 ORDER BY id DESC LIMIT 1")"
+  echo "  respuesta a la ubicación: ${R9:-(ninguna)}"
+  chk     "A9 la ubicación sí recibió respuesta" "$([ -n "$R9" ] && echo si || echo no)" "si"
+  chk_not "A9 no contesta que no puede leerlo"   "$R9" "no puedo"
+
+  # system: cero salientes. El watchdog ya no debe dispararlo.
+  local BASE_SYS; BASE_SYS="$(max_out_id "$QA")"
+  chk "A9 system HTTP" \
+      "$(post_webhook "$(_envelope "$QA" "$NAME" "{\"from\":\"$QA\",\"id\":\"$(wamid sys)\",\"timestamp\":\"$(ts)\",\"type\":\"system\",\"system\":{\"body\":\"El número cambió\"}}")")" "200"
+  echo "  esperando 85 s (ventana completa del watchdog)…"
+  sleep 85
+  chk "A9 un aviso de plataforma NO genera salientes" "$(max_out_id "$QA")" "$BASE_SYS"
+
+  # document: se ejerce el camino real (documentUnderstanding parsea en local) sobre
+  # un xlsx que un contacto mandó de verdad. Igual que A8, no se inyecta por webhook:
+  # un id de medio sintético no existe en Meta, el downloader marcaría la fila
+  # 'failed' y se probaría el harness, no el sistema.
+  local FILA9; FILA9="$(psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='incoming' AND message_type='document' AND media_status='stored' AND media_mime_type LIKE '%spreadsheet%' ORDER BY id DESC LIMIT 1")"
+  if [ -z "$FILA9" ]; then
+    echo "  (no hay hojas de cálculo almacenadas: A9-documento omitido)"
+  else
+    local OUT9; OUT9="$(docker exec "$BE" node -e "
+      const pool=require('/app/src/db');
+      const {leerDocumento}=require('/app/src/services/documentUnderstanding');
+      (async()=>{
+        const {rows}=await pool.query(\"SELECT message_id, message_type, media_mime_type, media_size_bytes FROM coexistence.chat_history WHERE message_id=\\\$1\",['$FILA9']);
+        const r=await leerDocumento({record:rows[0]});
+        console.log(JSON.stringify({ok:r.ok,motivo:r.motivo||null,chars:(r.texto||'').length,hoja:/^Hoja «/.test(r.texto||'')}));
+        process.exit(0);})();" 2>/dev/null | tail -1)"
+    echo "  lectura del documento: $OUT9"
+    chk_has "A9 la hoja de cálculo se leyó"        "$OUT9" '"ok":true'
+    chk_has "A9 el resumen empieza por la hoja"    "$OUT9" '"hoja":true'
+    local GUARDADO9; GUARDADO9="$(psql_q "SELECT COALESCE(length(media_lectura),0) FROM coexistence.chat_history WHERE message_id='$FILA9'")"
+    chk "A9 la lectura quedó guardada en la fila" "$([ "${GUARDADO9:-0}" -gt 50 ] && echo si || echo no)" "si"
   fi
 
   echo "  labels de la corrida al owner: $(fresh_labels "$OWNER" "$BASE_OWNER")"
