@@ -126,7 +126,7 @@ test('record vacío degrada al copy de texto en vez de reventar', () => {
 
 // ── F8: el digest decía "tienes 5" arrastrando 31 ────────────────────────────
 const FILAS = [
-  { contact_number: '5213321060293', name: 'Andrés', contact_message: 'te mando el archivo', created_at: new Date(Date.now() - 3 * 864e5) },
+  { contact_number: '5213321060293', name: 'Andrés', contact_message: 'te mando el archivo', created_at: new Date(Date.now() - 3 * 864e5), plane_issue_key: 'CAM-72' },
   { contact_number: '5213321062365', name: 'Juan Carlos', contact_message: 'Audio message', created_at: new Date(Date.now() - 5 * 864e5) },
 ];
 
@@ -145,6 +145,12 @@ test('sin total (llamada legacy) el digest sigue siendo válido', () => {
   const body = buildDigestBody(FILAS);
   assert.doesNotMatch(body, /En total llevas/);
   assert.match(body, /Andrés/);
+});
+
+test('el digest muestra el folio de Plane cuando la promesa ya es ticket', () => {
+  const body = buildDigestBody(FILAS, 22);
+  assert.match(body, /CAM-72, hace \d+ días/);
+  assert.doesNotMatch(body, /undefined/, 'la fila sin folio no debe imprimir undefined');
 });
 
 // ── F4: las promesas del agente también entran al ledger ─────────────────────

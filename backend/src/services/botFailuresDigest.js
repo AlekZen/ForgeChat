@@ -13,9 +13,10 @@
 // sigue siendo humano (política de aprobación por envío). El digest visibiliza
 // lo que hoy se pierde.
 //
-// Idempotencia: reclamo atómico `UPDATE ... WHERE digest_last_at IS NULL
-// RETURNING` ANTES de encolar, el mismo patrón de diapazoSesionRecordatorio.
-// At-most-once por fila aunque se solapen dos barridos o corran dos procesos.
+// Idempotencia: reclamo atómico `UPDATE ... RETURNING` con el MISMO predicado de
+// candidatura (nunca vista o vencida por repesca) ANTES de encolar, el mismo
+// patrón de diapazoSesionRecordatorio. At-most-once por fila y por ciclo de
+// repesca, aunque se solapen dos barridos o corran dos procesos.
 //
 // Camino de egress: resolveAccount + insertPendingRow + enqueueSend (el mismo de
 // ia360Reminders / diapazoSesionRecordatorio). No se usa sendIa360DirectText
@@ -33,15 +34,19 @@ const WA_NUMBER = process.env.IA360_WA_NUMBER || '5213321594582';
 const PROMESA_INTERVAL = '24 hours';
 // Tope de filas por digest: un mensaje de WhatsApp legible, no un volcado.
 const MAX_FILAS = 5;
+// Repesca: una promesa que sigue abierta vuelve al digest cada 7 días. Sin esto se
+// veía UNA sola vez en la vida (digest_last_at IS NULL) y 22 llevaban semanas mudas.
+const REPESCA_INTERVAL = process.env.IA360_FAILURES_REPESCA_INTERVAL || '7 days';
 
 const { buildDigestBody, truncar, dias } = require('../util/failuresDigestBody');
 
-// Candidatas: promesas abiertas de más de 24 h que aún no entraron a un digest.
-// Los números QA (rango exacto 52199900XXXXX) quedan fuera: son harness, y el
-// digest va al WhatsApp REAL del owner.
+// Candidatas: promesas abiertas de más de 24 h que nunca entraron a un digest o
+// que llevan más de REPESCA_INTERVAL sin volver a aparecer. Los números QA
+// (rango exacto 52199900XXXXX) quedan fuera: son harness, y el digest va al
+// WhatsApp REAL del owner.
 async function loadCandidatas() {
   const { rows } = await pool.query(
-    `SELECT f.id, f.contact_number, f.contact_message, f.created_at, c.name
+    `SELECT f.id, f.contact_number, f.contact_message, f.created_at, f.plane_issue_key, c.name
        FROM coexistence.ia360_bot_failures f
        LEFT JOIN LATERAL (
               SELECT name FROM coexistence.contacts
@@ -50,12 +55,12 @@ async function loadCandidatas() {
                LIMIT 1
             ) c ON TRUE
       WHERE f.status = 'abierto'
-        AND f.digest_last_at IS NULL
+        AND (f.digest_last_at IS NULL OR f.digest_last_at < NOW() - ($3)::interval)
         AND f.created_at < NOW() - ($1)::interval
         AND f.contact_number !~ '^52199900[0-9]{5}$'
-      ORDER BY f.created_at
+      ORDER BY f.digest_last_at NULLS FIRST, f.created_at
       LIMIT $2`,
-    [PROMESA_INTERVAL, MAX_FILAS]
+    [PROMESA_INTERVAL, MAX_FILAS, REPESCA_INTERVAL]
   );
   return rows;
 }
@@ -100,9 +105,9 @@ async function reclamar(ids) {
         SET digest_last_at = NOW(),
             owner_action = COALESCE(owner_action, 'digest_enviado')
       WHERE id = ANY($1::int[])
-        AND digest_last_at IS NULL
+        AND (digest_last_at IS NULL OR digest_last_at < NOW() - ($2)::interval)
       RETURNING id`,
-    [ids]
+    [ids, REPESCA_INTERVAL]
   );
   return new Set(rows.map(r => r.id));
 }

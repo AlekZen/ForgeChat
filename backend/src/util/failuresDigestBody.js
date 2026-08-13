@@ -28,11 +28,13 @@ function dias(desde) {
 function buildDigestBody(filas, totalAbiertas = 0) {
   const lineas = filas.map(f => {
     const quien = String(f.name || '').replace(/\s+WhatsApp IA360$/i, '').trim() || f.contact_number;
-    return `• ${quien}: «${truncar(f.contact_message, 90)}» (${dias(f.created_at)})`;
+    // El folio hace accionable la línea: el owner sabe en qué ticket va sin buscarlo.
+    const folio = f.plane_issue_key ? `${f.plane_issue_key}, ` : '';
+    return `• ${quien}: «${truncar(f.contact_message, 90)}» (${folio}${dias(f.created_at)})`;
   });
   const total = Number(totalAbiertas) || 0;
   const pie = total > filas.length
-    ? [`En total llevas ${total} promesas abiertas; las demás ya te las pasé en digests anteriores.`]
+    ? [`En total llevas ${total} promesas abiertas; te voy pasando el resto en los siguientes digests.`]
     : [];
   return [
     `Tienes ${filas.length} promesa${filas.length === 1 ? '' : 's'} de respuesta sin cerrar (les dije "te confirmo por aquí en breve" hace más de 24 h):`,

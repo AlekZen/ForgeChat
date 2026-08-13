@@ -117,3 +117,6 @@ done <<< "$FILAS"
 echo "--------------------------------------------------------------"
 echo "  $([ "$APPLY" -eq 1 ] && echo 'subidas' || echo 'por subir'): $SUBIDAS   omitidas (sin proyecto): $OMITIDAS"
 [ "$APPLY" -eq 0 ] && echo "  Nada se escribió. Corre con --apply cuando estés de acuerdo."
+# Sin esto, un --apply perfecto sale con código 1 (el último test falla) y
+# cualquier `script && verificación` encadenada se rompe sin que nada esté mal.
+exit 0

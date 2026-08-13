@@ -17,6 +17,10 @@ build/
 **/.env
 !.env.example
 !**/.env.example
+# Copias de respaldo del .env: 8 llegaron a estar versionadas con secretos en
+# claro porque ninguna regla las cubría (`.env.bak-*` no casa con `**/.env`).
+.env.bak*
+**/.env.bak*
 # First-run generated admin credential (written by the backend on first boot)
 .admin-password
 **/.admin-password
