@@ -8,6 +8,9 @@ const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
 const { enqueueMediaDownload } = require('../queue/mediaQueue');
 const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
 const { recordOutboundStatus } = require('../services/outboundStatusReceipt');
+const { onFollowUpReceipt } = require('../services/followUpService');
+const { dispatchIa360FollowUpInbound: dispatchFollowUpInbound } = require('../services/followUpInboundDispatcher');
+const { finalizeIa360Reply } = require('../services/outboundSurfaceContract');
 const { projectSignedWebhook } = require('../services/whatsapp5gInboundBridge');
 const { enqueueSend } = require('../queue/sendQueue');
 const { buildFlowButtonComponents } = require('../util/templateFlow');
@@ -189,8 +192,17 @@ function parseMetaPayload(body) {
           record.message_body = 'Order received';
         } else if (type === 'system' && msg.system) {
           record.message_body = msg.system.body || 'System message';
-        } else if (type === 'unknown' && msg.errors) {
-          record.message_body = `Error: ${msg.errors[0]?.message || 'Unknown error'}`;
+        } else if ((type === 'unknown' || type === 'unsupported') && msg.errors) {
+          // 19-ago-2026. Esta rama sólo miraba `unknown` y la Cloud API manda
+          // `unsupported`: tres mensajes de prueba (una ENCUESTA y dos «mensaje no
+          // disponible») entraron con message_body vacío y sin marca de error, y el
+          // motivo —que sí viene en el payload— se perdía. Sin esto no hay forma de
+          // saber qué mandó el contacto sin abrir el JSON a mano.
+          const err = msg.errors[0] || {};
+          const subtipo = msg.unsupported?.type || msg.unsupported?.raw_type || null;
+          record.message_body = `Error: ${err.message || err.title || 'Unknown error'}`
+            + (err.code ? ` (${err.code})` : '')
+            + (subtipo && subtipo !== 'unknown' ? ` [${subtipo}]` : '');
           record.status = 'error';
         }
 
@@ -665,9 +677,6 @@ function buildIa360ConversationRoleHint({ contact, stageName, convState, memory,
   if (profile.lifecycleStage) parts.push(`Etapa de relación: ${profile.lifecycleStage}`);
   if (cfHint.area_operacion) parts.push(`Área de operación: ${String(cfHint.area_operacion).slice(0, 120)}`);
   if (profile.projectName) parts.push(`Proyecto: ${profile.projectName}`);
-  if (String(cfHint.ia360_entrega_pendiente || '').trim()) {
-    parts.push(`Entregable pendiente con este contacto: ${String(cfHint.ia360_entrega_pendiente).slice(0, 200)}`);
-  }
   if (isIa360CommercialSuppressed(contact)) {
     parts.push('REGLA DURA: este contacto es cliente o beta activo. PROHIBIDO vender u ofrecer "Revenue OS", pipelines de venta o servicios nuevos. Responde únicamente sobre su operación y sus pendientes reales.');
   }
@@ -918,13 +927,21 @@ async function persistIa360MemorySignal({ record, contact, signal }) {
        persona, lifecycle_stage, area, signal_type, confidence, summary,
        business_impact, missing_data, next_action, should_be_fact,
        crm_sync_status, rag_index_status, owner_review_status, external_send_allowed,
-       contains_sensitive_data, store_transcript, source_message_id, payload
+       contains_sensitive_data, store_transcript, source_message_id, payload,
+       account_key
      )
      VALUES (
        'ia360_memory_event.v1', 'whatsapp', $1, $2, $3, $4, $5, $6, $7, $8,
        $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
        'dry_run_compact', 'structured_lookup_ready', 'required', false,
-       false, false, $19, $20::jsonb
+      false, false, $19, $20::jsonb,
+      COALESCE(
+        (SELECT cs.account_key FROM coexistence.ia360_contact_scope cs
+          WHERE cs.activo AND cs.rol <> 'owner' AND cs.contact_number = $2 LIMIT 1),
+        (SELECT 'unassigned-' || c.id::text FROM coexistence.contacts c WHERE c.id = $3 LIMIT 1),
+        CASE WHEN NULLIF($2,'') IS NOT NULL
+             THEN 'unassigned-tel-' || substr(md5($2),1,12) END,
+        'pendiente-tenencia')
      )
      ON CONFLICT (source_message_id, area, signal_type) WHERE source_message_id IS NOT NULL
      DO UPDATE SET
@@ -988,14 +1005,21 @@ async function persistIa360MemorySignal({ record, contact, signal }) {
          contact_number, forgechat_contact_id, espo_contact_id, account_name,
          project_name, persona, role, preference, objection, recurring_pain,
          affected_process, missing_metric, confidence, owner_review_status,
-         status, payload
+         status, payload, account_key
        )
        VALUES (
          'ia360_memory_fact.v1', md5($1), $2, 'whatsapp', $3,
          $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-         $14, $15, $16, 'pending_owner_review', 'pending_owner_review', $17::jsonb
+         $14, $15, $16, 'pending_owner_review', 'pending_owner_review', $17::jsonb,
+         COALESCE(
+           (SELECT cs.account_key FROM coexistence.ia360_contact_scope cs
+             WHERE cs.activo AND cs.rol <> 'owner' AND cs.contact_number = $4 LIMIT 1),
+           (SELECT 'unassigned-' || c.id::text FROM coexistence.contacts c WHERE c.id = $5 LIMIT 1),
+           CASE WHEN NULLIF($4,'') IS NOT NULL
+                THEN 'unassigned-tel-' || substr(md5($4),1,12) END,
+           'pendiente-tenencia')
        )
-       ON CONFLICT (fact_key)
+       ON CONFLICT (account_key, fact_key)
        DO UPDATE SET
          source_event_id=COALESCE(EXCLUDED.source_event_id, coexistence.ia360_memory_facts.source_event_id),
          preference=COALESCE(NULLIF(EXCLUDED.preference, ''), coexistence.ia360_memory_facts.preference),
@@ -1140,6 +1164,26 @@ function ia360ContactDisplayName({ contact = null, record = null, fallbackNumber
   if (candidate) return candidate;
   const number = String(fallbackNumber || record?.contact_number || '').trim();
   return number ? `contacto ${maskIa360Number(number)}` : 'contacto desconocido';
+}
+
+// Alek lee estas tarjetas en el celular: un numero de 13 digitos le cuesta trabajo
+// y no le dice nada. Siempre que exista nombre en contacts, se usa el nombre; el
+// numero enmascarado es el ultimo recurso, no el primero.
+async function nombreDeContacto(contactNumber) {
+  const num = String(contactNumber || '').replace(/\D/g, '');
+  if (!num) return 'un contacto';
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(NULLIF(trim(name),''), NULLIF(trim(profile_name),'')) AS nombre
+         FROM coexistence.contacts WHERE contact_number=$1
+        ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+      [num]
+    );
+    return rows[0]?.nombre || `contacto ${maskIa360Number(num)}`;
+  } catch (err) {
+    console.error('[ia360] nombreDeContacto:', err.message);
+    return `contacto ${maskIa360Number(num)}`;
+  }
 }
 
 async function loadIa360FailureTarget(failureId) {
@@ -1382,6 +1426,98 @@ function extractSharedContactsFromRecord(record) {
     console.error('[ia360-vcard] extract error:', err.message);
     return [];
   }
+}
+
+// ── P16 (19-ago-2026): carga ESTRUCTURADA para el agente ──────────────────────
+// El agente recibia todo aplanado a `text`. Consecuencias medidas:
+//   · un tap de boton y alguien tecleando esa misma palabra llegaban identicos;
+//   · las respuestas de Flow (interactive.nfm_reply.response_json) no llegaban
+//     en absoluto: 943 mensajes `interactive` y el modelo nunca vio un solo id.
+// Esto extrae el nodo real del sobre de Meta y lo entrega aparte. Es ADITIVO:
+// quien no lea los campos nuevos sigue viendo exactamente los 10 de antes.
+function ia360MetaMessageNode(record) {
+  if (!record || !record.raw_payload) return null;
+  try {
+    const payload = typeof record.raw_payload === 'string' ? JSON.parse(record.raw_payload) : record.raw_payload;
+    // Misma navegacion que usa extractSharedContactsFromRecord: se empareja por
+    // message_id porque n8n entrega lotes con varios mensajes en un solo sobre.
+    const messages = payload?.entry?.[0]?.changes?.[0]?.value?.messages || [];
+    return messages.find(m => m && m.id === record.message_id) || messages[0] || null;
+  } catch (err) {
+    console.error('[ia360-structured] raw_payload ilegible:', err.message);
+    return null;
+  }
+}
+
+function buildIa360StructuredPayload(record) {
+  const msg = ia360MetaMessageNode(record);
+  if (!msg) return null;
+  const tipo = record.message_type || msg.type || null;
+  try {
+    if (tipo === 'interactive') {
+      const inter = msg.interactive || {};
+      const kind = inter.type || null;
+      const cuerpo = (kind && inter[kind]) || {};
+      if (kind === 'nfm_reply') {
+        let respuestas = null;
+        try {
+          respuestas = cuerpo.response_json ? JSON.parse(cuerpo.response_json) : null;
+        } catch (_) {
+          respuestas = null;   // el Flow mando algo no-JSON: mejor null que romper
+        }
+        return { kind, name: cuerpo.name || null, body: cuerpo.body || null, respuestas };
+      }
+      return {
+        kind,
+        id: cuerpo.id || null,
+        title: cuerpo.title || null,
+        description: cuerpo.description || null,
+      };
+    }
+
+    if (tipo === 'button') {
+      const b = msg.button || {};
+      return { kind: 'button', payload: b.payload || null, text: b.text || null };
+    }
+
+    if (tipo === 'contacts') {
+      // La tarjeta sale del host hacia el modelo: el telefono de un TERCERO se
+      // enmascara a los ultimos 4. El numero completo ya vive en la BD y en el
+      // CRM, que es donde tiene que estar.
+      return {
+        kind: 'contacts',
+        contactos: extractSharedContactsFromRecord(record).slice(0, 5).map(c => ({
+          nombre: c.name || null,
+          telefono_ultimos4: c.contactNumber ? String(c.contactNumber).slice(-4) : null,
+          tiene_email: Boolean(c.email),
+        })),
+      };
+    }
+
+    if (tipo === 'location') {
+      const l = msg.location || {};
+      return {
+        kind: 'location',
+        lat: l.latitude ?? null,
+        lng: l.longitude ?? null,
+        name: l.name || null,
+        address: l.address || null,
+      };
+    }
+
+    const tipoMedio = tipoDeLectura(tipo);
+    if (tipoMedio) {
+      return {
+        kind: 'media',
+        subtipo: tipoMedio,
+        filename: record.media_filename || null,
+        caption: ia360MediaCaption(record) || null,
+      };
+    }
+  } catch (err) {
+    console.error('[ia360-structured] no pude estructurar tipo=%s: %s', tipo, err.message);
+  }
+  return null;
 }
 
 function inferIa360QaPersonaHint(name) {
@@ -2003,92 +2139,6 @@ async function handleRevenueOsFreeText(record) {
 }
 
 // ============================================================================
-// G7-CONGRUENCIA — botones del template de ENTREGA (ia360_seguimiento_entregable_v1).
-// Sus quick replies llegan con el título visible ("Sí, compártelo" / "Después"), el
-// mismo canal que los openers fríos; sin este handler el afirmativo lo capturaba el
-// clasificador léxico global y respondía con un paso de embudo comercial.
-// Gate DOBLE: título reconocido Y evidencia de que a ESTE contacto se le mandó ese
-// template en los últimos 7 días. Sin las dos cosas declina (return false) y el
-// botón sigue su curso normal. Nunca amplía los lexicones globales: el opener
-// `aliado_caso_reventa` usa "Sí, compártelo" legítimamente y debe seguir funcionando.
-// ============================================================================
-const IA360_ENTREGA_TEMPLATE = 'ia360_seguimiento_entregable_v1';
-
-async function handleEntregaButton({ record, replyId, answer }) {
-  try {
-    if (!record) return false;
-    const key = normalizeOpenerReplyId(replyId || answer);
-    const esSi = key === 'si, compartelo' || key === 'si compartelo';
-    const esDespues = key === 'despues';
-    if (!esSi && !esDespues) return false;
-
-    const { rows } = await pool.query(
-      `SELECT 1
-         FROM coexistence.chat_history
-        WHERE direction='outgoing'
-          AND wa_number=$1 AND contact_number=$2
-          AND message_type='template'
-          AND template_meta->>'template_name' = $3
-          AND created_at >= NOW() - INTERVAL '7 days'
-        LIMIT 1`,
-      [record.wa_number, record.contact_number, IA360_ENTREGA_TEMPLATE]
-    );
-    if (!rows.length) return false; // no hay entrega pendiente: que lo rutee quien corresponda
-
-    const contact = await loadIa360ContactContext(record).catch(() => null);
-    const safeName = contact?.name || record.contact_name || record.contact_number;
-
-    if (esDespues) {
-      await enqueueIa360Text({
-        record,
-        label: 'ia360_entrega_pospuesta',
-        body: 'Va, sin prisa. Aquí queda pendiente y me dices cuando quieras verlo.',
-      });
-      await mergeContactIa360State({
-        waNumber: record.wa_number,
-        contactNumber: record.contact_number,
-        customFields: { ia360_entrega_state: 'pospuesto' },
-      }).catch(e => console.error('[ia360-entrega] state pospuesto:', e.message));
-      return true;
-    }
-
-    const pendiente = String(contact?.custom_fields?.ia360_entrega_pendiente || '').trim();
-    if (pendiente) {
-      await enqueueIa360Text({ record, label: 'ia360_entrega_envio', body: pendiente });
-      await mergeContactIa360State({
-        waNumber: record.wa_number,
-        contactNumber: record.contact_number,
-        customFields: { ia360_entrega_state: 'entregado' },
-      }).catch(e => console.error('[ia360-entrega] state entregado:', e.message));
-      return true;
-    }
-
-    await enqueueIa360Text({
-      record,
-      label: 'ia360_entrega_ack',
-      body: '¡Va! Te lo comparto por aquí en un momento.',
-    });
-    await mergeContactIa360State({
-      waNumber: record.wa_number,
-      contactNumber: record.contact_number,
-      customFields: { ia360_entrega_state: 'confirmado' },
-    }).catch(e => console.error('[ia360-entrega] state confirmado:', e.message));
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'owner_entrega_confirmada',
-      body: `Entrega confirmada por ${safeName}: envía el pendiente manualmente.`,
-      targetContact: record.contact_number,
-      ownerBudget: true,
-    }).catch(e => console.error('[ia360-entrega] owner notice:', e.message));
-    return true;
-  } catch (err) {
-    console.error('[ia360-entrega] handler error (no route):', err.message);
-    return false;
-  }
-}
-
-// ============================================================================
 // G-WIN — Quick-win "Mapa de cartera" (Pipeline 7 "Champions — Adopción y
 // expansión", persona cliente activo / CFO). Patrón Revenue OS P5: máquina de
 // estados en contacts.custom_fields.ia360_cartera_state ('' → esperando_tabla
@@ -2564,7 +2614,7 @@ async function enqueueIa360FlowMessage({ record, flowId, screen, cta, bodyText, 
 // si NO hay slot abre el Flow diagnostico ligero. El stage manda. Devuelve el bool de envio
 // (true si se encolo). loadIa360Bookings/enqueueIa360FlowMessage estan hoisted (function decls).
 async function dispatchContextFlow(record) {
-  const bookings = await loadIa360Bookings(record.contact_number);
+  const bookings = await loadIa360Bookings(record.contact_number, record.wa_number);
   const hasSlot = Array.isArray(bookings) && bookings.length > 0;
   console.log('[ia360-flowwire] send_context contact=%s hasSlot=%s -> %s', record.contact_number, hasSlot, hasSlot ? 'pre_call' : 'diagnostico');
   if (hasSlot) {
@@ -2631,6 +2681,17 @@ async function enqueueIa360Text({ record, label, body, dedupSuffix = '' }) {
   return true;
 }
 
+async function dispatchIa360FollowUpInbound(record) {
+  return dispatchFollowUpInbound(record, {
+    db: pool,
+    sendDeferred: async () => enqueueIa360Text({
+      record,
+      label: 'ia360_follow_up_deferred',
+      body: 'Claro, lo dejamos para después.',
+    }),
+  });
+}
+
 // G-BRAIN: respuesta conversacional del AGENTE con candado anti-doble-ruta.
 // El incidente José Ramón (ids 1651/1653): dos inbound casi simultáneos del mismo
 // contacto (texto + botón) dispararon rutas paralelas — la seq_* contestó al
@@ -2648,6 +2709,7 @@ async function enqueueIa360AgentReply({ record, label, body }) {
   const { account } = resolved;
   const client = await pool.connect();
   let localId = null;
+  let finalBody = String(body || '').trim();
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(73601, hashtext($1))', [String(record.contact_number || '')]);
@@ -2668,11 +2730,12 @@ async function enqueueIa360AgentReply({ record, label, body }) {
         maskIa360Number(record.contact_number), record.message_id, rows[0].id);
       return 'superseded';
     }
+    finalBody = await finalizeIa360Reply(client, { record, body: finalBody });
     localId = await insertPendingRow({
       account,
       toNumber: record.contact_number,
       messageType: 'text',
-      messageBody: body,
+      messageBody: finalBody,
       templateMeta: {
         ux: 'ia360_100m',
         label,
@@ -2695,20 +2758,20 @@ async function enqueueIa360AgentReply({ record, label, body }) {
     accountId: account.id,
     to: record.contact_number,
     localMessageId: localId,
-    payload: { body, previewUrl: false },
+    payload: { body: finalBody, previewUrl: false },
   });
   // F4 (auditoría 2026-08-12): si el agente prometió algo ("te armo el mini-plan",
   // "te confirmo"), la promesa entra al MISMO ledger que las del fallback. Así el
   // digest de 24 h la envejece y el owner la ve si nadie la cumplió. Best-effort:
   // un fallo aquí jamás afecta al mensaje ya enviado. Owner y QA quedan fuera.
-  if (detectIa360AgentPromise(body)
+  if (detectIa360AgentPromise(finalBody)
       && normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER
       && !IA360_QA_NUMBER_RE.test(String(record.contact_number || ''))) {
     pool.query(
       `INSERT INTO coexistence.ia360_bot_failures
          (contact_number, contact_message, reason, bot_fallback, status)
        VALUES ($1, $2, 'promesa_de_agente', $3, 'abierto')`,
-      [record.contact_number, record.message_body || null, body]
+      [record.contact_number, record.message_body || null, finalBody]
     ).catch(e => console.error('[ia360-promesa] registro de promesa del agente:', e.message));
   }
   return true;
@@ -3168,6 +3231,13 @@ function buildIa360AgentPayload({ record, stageName, history, source }) {
     wa_number: record.wa_number || null,
     contact_number: record.contact_number || null,
     contact_name: record.contact_name || record.profile_name || null,
+    // ── P16 (19-ago-2026). Estrictamente ADITIVO: los 10 campos de arriba no
+    // cambian de nombre ni de forma, asi que el workflow actual sigue igual.
+    // `contract_version` permite al workflow distinguir un payload viejo de
+    // uno nuevo sin adivinar por presencia de campos.
+    contract_version: 2,
+    message_type: record.message_type || 'text',
+    structured: buildIa360StructuredPayload(record),
   };
 }
 
@@ -3278,6 +3348,38 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
 }
 
 // ── IA360 Human-in-the-loop (owner notify + cancelar conversacional) ─────────
+// P9: «Producción» deja de ser una marca en la bandeja y crea el work item real en
+// Plane. Todo el criterio de tenencia vive en n8n (gateway de alcance + guarda de
+// duplicados): aquí NO se decide cuenta ni proyecto, sólo se pasa el contacto. La
+// prioridad viaja como parámetro y por defecto es 'none' — el bot no prioriza, Plane
+// manda (P17) y Alek ordena el tablero.
+const N8N_IA360_PLANE_CREATE_URL = process.env.N8N_IA360_PLANE_CREATE_URL || 'http://n8n:5678/webhook/ia360-plane-create-item';
+async function createIa360PlaneWorkItem({ contactNumber, waNumber, texto, titulo, fuente, ideaId, prioridad = 'none', dryRun = false }) {
+  try {
+    const res = await fetch(N8N_IA360_PLANE_CREATE_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        contact_number: contactNumber || '',
+        wa_number: waNumber || '',
+        texto: texto || '',
+        titulo: titulo || '',
+        fuente: fuente || 'ia360',
+        idea_id: String(ideaId || ''),
+        prioridad,
+        dry_run: dryRun === true,
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+    const cuerpo = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, accion: 'error', motivo: `http_${res.status}` };
+    return cuerpo;
+  } catch (err) {
+    console.error('[ia360-plane-create] error:', err.message);
+    return { ok: false, accion: 'error', motivo: err.message };
+  }
+}
+
 // Owner = Alek. HOY su numero es el MISMO que el prospecto de prueba, asi que la
 // rama owner discrimina por PREFIJO de id de boton ('owner_'), NO por numero.
 // Reflejo por interaccion a EspoCRM: find-or-update de UN Contact con campos ia360_*.
@@ -4827,7 +4929,7 @@ function buildIa360SequenceReadout({ name, targetContact, flow, sequence, payloa
     : '';
   return [
     ...(introLine ? [String(introLine), ''] : []),
-    `Contacto: ${name} (${targetContact})`,
+    `Contacto: ${name}`,
     `Persona: ${flow.personaContext} · Secuencia: ${sequence.label}`,
     ...(draft ? ['', 'Borrador:', draft] : []),
     ...(opciones ? ['', `Botones: ${opciones}`] : []),
@@ -6063,7 +6165,7 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   // (clase incidente José Ramón) se detiene aquí, en el último metro.
   if (isIa360SyntheticWamid(record.message_id)
       && !(IA360_QA_NUMBER_RE.test(normalizePhone(targetContact)) || normalizePhone(targetContact) === IA360_OWNER_NUMBER)) {
-    return deny('synthetic_approve_real_contact', `Gate QA: la aprobación vino de un payload sintético del harness y ${name} (${targetContact}) es un contacto real. No envié nada.`);
+    return deny('synthetic_approve_real_contact', `Gate QA: la aprobación vino de un payload sintético del harness y ${name} es un contacto real. No envié nada.`);
   }
 
   // GATE DE SEGURIDAD: allowlist de prueba. Sin allowlist o fuera de ella → NO envía.
@@ -6071,7 +6173,7 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   const allowRaw = String(process.env.IA360_APPROVE_SEND_ALLOWLIST || '').trim();
   const allow = ia360ApproveSendAllowlist();
   if (allowRaw !== '*' && (!allow.length || !allow.includes(normalizePhone(targetContact)))) {
-    return deny('not_in_test_allowlist', `Gate de seguridad: ${name} (${targetContact}) no está en IA360_APPROVE_SEND_ALLOWLIST. Aprobación registrada pero NO envié nada al contacto.`);
+    return deny('not_in_test_allowlist', `Gate de seguridad: ${name} no está en IA360_APPROVE_SEND_ALLOWLIST. Aprobación registrada pero NO envié nada al contacto.`);
   }
 
   // P10: la ruta Diapazo no manda un opener de catálogo. Entrega la Sesión de
@@ -6232,7 +6334,7 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     record,
     toNumber: IA360_OWNER_NUMBER,
     label: 'owner_approve_send_done',
-    body: `Aprobado. Enviando el opener de "${sequence.label}" a ${name} (${targetContact}); te aviso solo si falla.${dealLinea} Su deal queda en "Diagnóstico enviado".`,
+    body: `Aprobado. Enviando el opener de "${sequence.label}" a ${name}; te aviso solo si falla.${dealLinea} Su deal queda en "Diagnóstico enviado".`,
     targetContact,
     ownerBudget: true,
     critical: true,
@@ -6311,7 +6413,7 @@ async function handleIa360ApproveSendDiapazo({ record, targetContact, name, flow
     record,
     toNumber: IA360_OWNER_NUMBER,
     label: 'owner_approve_send_done',
-    body: `Aprobado. ${name} (${targetContact}) recibe la Sesión de Afinación de DIAPAZO ${res.via === 'flow' ? 'como Flow directo' : `como template «${DIAPAZO_SESION_INVITACION_TEMPLATE}» con su botón de Flow`}; te aviso solo si falla. Sus respuestas ya rutean al agente de Diapazo.`,
+    body: `Aprobado. ${name} recibe la Sesión de Afinación de DIAPAZO ${res.via === 'flow' ? 'como Flow directo' : `como template «${DIAPAZO_SESION_INVITACION_TEMPLATE}» con su botón de Flow`}; te aviso solo si falla. Sus respuestas ya rutean al agente de Diapazo.`,
     targetContact,
     ownerBudget: true,
     critical: true,
@@ -6687,7 +6789,7 @@ async function handleIa360OwnerVcardAction({ record, ownerAction, targetContact 
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: 'owner_vcard_keep_ack',
-      body: `Guardado: ${name} (${targetContact}) queda capturado sin pipeline ni envío.`,
+      body: `Guardado: ${name} queda capturado sin pipeline ni envío.`,
     });
   }
 }
@@ -7306,9 +7408,17 @@ async function enrichIa360ContactFromVault({ record, contact }) {
       await pool.query(
         `INSERT INTO coexistence.ia360_memory_facts
            (fact_key, source, contact_wa_number, contact_number, forgechat_contact_id,
-            project_name, ${col}, confidence, owner_review_status, status, payload)
-         VALUES ($1,'alekcontenido',$2,$3,$4,$5,$6,0.950,'owner_curated','confirmed',$7::jsonb)
-         ON CONFLICT (fact_key) DO UPDATE SET
+            project_name, ${col}, confidence, owner_review_status, status, payload,
+            account_key)
+         VALUES ($1,'alekcontenido',$2,$3,$4,$5,$6,0.950,'owner_curated','confirmed',$7::jsonb,
+           COALESCE(
+             (SELECT cs.account_key FROM coexistence.ia360_contact_scope cs
+               WHERE cs.activo AND cs.rol <> 'owner' AND cs.contact_number = $3 LIMIT 1),
+             (SELECT 'unassigned-' || c.id::text FROM coexistence.contacts c WHERE c.id = $4 LIMIT 1),
+             CASE WHEN NULLIF($3,'') IS NOT NULL
+                  THEN 'unassigned-tel-' || substr(md5($3),1,12) END,
+             'pendiente-tenencia'))
+         ON CONFLICT (account_key, fact_key) DO UPDATE SET
            ${col} = EXCLUDED.${col},
            project_name = EXCLUDED.project_name,
            payload = EXCLUDED.payload,
@@ -7442,7 +7552,7 @@ async function handleIa360OwnerVaultLink({ record, targetContact, noteId }) {
         record,
         toNumber: IA360_OWNER_NUMBER,
         label: 'ia360_vault_link_conflict',
-        body: `No pude vincular: ${!contact ? `no hay ficha de contacto para ${targetContact}` : `la nota ${noteId} ya no existe en el índice del vault`}. Corre el indexador y vuelve a pedir "sincroniza a ...".`,
+        body: `No pude vincular: ${!contact ? `no hay ficha de contacto para ${await nombreDeContacto(targetContact)}` : `la nota ${noteId} ya no existe en el índice del vault`}. Corre el indexador y vuelve a pedir "sincroniza a ...".`,
         targetContact,
         ownerBudget: true,
       });
@@ -7479,7 +7589,7 @@ async function handleIa360OwnerVaultLink({ record, targetContact, noteId }) {
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: 'ia360_vault_linked',
-      body: `Vinculé ${note.note_path} a ${display} (${targetContact}). Facts: ${enriched.facts} (proyecto: ${note.project_name || 'general'}). Si quieres vincular otra nota: "sincroniza a ${display}".`,
+      body: `Vinculé ${note.note_path} a ${display}. Facts: ${enriched.facts} (proyecto: ${note.project_name || 'general'}). Si quieres vincular otra nota: "sincroniza a ${display}".`,
       targetContact,
       ownerBudget: true,
     });
@@ -7489,7 +7599,7 @@ async function handleIa360OwnerVaultLink({ record, targetContact, noteId }) {
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: 'ia360_vault_link_conflict',
-      body: `No pude completar el vínculo para ${targetContact} (error interno). Inténtalo de nuevo en un momento.`,
+      body: `No pude completar el vínculo para ${await nombreDeContacto(targetContact)} (error interno). Inténtalo de nuevo en un momento.`,
       targetContact,
       ownerBudget: true,
     }).catch(() => {});
@@ -7507,7 +7617,7 @@ async function handleIa360OwnerVaultNone({ record, targetContact }) {
         record,
         toNumber: IA360_OWNER_NUMBER,
         label: 'ia360_vault_none_ack',
-        body: `No hay ficha de contacto para ${targetContact}; no había nada que sellar.`,
+        body: `No hay ficha de contacto para ${await nombreDeContacto(targetContact)}; no había nada que sellar.`,
         targetContact,
         ownerBudget: true,
       });
@@ -7543,7 +7653,7 @@ async function handleIa360OwnerVaultNone({ record, targetContact }) {
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: 'ia360_vault_none_ack',
-      body: `Listo, no vinculé nada para ${targetContact}. Los candidatos quedan sellados como rechazados (no vuelvo a preguntar) y cuando haya documentos crearé nota nueva en Areas/CRM/contactos/.`,
+      body: `Listo, no vinculé nada para ${await nombreDeContacto(targetContact)}. Los candidatos quedan sellados como rechazados (no vuelvo a preguntar) y cuando haya documentos crearé nota nueva en Areas/CRM/contactos/.`,
       targetContact,
       ownerBudget: true,
     });
@@ -7553,7 +7663,7 @@ async function handleIa360OwnerVaultNone({ record, targetContact }) {
       record,
       toNumber: IA360_OWNER_NUMBER,
       label: 'ia360_vault_none_ack',
-      body: `No pude sellar los rechazos para ${targetContact} (error interno). Vuelve a tocar "Ninguno, crear nuevo" en un momento.`,
+      body: `No pude sellar los rechazos para ${await nombreDeContacto(targetContact)} (error interno). Vuelve a tocar "Ninguno, crear nuevo" en un momento.`,
       targetContact,
       ownerBudget: true,
     }).catch(() => {});
@@ -7837,9 +7947,31 @@ async function insertIa360Idea({ fuente, contactNumber, texto, contexto }) {
   return rows[0].id;
 }
 
+// P8: la tarjeta ya no muestra sólo el texto. Antes de mandarla se hace un DRY-RUN
+// contra ia360-plane-create-item: eso resuelve la cuenta del contacto y busca en su
+// proyecto de Plane si ya hay algo parecido. Sin ese dato Alek decidía a ciegas y
+// terminaba creando duplicados; con él la tarjeta dice de quién es y qué se le parece.
+// El dry-run NO escribe nada (verificado) y nunca bloquea el envío de la tarjeta.
+async function buildIa360IdeaPreview({ ideaId, texto, contactNumber, waNumber, fuente }) {
+  if (!contactNumber) return { linea: 'Cuenta: no resuelta (idea sin contacto). Producción quedará bloqueada.', candidato: null };
+  const r = await createIa360PlaneWorkItem({
+    contactNumber, waNumber, texto,
+    titulo: texto.length > 80 ? `${texto.slice(0, 77)}...` : texto,
+    fuente: `idea_${fuente}`, ideaId, dryRun: true,
+  });
+  if (r.accion === 'bloqueado') return { linea: `Cuenta: sin alcance (${r.motivo || 's/d'}). Producción quedará bloqueada.`, candidato: null };
+  const c = r.candidato_similar;
+  const parecido = c && (r.decision_guarda === 'relacionar' || r.decision_guarda === 'proponer_relacion')
+    ? `\nSe parece a #${c.referencia}: «${c.nombre}»`
+    : '\nNo hay nada parecido abierto.';
+  return { linea: `Cuenta: ${r.account_key} (${r.issues_revisados} pendientes abiertos).${parecido}`, candidato: c || null };
+}
+
 async function sendIa360IdeaCard({ record, ideaId, texto, fuente, contactNumber = null }) {
-  const origen = fuente === 'owner' ? 'tuya' : `de la conversación con ${contactNumber || 'un contacto'}`;
-  const preview = texto.length > 480 ? `${texto.slice(0, 477)}...` : texto;
+  const origen = fuente === 'owner' ? 'tuya' : `de la conversación con ${await nombreDeContacto(contactNumber)}`;
+  const preview = texto.length > 380 ? `${texto.slice(0, 377)}...` : texto;
+  const ctx = await buildIa360IdeaPreview({ ideaId, texto, contactNumber, waNumber: record.wa_number, fuente })
+    .catch(e => { console.error('[ia360-ideas] preview:', e.message); return { linea: 'Cuenta: no verificada (preview falló).', candidato: null }; });
   return sendOwnerInteractive({
     record,
     label: `owner_idea_card_${ideaId}`,
@@ -7848,16 +7980,17 @@ async function sendIa360IdeaCard({ record, ideaId, texto, fuente, contactNumber 
     interactive: {
       type: 'list',
       header: { type: 'text', text: `Idea #${ideaId} capturada` },
-      body: { text: `Alek, capturé esta idea (${origen}):\n\n"${preview}"\n\n¿A dónde la ruteo?` },
+      body: { text: `Alek, capturé esta idea (${origen}):\n\n"${preview}"\n\n${ctx.linea}\n\n¿A dónde la ruteo?` },
       footer: { text: 'Bandeja de ideas · IA360' },
       action: {
         button: 'Rutear',
         sections: [{
           title: 'Destinos',
           rows: [
-            { id: `owner_idea_prod:${ideaId}`, title: 'Producción', description: 'Backlog de producción (routed_production)' },
+            { id: `owner_idea_prod:${ideaId}`, title: 'Producción', description: 'Crea el work item en Plane, sin duplicar' },
             { id: `owner_idea_docs:${ideaId}`, title: 'Documentar', description: 'Encolar al vault local AlekContenido (ia360_docs_sync)' },
             { id: `owner_idea_crm:${ideaId}`, title: 'CRM', description: 'Crear nota en EspoCRM ligada al contacto' },
+            { id: `owner_idea_comment:${ideaId}`, title: 'Comentar', description: 'Tu siguiente texto se suma a la idea y te devuelvo la tarjeta' },
             { id: `owner_idea_reject:${ideaId}`, title: 'Rechazar', description: 'Descartar; puedes responder con el motivo' },
           ],
         }],
@@ -7879,6 +8012,111 @@ async function handleIa360OwnerIdeaCommand({ record, texto }) {
   }
 }
 
+// P22: aplicación de la propuesta de tenencia. Es el ÚNICO sitio que escribe en
+// ia360_contact_scope desde la conversación. Se revalida la guarda en el momento
+// del tap (no en el de la propuesta): entre una cosa y otra pudo cambiar el mundo.
+async function handleIa360OwnerScopeDecision({ record, propuestaId, aceptar }) {
+  const idNum = String(propuestaId || '').replace(/\D/g, '');
+  if (!idNum) return;
+  const { rows } = await pool.query(
+    `SELECT * FROM coexistence.ia360_scope_proposals WHERE id=$1 AND estado='pendiente'`,
+    [idNum]
+  );
+  if (!rows.length) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'scope_prop_cerrada', body: `La propuesta #${idNum} ya no está pendiente. No hice cambios.`, ownerBudget: true });
+    return;
+  }
+  const p = rows[0];
+  if (!aceptar) {
+    await pool.query(`UPDATE coexistence.ia360_scope_proposals SET estado='rechazada', resuelto_at=now() WHERE id=$1`, [idNum]);
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'scope_prop_no', body: `Ok: no asigné nada. Propuesta #${idNum} descartada.`, ownerBudget: true });
+    return;
+  }
+  const revalidacion = await evaluarPropuestaDeAlcance({ contactNumber: p.contact_number, accountKey: p.account_key });
+  if (revalidacion.veredicto !== 'OK') {
+    await pool.query(
+      `UPDATE coexistence.ia360_scope_proposals SET estado='bloqueada', veredicto=$2, detalle_json=$3::jsonb, resuelto_at=now() WHERE id=$1`,
+      [idNum, revalidacion.veredicto, JSON.stringify(revalidacion.detalle)]
+    );
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'scope_prop_bloqueada', body: `NO asigné nada: al revalidar salió ${revalidacion.veredicto}. ${JSON.stringify(revalidacion.detalle)}`, ownerBudget: true });
+    return;
+  }
+  await pool.query(
+    `INSERT INTO coexistence.ia360_contact_scope (contact_number, account_key, rol, activo, nota)
+     VALUES ($1,$2,$3,true,$4)
+     ON CONFLICT (contact_number, account_key)
+     DO UPDATE SET rol=EXCLUDED.rol, activo=true, nota=COALESCE(EXCLUDED.nota, coexistence.ia360_contact_scope.nota)`,
+    [p.contact_number, p.account_key, p.rol, p.nota || `${revalidacion.detalle.nombre || 'contacto'} | asignado por Alek desde WhatsApp (P22)`]
+  );
+  let extra = '';
+  if (p.crear_proyecto) {
+    const creado = await crearProyectoPlaneParaCuenta({
+      accountKey: p.account_key,
+      nombre: p.proyecto_nombre || p.account_key,
+      identifier: p.proyecto_identifier || p.account_key.slice(0, 3).toUpperCase(),
+    });
+    extra = creado.ok
+      ? `\nProyecto «${creado.nombre}» creado en Plane (${creado.identifier}) y registrado como proyecto de la cuenta.`
+      : `\nNO pude crear el proyecto en Plane (${creado.motivo}). La asignación sí quedó.`;
+  }
+  await pool.query(`UPDATE coexistence.ia360_scope_proposals SET estado='aplicada', resuelto_at=now() WHERE id=$1`, [idNum]);
+  await sendIa360DirectText({
+    record, toNumber: IA360_OWNER_NUMBER, label: 'scope_prop_aplicada', ownerBudget: true,
+    body: `Listo: ${await nombreDeContacto(p.contact_number)} queda en ${p.account_key} como ${p.rol}. Desde ahora sólo ve pendientes de esa cuenta.${extra}`,
+  });
+}
+
+// Crea el proyecto en Plane y lo registra como proyecto de la cuenta. El identifier
+// de Plane es único por workspace: si choca, Plane responde 400 y se dice tal cual
+// en vez de dejar la cuenta con un proyecto fantasma.
+async function crearProyectoPlaneParaCuenta({ accountKey, nombre, identifier }) {
+  const token = process.env.PLANE_API_TOKEN;
+  if (!token) return { ok: false, motivo: 'sin PLANE_API_TOKEN en el backend' };
+  const ws = 'codigo';
+  try {
+    const res = await fetch(`https://plane.geekstudio.dev/api/v1/workspaces/${ws}/projects/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Api-Key': token, 'User-Agent': 'Mozilla/5.0' },
+      body: JSON.stringify({ name: nombre, identifier: String(identifier).toUpperCase().slice(0, 5) }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const cuerpo = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, motivo: `Plane ${res.status}: ${JSON.stringify(cuerpo).slice(0, 160)}` };
+    await pool.query(
+      `INSERT INTO coexistence.ia360_account_projects (account_key, plane_workspace, plane_identifier, plane_project_id, es_default, activo)
+       VALUES ($1,$2,$3,$4,false,true)
+       ON CONFLICT DO NOTHING`,
+      [accountKey, ws, cuerpo.identifier, cuerpo.id]
+    );
+    return { ok: true, nombre: cuerpo.name, identifier: cuerpo.identifier, id: cuerpo.id };
+  } catch (err) {
+    return { ok: false, motivo: err.message };
+  }
+}
+
+// P8: «Comentar» no rutea la idea: la deja pending y arma la ventana para que el
+// SIGUIENTE texto del owner se sume al cuerpo de la idea. Es el mismo mecanismo ya
+// probado para los fallos del bot (ia360_awaiting_comment_failure), con su propia
+// llave para que no se pisen si las dos ventanas estan abiertas a la vez.
+async function handleIa360OwnerIdeaComment({ record, ideaId }) {
+  const idNum = String(ideaId || '').replace(/\D/g, '');
+  if (!idNum) return;
+  const { rows } = await pool.query(
+    `SELECT id FROM coexistence.ia360_ideas WHERE id=$1 AND status='pending'`,
+    [idNum]
+  );
+  if (!rows.length) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'idea_comment_cerrada', body: `La idea #${idNum} ya estaba ruteada (o no existe). No abrí el comentario.`, ownerBudget: true });
+    return;
+  }
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: record.contact_number,
+    customFields: { ia360_awaiting_comment_idea: String(idNum) },
+  });
+  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'idea_comment_abierto', body: `Va: tu siguiente mensaje se suma a la idea #${idNum} y te devuelvo la tarjeta con la cuenta y los parecidos actualizados.`, ownerBudget: true });
+}
+
 async function handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId }) {
   const status = IA360_IDEAS_STATUS_BY_ACTION[ownerAction];
   const idNum = String(ideaId || '').replace(/\D/g, '');
@@ -7897,7 +8135,34 @@ async function handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId }) {
   const idea = rows[0];
   let ack;
   if (status === 'routed_production') {
-    ack = `Idea #${idea.id} marcada para PRODUCCIÓN (routed_production). Queda en la bandeja para la siguiente ventana de implementación.`;
+    // P9: el destino «Producción» crea el work item de verdad. Si la idea vino de una
+    // conversación, el contacto de esa conversación es el que define la cuenta; si la
+    // dictó el owner, no hay cuenta que resolver y el gateway bloquea a propósito
+    // (fail-closed): se dice tal cual en el acuse en vez de fingir que se creó.
+    const tituloIdea = idea.texto.length > 80 ? `${idea.texto.slice(0, 77)}...` : idea.texto;
+    const r = await createIa360PlaneWorkItem({
+      contactNumber: idea.contact_number || '',
+      waNumber: record.wa_number,
+      texto: idea.texto,
+      titulo: tituloIdea,
+      fuente: `idea_${idea.fuente}`,
+      ideaId: idea.id,
+    });
+    if (r.accion === 'creado') {
+      await pool.query(
+        `UPDATE coexistence.ia360_ideas SET contexto_json = COALESCE(contexto_json,'{}'::jsonb) || $1::jsonb WHERE id=$2`,
+        [JSON.stringify({ plane_issue_id: r.plane_issue_id, plane_referencia: r.referencia, external_id: r.external_id }), idea.id]
+      ).catch(e => console.error('[ia360-ideas] guardar plane ref:', e.message));
+      ack = `Idea #${idea.id} en PRODUCCIÓN: creé el work item ${r.referencia ? `#${r.referencia}` : ''} en Plane (${r.account_key}). Prioridad sin fijar: ordénala tú en el tablero.`;
+    } else if (r.accion === 'ya_existia' || r.accion === 'duplicado_detectado') {
+      const ref = r.candidato_similar?.referencia;
+      ack = `Idea #${idea.id}: ya existe ese pendiente en Plane${ref ? ` (#${ref})` : ''}. No dupliqué nada.`;
+    } else if (r.accion === 'proponer_al_owner') {
+      const c = r.candidato_similar || {};
+      ack = `Idea #${idea.id}: se parece a «${c.nombre || 's/d'}»${c.referencia ? ` (#${c.referencia})` : ''} pero no lo suficiente para decidirlo solo. NO creé nada; dime si es el mismo pendiente o creo uno nuevo.`;
+    } else {
+      ack = `Idea #${idea.id} quedó routed_production, pero NO se creó en Plane (${r.motivo || 'motivo desconocido'}). Queda en la bandeja.`;
+    }
   } else if (status === 'routed_docs') {
     const titulo = idea.texto.length > 80 ? `${idea.texto.slice(0, 77)}...` : idea.texto;
     const contenido = `# Idea #${idea.id}\n\n- Fuente: ${idea.fuente}\n- Contacto: ${idea.contact_number || '-'}\n- Capturada: ${new Date().toISOString()}\n\n${idea.texto}\n\nContexto: ${JSON.stringify(idea.contexto_json || {})}`;
@@ -7910,10 +8175,16 @@ async function handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId }) {
     const identifier = idea.fuente === 'owner' ? IA360_OWNER_NUMBER : (idea.contact_number || IA360_OWNER_NUMBER);
     let espoOk = false;
     try {
+      // P13/hallazgo 9: la llave real es (wa_number, contact_number). Medido el
+      // 19-ago-2026: el número del owner (…8033) existe bajo DOS líneas distintas,
+      // así que filtrar sólo por contact_number puede traer la ficha equivocada
+      // —y con ella el espo_id de otra línea—. Se acota por la línea que atiende.
       const { rows: cRows } = await pool.query(
         `SELECT custom_fields->>'espo_id' AS espo_id, COALESCE(name, profile_name) AS name
-           FROM coexistence.contacts WHERE contact_number=$1 ORDER BY updated_at DESC LIMIT 1`,
-        [identifier]
+           FROM coexistence.contacts
+          WHERE contact_number=$1 AND ($2 = '' OR wa_number=$2)
+          ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+        [identifier, String(record?.wa_number || '')]
       );
       const res = await fetch(N8N_IA360_UPSERT_WEBHOOK_URL, {
         method: 'POST',
@@ -7973,16 +8244,20 @@ async function cancelIa360Booking({ calendarEventId, zoomMeetingId }) {
 // Lee el array de reservas de un contacto. Si `ia360_bookings` esta vacio pero hay
 // campos sueltos legacy (una cita previa al multi-cita), sintetiza un array de 1
 // elemento para que el cancelar siga funcionando sobre data preexistente.
-async function loadIa360Bookings(contactNumber) {
+// P13/hallazgo 9: waNumber es opcional pero, cuando llega, acota. Sin él, un
+// contact_number que existe bajo dos líneas (medido: …8033) puede resolver a la
+// ficha de la otra línea y devolver las citas equivocadas.
+async function loadIa360Bookings(contactNumber, waNumber = '') {
   try {
     const { rows } = await pool.query(
       `SELECT custom_fields->'ia360_bookings'             AS arr,
               custom_fields->>'ia360_booking_event_id'    AS evt,
               custom_fields->>'ia360_booking_zoom_id'     AS zoom,
               custom_fields->>'ia360_booking_start'       AS start
-         FROM coexistence.contacts WHERE contact_number=$1
+         FROM coexistence.contacts
+        WHERE contact_number=$1 AND ($2 = '' OR wa_number=$2)
         ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
-      [contactNumber]
+      [contactNumber, String(waNumber || '')]
     );
     if (!rows.length) return [];
     let arr = rows[0].arr;
@@ -8313,6 +8588,9 @@ async function handleIa360BotFailure({ record, reason, alreadyResponded = false 
 // futura (texto, botones, audio, vCard) sin parchar rama por rama. El dedupe de
 // resolveIa360Outbound (ia360_handler_for = message_id) lo hace idempotente.
 const IA360_NO_SILENCE_WATCHDOG_MS = 75000;
+// Una sola lista para el timer y para el rescan de arranque. Estaban duplicadas y
+// derivaron: por eso el nombre equivocado (`unknown`) sobrevivió en los dos lados.
+const IA360_NO_SILENCE_TIPOS_IGNORADOS = ['status', 'reaction', 'sticker', 'system', 'unknown', 'unsupported'];
 
 async function ia360HasOutgoingForInbound(record) {
   // Escape de comodines LIKE: los wamid del harness pueden traer '_' o '%'.
@@ -8371,7 +8649,10 @@ function scheduleIa360NoSilenceWatchdog(record) {
     // `system` es un aviso de la plataforma (el contacto cambió de número) y
     // `unknown` un error de entrega de Meta: contestarlos con «Recibí tu pregunta…»
     // es responderle a nadie, el mismo ruido que ya se corrigió en el carril owner.
-    if (['status', 'reaction', 'sticker', 'system', 'unknown'].includes(record.message_type)) return;
+    // 19-ago-2026: `unsupported` es el nombre que Meta manda de verdad (`unknown` no
+    // llega nunca). Sin él en esta lista, cada encuesta de un champion abría una
+    // falla de bot inventada. Se dejan los dos: el que llega y el que documenta.
+    if (IA360_NO_SILENCE_TIPOS_IGNORADOS.includes(record.message_type)) return;
     if (!record.message_id) return; // sin wamid no hay forma confiable de verificar el egress
     const n = normalizePhone(record.contact_number);
     if (!n || n === IA360_OWNER_NUMBER) return;
@@ -8406,8 +8687,9 @@ const ia360BootRescanTimer = setTimeout(async () => {
       `SELECT message_id, wa_number, contact_number, message_type, message_body
          FROM coexistence.chat_history
         WHERE direction = 'incoming'
-          AND message_type NOT IN ('status', 'reaction', 'sticker', 'system', 'unknown')
-          AND timestamp > NOW() - INTERVAL '15 minutes'`
+          AND message_type <> ALL($1::text[])
+          AND timestamp > NOW() - INTERVAL '15 minutes'`,
+      [IA360_NO_SILENCE_TIPOS_IGNORADOS]
     );
     let checked = 0;
     for (const r of rows) {
@@ -8870,7 +9152,7 @@ async function handleIa360FreeText(record) {
       //   - 0 candidatos -> avisar al contacto (segun si habia date o no habia ninguna).
       // Todo va dentro del try/catch terminal de handleIa360FreeText.
       if (isCancel) {
-        const bookings = await loadIa360Bookings(record.contact_number);
+        const bookings = await loadIa360Bookings(record.contact_number, record.wa_number);
 
         // SIN ninguna cita guardada → NO molestar al owner. Responder al contacto.
         if (!bookings.length) {
@@ -9498,7 +9780,7 @@ async function handleIa360FlowReply(record) {
       // W4 fix anti-lazo (per FLOWS doc: pre_call es stage-aware). Si el contacto YA tiene una
       // reunión agendada, NO lo empujamos a re-agendar (eso causaba el lazo booking→contexto→
       // re-agenda→booking); cerramos con acuse terminal. Solo si NO hay slot ofrecemos agendar.
-      const preCallBookings = await loadIa360Bookings(record.contact_number);
+      const preCallBookings = await loadIa360Bookings(record.contact_number, record.wa_number);
       const preCallHasSlot = Array.isArray(preCallBookings) && preCallBookings.length > 0;
       if (preCallHasSlot) {
         await syncIa360Deal({
@@ -9776,7 +10058,16 @@ async function handleIa360LiteInteractive(record) {
       // call/keep cargan el numero del contacto (digit-strip OK). owner_cancel_yes
       // carga el EVENT_ID (alfanumerico) → NO digit-stripear ese arg.
       const targetContact = (ownerArg || '').replace(/\D/g, '');
-      // BANDEJA DE IDEAS: ruteo de la tarjeta (Producción/Documentar/CRM/Rechazar).
+      // BANDEJA DE IDEAS: ruteo de la tarjeta (Producción/Documentar/CRM/Comentar/Rechazar).
+      // P22: confirmación de tenencia. Nada se escribe sin uno de estos dos taps.
+      if (ownerAction === 'owner_scope_ok' || ownerAction === 'owner_scope_no') {
+        await handleIa360OwnerScopeDecision({ record, propuestaId: ownerArg, aceptar: ownerAction === 'owner_scope_ok' });
+        return;
+      }
+      if (ownerAction === 'owner_idea_comment') {
+        await handleIa360OwnerIdeaComment({ record, ideaId: ownerArg });
+        return;
+      }
       if (ownerAction && ownerAction.startsWith('owner_idea_')) {
         await handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId: ownerArg });
         return;
@@ -9844,7 +10135,7 @@ async function handleIa360LiteInteractive(record) {
         return;
       }
       if (ownerAction === 'owner_approve_edit') {
-        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_approve_edit_ack', body: `Ok, el borrador para ${targetContact} queda SIN enviar. Edita el copy y vuelve a elegir secuencia cuando esté listo.`, targetContact, ownerBudget: true });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_approve_edit_ack', body: `Ok, el borrador para ${await nombreDeContacto(targetContact)} queda SIN enviar. Edita el copy y vuelve a elegir secuencia cuando esté listo.`, targetContact, ownerBudget: true });
         return;
       }
       if (ownerAction === 'owner_approve_keep') {
@@ -9904,18 +10195,18 @@ async function handleIa360LiteInteractive(record) {
       }
       if (ownerAction === 'owner_cancel_call') {
         await sendIa360DirectText({ record, toNumber: targetContact, label: 'ia360_cancel_call_contact', body: 'Alek te va a llamar para verlo.' });
-        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_call_ack', body: `Ok, le avisé a ${targetContact} que lo llamas.` });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_call_ack', body: `Ok, le avisé a ${await nombreDeContacto(targetContact)} que lo llamas.` });
         return;
       }
       if (ownerAction === 'owner_cancel_keep') {
         await sendIa360DirectText({ record, toNumber: targetContact, label: 'ia360_cancel_keep_contact', body: 'Tu reunión sigue en pie.' });
-        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_keep_ack', body: `Ok, la reunión de ${targetContact} se mantiene.` });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_keep_ack', body: `Ok, la reunión de ${await nombreDeContacto(targetContact)} se mantiene.` });
         return;
       }
       // BONUS C acks: owner_take / owner_book / owner_nurture (FYI flow-reply).
-      if (ownerAction === 'owner_take') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_take_ack', body: `Ok, tú tomas a ${targetContact}.` }); return; }
-      if (ownerAction === 'owner_book') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_book_ack', body: `Ok, a agendar con ${targetContact}.` }); return; }
-      if (ownerAction === 'owner_nurture') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_nurture_ack', body: `Ok, ${targetContact} a nutrición.` }); return; }
+      if (ownerAction === 'owner_take') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_take_ack', body: `Ok, tú tomas a ${await nombreDeContacto(targetContact)}.` }); return; }
+      if (ownerAction === 'owner_book') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_book_ack', body: `Ok, a agendar con ${await nombreDeContacto(targetContact)}.` }); return; }
+      if (ownerAction === 'owner_nurture') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_nurture_ack', body: `Ok, ${await nombreDeContacto(targetContact)} a nutrición.` }); return; }
 
       // ── PRODUCTION-HARDENING: cierre del loop de fallos del bot ───────────────
       // Estos botones llegan de la alerta de handleIa360BotFailure. El `ownerArg`
@@ -9992,11 +10283,6 @@ async function handleIa360LiteInteractive(record) {
   if (await handleIa360FlowReply(record)) return;
   const answer = String(record.message_body || '').trim().toLowerCase();
   const replyId = getInteractiveReplyId(record);
-
-  // G7-CONGRUENCIA: entrega de un pendiente (template ia360_seguimiento_entregable_v1).
-  // Va ANTES de Revenue OS: su "Sí, compártelo" es del carril de entrega, no de un
-  // opener comercial. Declina si no hay ese template reciente para el contacto.
-  if (await handleEntregaButton({ record, replyId, answer })) return;
 
   // Pipeline 5 "WhatsApp Revenue OS": respuesta a la apertura (PASO 1) y bifurcación
   // (PASO 3). Gateado por custom_fields.ia360_revenue_state; si no aplica, devuelve
@@ -11266,6 +11552,36 @@ async function handleIa360LiteInteractive(record) {
   try {
     const fallbackId = replyId || answer || '(sin id)';
     console.warn('[ia360-fallback] unhandled interactive reply contact=%s id=%s body=%s', record.contact_number || '-', fallbackId, String(record.message_body || '').slice(0, 80));
+
+    // ── P16 (19-ago-2026): el agente antes que el enlatado ────────────────────
+    // Un boton sin manejador NO es motivo para contestar "lo estoy ubicando":
+    // ahora el modelo recibe el turno CON la carga estructurada (id y titulo del
+    // boton), que es justo lo que necesita para responder al contenido. El acuse
+    // fijo queda como ultimo recurso, para cuando el agente no devuelve nada.
+    // enqueueIa360AgentReply trae dedupe propio (ventana de 120 s): si otra ruta
+    // ya contesto este inbound, descarta en vez de duplicar.
+    let agenteContesto = false;
+    try {
+      const dealFallback = await getActiveNonTerminalIa360Deal(record).catch(() => null);
+      const respuesta = await callIa360Agent({ record, stageName: dealFallback?.stage_name || null });
+      const textoAgente = String(respuesta?.reply || '').trim();
+      if (textoAgente) {
+        const enviado = await enqueueIa360AgentReply({
+          record,
+          label: 'ia360_interactive_agent_reply',
+          body: textoAgente,
+        });
+        agenteContesto = Boolean(enviado);   // 'superseded' tambien cuenta: alguien ya respondio
+      }
+    } catch (agenteErr) {
+      console.error('[ia360-fallback] el agente no pudo tomar el interactive:', agenteErr.message);
+    }
+    if (agenteContesto) {
+      console.log('[ia360-fallback] resuelto por el agente contact=%s id=%s',
+        maskIa360Number(record.contact_number), fallbackId);
+      return;
+    }
+
     if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
       await sendIa360DirectText({
         record,
@@ -11665,6 +11981,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
     // Support both array of payloads (n8n batch) and single payload
     const payloads = Array.isArray(payload) ? payload : [payload];
     const allRecords = [];
+    const insertedMessageIds = new Set();
     for (const p of payloads) {
       const records = parseMetaPayload(p);
       allRecords.push(...records);
@@ -11709,6 +12026,12 @@ router.post('/webhook/whatsapp', async (req, res) => {
             status: r.status,
             errorMessage: statusErrors,
           });
+          await onFollowUpReceipt({
+            db: client,
+            messageId: r.message_id,
+            status: r.status,
+            publicCode: statusErrors ? 'FOLLOWUP_PROVIDER_FAILED' : null,
+          });
           continue;
         }
 
@@ -11736,16 +12059,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
           continue;
         }
 
-        // Upsert chat_history (ignore duplicates on message_id)
-        await client.query(
+        // Un inbound ordinario se despacha sólo si esta transacción lo insertó.
+        const insertResult = await client.query(
           `INSERT INTO coexistence.chat_history
             (message_id, phone_number_id, wa_number, contact_number, to_number,
              direction, message_type, message_body, raw_payload, media_url,
              media_mime_type, media_filename, status, timestamp, context_message_id)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-           ON CONFLICT (message_id) DO UPDATE SET
-             status = EXCLUDED.status,
-             raw_payload = EXCLUDED.raw_payload`,
+           ON CONFLICT (message_id) DO NOTHING
+           RETURNING message_id`,
           [
             r.message_id, r.phone_number_id, r.wa_number, r.contact_number, r.to_number,
             r.direction, r.message_type, r.message_body, r.raw_payload, r.media_url,
@@ -11753,6 +12075,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
             r.context_message_id || null,
           ]
         );
+        if (insertResult.rowCount === 1) insertedMessageIds.add(r.message_id);
 
         // Upsert the WhatsApp profile/push name into profile_name (NOT name).
         // `name` is reserved for a name we explicitly captured (AI ask-name flow
@@ -11795,12 +12118,18 @@ router.post('/webhook/whatsapp', async (req, res) => {
     //    resume them and SKIP fresh trigger evaluation for that record
     //    (the customer is mid-conversation — see plan: "Resume only — skip
     //    new trigger").
-    const incomingRecords = allRecords.filter(r => r.direction === 'incoming' && r.message_type !== 'status' && r.message_type !== 'reaction');
+    const incomingRecords = allRecords.filter(r =>
+      r.direction === 'incoming'
+      && r.message_type !== 'status'
+      && r.message_type !== 'reaction'
+      && insertedMessageIds.has(r.message_id)
+    );
     if (incomingRecords.length > 0) {
       for (const record of incomingRecords) {
         try {
-          // G-LIVE: invariante no-silencio. Se programa ANTES de cualquier handler
-          // para que cubra continues, throws y ramas fire-and-forget por igual.
+          const followUpDispatch = await dispatchIa360FollowUpInbound(record);
+          if (followUpDispatch.consumed) continue;
+          // Todo inbound no consumido conserva la cobertura de no-silencio.
           scheduleIa360NoSilenceWatchdog(record);
           // ── BANDEJA DE IDEAS: comando del owner "idea: <texto>" ─────
           // Va ANTES del canary Brain v2 (el owner está en la allowlist y el
@@ -11896,6 +12225,49 @@ router.post('/webhook/whatsapp', async (req, res) => {
           // Owner y no-DIAPAZO => false (siguen al embudo IA360/TransformIA intacto).
           // Flag off por defecto => return false => CERO cambio de comportamiento.
           if (await handleDiapazoInbound(record).catch(e => { console.error('[diapazo-inbound] dispatch:', e.message); return false; })) continue;
+          // ── P8: CAPTURA DEL COMENTARIO SOBRE UNA IDEA ───────────────────────
+          // Va antes de la captura de comentarios de fallo porque son ventanas
+          // distintas con llaves distintas; si las dos estuvieran abiertas, la idea
+          // es la que el owner acaba de tocar. El texto se SUMA al cuerpo de la idea
+          // (no lo reemplaza) y se reenvía la tarjeta ya recalculada contra Plane.
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER
+              && String(record.message_body || '').trim()) {
+            try {
+              const { rows: ideaRows } = await pool.query(
+                `SELECT custom_fields->>'ia360_awaiting_comment_idea' AS iid
+                   FROM coexistence.contacts
+                  WHERE wa_number=$1 AND contact_number=$2
+                  LIMIT 1`,
+                [record.wa_number, record.contact_number]
+              );
+              const awaitingIdea = String(ideaRows[0]?.iid || '').replace(/\D/g, '');
+              if (awaitingIdea) {
+                const comentario = String(record.message_body || '').trim();
+                const { rows: upd } = await pool.query(
+                  `UPDATE coexistence.ia360_ideas
+                      SET texto = texto || E'\n\nComentario de Alek: ' || $1
+                    WHERE id=$2 AND status='pending'
+                    RETURNING id, texto, fuente, contact_number`,
+                  [comentario, awaitingIdea]
+                );
+                await mergeContactIa360State({
+                  waNumber: record.wa_number,
+                  contactNumber: record.contact_number,
+                  customFields: { ia360_awaiting_comment_idea: '' },
+                }).catch(e => console.error('[ia360-ideas] limpiar ventana:', e.message));
+                if (!upd.length) {
+                  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'idea_comment_tarde', body: `La idea #${awaitingIdea} ya se había ruteado; no sumé el comentario.`, ownerBudget: true });
+                } else {
+                  const idea = upd[0];
+                  await sendIa360IdeaCard({ record, ideaId: idea.id, texto: idea.texto, fuente: idea.fuente, contactNumber: idea.contact_number });
+                }
+                continue; // NO procesar como mensaje normal
+              }
+            } catch (ideaErr) {
+              console.error('[ia360-ideas] captura de comentario:', ideaErr.message);
+            }
+          }
           // ── PRODUCTION-HARDENING: CAPTURA DEL COMENTARIO del owner ──────────
           // Va ANTES de TODO (paused-resume, flow, funnel): si el owner (Alek) tocó
           // "Comentar" en una alerta de fallo, su SIGUIENTE texto ES el comentario.
@@ -12573,6 +12945,282 @@ router.post('/internal/ia360-memory/capture', async (req, res) => {
   } catch (err) {
     console.error('[ia360-memory] capture endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'capture_failed' });
+  }
+});
+
+// ── P22: asignar cuenta (y opcionalmente crear proyecto) desde la conversación ──
+// La tenencia es lo más caro de equivocar: un contacto en la cuenta equivocada ve
+// pendientes de otro cliente. Por eso NADA se aplica aquí. Este endpoint sólo
+// PROPONE: corre la misma guarda que ~/ops/scope-preflight.sh —comparando números
+// COMPLETOS en SQL y sacando a la vista sólo los últimos 4 dígitos— y le manda a
+// Alek una tarjeta para que confirme. La escritura vive en el handler del tap.
+async function evaluarPropuestaDeAlcance({ contactNumber, accountKey }) {
+  const { rows } = await pool.query(
+    `WITH cand AS (
+       SELECT c.contact_number, COALESCE(c.name, c.profile_name) AS nombre
+         FROM coexistence.contacts c
+        WHERE c.contact_number = $1
+        LIMIT 1)
+     SELECT (SELECT count(*) FROM cand)::int                                          AS existe,
+            (SELECT nombre FROM cand)                                                 AS nombre,
+            (SELECT count(*) FROM coexistence.chat_history h
+              WHERE h.contact_number = $1)::int                                       AS mensajes,
+            (SELECT count(*) FROM coexistence.ia360_accounts a
+              WHERE a.account_key = $2 AND a.activo)::int                             AS cuenta_ok,
+            (SELECT string_agg(DISTINCT s.account_key, ',') FROM coexistence.ia360_contact_scope s
+              WHERE s.contact_number = $1 AND s.activo)                               AS ya_asignado,
+            (SELECT string_agg(DISTINCT '...' || right(c2.contact_number,4) || '->' || f.account_key, ', ')
+               FROM coexistence.contacts c2
+               JOIN coexistence.ia360_memory_facts f ON f.contact_number = c2.contact_number
+              WHERE right(c2.contact_number,4) = right($1,4)
+                AND c2.contact_number <> $1
+                AND f.account_key <> $2
+                AND EXISTS (SELECT 1 FROM coexistence.chat_history h2
+                             WHERE h2.contact_number = c2.contact_number))            AS colision`,
+    [contactNumber, accountKey]
+  );
+  const r = rows[0] || {};
+  if (!r.existe) return { veredicto: 'SIN_CANDIDATO', detalle: { motivo: 'el número no existe en contacts' } };
+  if (!r.cuenta_ok) return { veredicto: 'CUENTA_DESCONOCIDA', detalle: { account_key: accountKey } };
+  if (!r.mensajes) return { veredicto: 'SIN_CONVERSACION', detalle: { ult4: contactNumber.slice(-4) } };
+  if (r.ya_asignado && r.ya_asignado !== accountKey) {
+    return { veredicto: 'YA_ASIGNADO_A_OTRA', detalle: { actual: r.ya_asignado, propuesta: accountKey } };
+  }
+  if (r.colision) return { veredicto: 'COLISION_ULT4', detalle: { colision: r.colision } };
+  return {
+    veredicto: 'OK',
+    detalle: { nombre: r.nombre, ult4: contactNumber.slice(-4), mensajes: r.mensajes, ya_asignado: r.ya_asignado || null },
+  };
+}
+
+router.post('/internal/ia360-scope/propose', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const contactNumber = normalizePhone(b.contact_number || '');
+    const accountKey = String(b.account_key || '').trim();
+    const rol = ['contacto', 'champion'].includes(String(b.rol || '')) ? String(b.rol) : 'champion';
+    if (!contactNumber || !accountKey) {
+      return res.status(422).json({ ok: false, error: 'contact_number_and_account_key_required' });
+    }
+    const { veredicto, detalle } = await evaluarPropuestaDeAlcance({ contactNumber, accountKey });
+    // La propuesta lleva FK a ia360_accounts: si la cuenta no existe no hay fila que
+    // guardar, y persistirla reventaría el INSERT. Se responde el veredicto y ya.
+    if (veredicto === 'CUENTA_DESCONOCIDA') {
+      return res.json({ ok: false, schema: 'ia360_scope_proposal.v1', propuesta_id: null, veredicto, detalle, aplicada: false });
+    }
+    const crearProyecto = b.crear_proyecto === true;
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.ia360_scope_proposals
+         (contact_number, account_key, rol, nota, crear_proyecto, proyecto_nombre, proyecto_identifier, veredicto, detalle_json, estado)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10) RETURNING id`,
+      [contactNumber, accountKey, rol, String(b.nota || '').trim() || null, crearProyecto,
+       String(b.proyecto_nombre || '').trim() || null, String(b.proyecto_identifier || '').trim().toUpperCase() || null,
+       veredicto, JSON.stringify(detalle), veredicto === 'OK' ? 'pendiente' : 'bloqueada']
+    );
+    const propId = rows[0].id;
+    if (veredicto !== 'OK') {
+      return res.json({ ok: false, schema: 'ia360_scope_proposal.v1', propuesta_id: propId, veredicto, detalle, aplicada: false });
+    }
+    // Tarjeta al owner. Sin su tap no se escribe una sola fila de tenencia.
+    const synthetic = {
+      wa_number: normalizePhone(b.wa_number || process.env.IA360_WA_NUMBER || '5213321594582'),
+      contact_number: IA360_OWNER_NUMBER,
+      message_id: `ia360-scope-${propId}`,
+      message_body: '',
+      message_type: 'text',
+    };
+    const cardSent = await sendOwnerInteractive({
+      record: synthetic,
+      label: `owner_scope_card_${propId}`,
+      messageBody: `IA360: propuesta de tenencia #${propId}`,
+      ownerBudget: true,
+      interactive: {
+        type: 'button',
+        body: {
+          text: `Alek, ¿asigno a ${detalle.nombre || `...${detalle.ult4}`} (...${detalle.ult4}, ${detalle.mensajes} mensajes) a la cuenta ${accountKey} como ${rol}?`
+            + (crearProyecto ? `\n\nAdemás crearía el proyecto «${b.proyecto_nombre || accountKey}» en Plane.` : '')
+            + '\n\nSin tu confirmación no escribo nada.',
+        },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: `owner_scope_ok:${propId}`, title: 'Sí, asignar' } },
+            { type: 'reply', reply: { id: `owner_scope_no:${propId}`, title: 'No' } },
+          ],
+        },
+      },
+    });
+    return res.json({ ok: true, schema: 'ia360_scope_proposal.v1', propuesta_id: propId, veredicto, detalle, card_sent: cardSent, aplicada: false });
+  } catch (err) {
+    console.error('[ia360-scope] propose error:', err.message);
+    return res.status(500).json({ ok: false, error: 'propose_failed' });
+  }
+});
+
+// ── P21: recordatorio de pendientes con la ventana de 24 h CERRADA ────────────
+// Fuera de ventana Meta sólo deja plantillas aprobadas. La regla de selección está
+// escrita aquí para que nadie improvise:
+//   · falta una acción del contacto           -> ia360_pendiente_esperamos_respuesta
+//   · 2+ pendientes y ninguno depende de él   -> ia360_pendientes_resumen
+//   · algo quedó listo y falta que lo valide  -> ia360_seguimiento_entregable_v1 (ya aprobada)
+// Y la regla que no se negocia: allowTextFallback:false. Con true, si la plantilla
+// no valida contra Meta el código cae a texto libre, Meta lo rechaza y se reporta un
+// éxito falso (G-COLD). Fuera de ventana, o sale plantilla o no sale nada.
+const PRIORIDAD_PESO = { urgent: 4, high: 3, medium: 2, low: 1, none: 0 };
+
+// Sólo cuentan los pendientes ATRIBUIBLES a este contacto. Medido el 19-ago-2026:
+// contar todo el proyecto daba «tienes 71 pendientes abiertos» a Hendri y a Juan
+// Carlos —los 71 del tablero de Camiones Selectos, no los suyos—, que es falso y
+// además agresivo. La atribución existe porque P9 escribe «contacto ...XXXX» en la
+// descripción del work item; lo que no lleva esa marca (lo capturado a mano por
+// humanos) NO se le adjudica a nadie.
+async function pendientesVivosDeContacto(contactNumber) {
+  const token = process.env.PLANE_API_TOKEN;
+  if (!token) return { ok: false, motivo: 'sin PLANE_API_TOKEN' };
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ap.plane_workspace, ap.plane_project_id
+       FROM coexistence.ia360_contact_scope cs
+       JOIN coexistence.ia360_account_projects ap ON ap.account_key = cs.account_key AND ap.activo
+      WHERE cs.contact_number = $1 AND cs.activo AND cs.rol <> 'owner'`,
+    [contactNumber]
+  );
+  if (!rows.length) {
+    // P23: una cuenta de RELACION (con_backlog=false, p.ej. compañeros de capítulo
+    // BNI) no tiene proyecto A PROPÓSITO. Distinguirlo de un hueco real importa:
+    // al hueco hay que arreglarlo, a la relación hay que dejarla en paz.
+    const { rows: rel } = await pool.query(
+      `SELECT 1 FROM coexistence.ia360_contact_scope cs
+         JOIN coexistence.ia360_accounts a ON a.account_key = cs.account_key
+        WHERE cs.contact_number = $1 AND cs.activo AND cs.rol <> 'owner' AND a.con_backlog = false
+        LIMIT 1`,
+      [contactNumber]
+    );
+    return { ok: false, motivo: rel.length ? 'cuenta de relacion, sin backlog por decision (P23)' : 'sin proyectos autorizados' };
+  }
+  const ult4 = String(contactNumber).slice(-4);
+  const marca = `contacto ...${ult4}`;
+  // Si el contacto es el ÚNICO champion activo de su cuenta, los pendientes de la
+  // cuenta SÍ son suyos y decírselo es correcto. Si comparte cuenta con otros
+  // (Hendri y Juan Carlos en Camiones Selectos), sólo cuentan los que traen su
+  // marca: nadie carga con los pendientes del vecino.
+  const { rows: soloEl } = await pool.query(
+    `SELECT count(*)::int AS n
+       FROM coexistence.ia360_contact_scope s
+      WHERE s.activo AND s.rol <> 'owner'
+        AND s.account_key IN (SELECT account_key FROM coexistence.ia360_contact_scope
+                               WHERE contact_number=$1 AND activo AND rol <> 'owner')`,
+    [contactNumber]
+  );
+  const esUnicoChampion = (soloEl[0]?.n || 0) === 1;
+  const hdrs = { 'X-Api-Key': token, 'User-Agent': 'Mozilla/5.0' };
+  const abiertos = [];
+  for (const r of rows) {
+    const base = `https://plane.geekstudio.dev/api/v1/workspaces/${r.plane_workspace}/projects/${r.plane_project_id}`;
+    // El work item trae `state` como uuid, no el grupo: sin este mapa un item
+    // cancelado o terminado se contaría como pendiente.
+    const stRes = await fetch(`${base}/states/`, { headers: hdrs, signal: AbortSignal.timeout(20000) }).catch(() => null);
+    const grupoPorEstado = new Map();
+    if (stRes && stRes.ok) {
+      const st = await stRes.json().catch(() => ({}));
+      for (const s of (st.results || [])) grupoPorEstado.set(s.id, s.group);
+    }
+    const res = await fetch(`${base}/work-items/?per_page=100`, { headers: hdrs, signal: AbortSignal.timeout(20000) }).catch(() => null);
+    if (!res || !res.ok) continue;
+    const body = await res.json().catch(() => ({}));
+    for (const w of (body.results || [])) {
+      const grupo = grupoPorEstado.get(w.state) || '';
+      if (w.completed_at || grupo === 'completed' || grupo === 'cancelled') continue;
+      if (!esUnicoChampion && !String(w.description_html || '').includes(marca)) continue;
+      abiertos.push({ referencia: w.sequence_id, nombre: w.name, prioridad: w.priority || 'none' });
+    }
+  }
+  abiertos.sort((a, b) => (PRIORIDAD_PESO[b.prioridad] || 0) - (PRIORIDAD_PESO[a.prioridad] || 0));
+  return { ok: true, abiertos };
+}
+
+function elegirPlantillaDePendientes({ nombre, abiertos, esperaAccionDelContacto, faltaValidar }) {
+  if (!abiertos.length) return null;
+  const top = abiertos[0];
+  if (faltaValidar) {
+    return { templateName: 'ia360_seguimiento_entregable_v1', vars: [nombre, top.nombre], motivo: 'entregable listo, falta que lo valide' };
+  }
+  if (esperaAccionDelContacto) {
+    return {
+      templateName: 'ia360_pendiente_esperamos_respuesta',
+      vars: [nombre, top.nombre, String(esperaAccionDelContacto)],
+      motivo: 'falta una acción suya',
+    };
+  }
+  if (abiertos.length >= 2) {
+    return { templateName: 'ia360_pendientes_resumen', vars: [nombre, String(abiertos.length), top.nombre], motivo: '2+ pendientes, ninguno depende de él' };
+  }
+  return null;
+}
+
+router.post('/internal/ia360-pendientes/nudge', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    // dry_run por defecto TRUE: para mandar de verdad hay que pedirlo explícitamente.
+    const dryRun = b.dry_run !== false;
+    const waNumber = normalizePhone(b.wa_number || process.env.IA360_WA_NUMBER || '5213321594582');
+    const soloContacto = normalizePhone(b.contact_number || '');
+    const { rows: champions } = await pool.query(
+      `WITH ult AS (
+         SELECT contact_number, max(created_at) FILTER (WHERE direction='incoming') AS ue
+           FROM coexistence.chat_history GROUP BY contact_number)
+       SELECT cs.contact_number,
+              -- El perfil de WhatsApp suele traer el cargo entero («Hendri Salas
+              -- Hernández Director Operativo Camiones Selectos»). En un saludo eso
+              -- suena a formulario: se usan las dos primeras palabras.
+              -- Ojo: E'\\s' en Postgres NO es "espacio", es la letra s (no es un
+              -- escape reconocido). Con eso «José» salía «Jo é». Clase POSIX.
+              array_to_string((string_to_array(regexp_replace(COALESCE(NULLIF(trim(c.name),''), NULLIF(trim(c.profile_name),''), 'ahí'), '[[:space:]]+', ' ', 'g'), ' '))[1:2], ' ') AS nombre,
+              round(EXTRACT(EPOCH FROM (now()-u.ue))/3600, 1) AS horas
+         FROM coexistence.ia360_contact_scope cs
+         JOIN ult u ON u.contact_number = cs.contact_number
+         LEFT JOIN coexistence.contacts c ON c.contact_number = cs.contact_number
+        WHERE cs.activo AND cs.rol <> 'owner'
+          AND now() - u.ue >= interval '23 hours 30 minutes'
+          AND ($1 = '' OR cs.contact_number = $1)`,
+      [soloContacto]
+    );
+    const plan = [];
+    for (const ch of champions) {
+      const pend = await pendientesVivosDeContacto(ch.contact_number);
+      if (!pend.ok) { plan.push({ ult4: ch.contact_number.slice(-4), nombre: ch.nombre, horas: Number(ch.horas), accion: 'omitido', motivo: pend.motivo }); continue; }
+      const eleccion = elegirPlantillaDePendientes({
+        nombre: ch.nombre,
+        abiertos: pend.abiertos,
+        esperaAccionDelContacto: b.espera_accion || null,
+        faltaValidar: b.falta_validar === true,
+      });
+      if (!eleccion) { plan.push({ ult4: ch.contact_number.slice(-4), nombre: ch.nombre, horas: Number(ch.horas), accion: 'omitido', motivo: 'sin pendientes abiertos' }); continue; }
+      const fila = {
+        ult4: ch.contact_number.slice(-4), nombre: ch.nombre, horas: Number(ch.horas),
+        plantilla: eleccion.templateName, vars: eleccion.vars, motivo: eleccion.motivo,
+        pendientes_abiertos: pend.abiertos.length,
+      };
+      if (dryRun) { fila.accion = 'simulado'; plan.push(fila); continue; }
+      const envio = await enqueueIa360Template({
+        record: { wa_number: waNumber, contact_number: ch.contact_number, message_id: `ia360-nudge-${ch.contact_number}-${Date.now()}`, message_body: '', message_type: 'text' },
+        label: 'ia360_pendientes_nudge',
+        templateName: eleccion.templateName,
+        vars: eleccion.vars,
+        allowTextFallback: false,
+      });
+      fila.accion = envio.ok ? 'enviado' : 'fallo';
+      fila.detalle = envio.ok ? null : (envio.status || envio.error || 'desconocido');
+      plan.push(fila);
+    }
+    return res.json({ ok: true, schema: 'ia360_pendientes_nudge.v1', dry_run: dryRun, ventana: 'cerrada (>=23.5 h)', total: plan.length, plan });
+  } catch (err) {
+    console.error('[ia360-nudge] error:', err.message);
+    return res.status(500).json({ ok: false, error: 'nudge_failed' });
   }
 });
 

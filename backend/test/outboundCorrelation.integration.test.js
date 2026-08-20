@@ -120,7 +120,10 @@ test('correlación saliente usa Postgres y Redis reales en contenedores efímero
       timestamp TIMESTAMPTZ NOT NULL,
       template_meta JSONB,
       context_message_id TEXT,
-      error_message TEXT
+      error_message TEXT,
+      surface_attestation_ref TEXT,
+      outbound_purpose TEXT,
+      case_ref TEXT
     )`);
     await pool.query(`CREATE UNIQUE INDEX chat_history_ia360_handler_dedupe
       ON coexistence.chat_history (contact_number, (template_meta->>'ia360_handler_for'))
