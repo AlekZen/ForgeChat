@@ -33,6 +33,14 @@ const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia
 const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
 const { buildIa360MemoryJaulaWhere } = require('../services/ia360MemoryIsolation');
+const {
+  buildIa360ContinuationContext,
+  buildIa360ContextualMemorySignal,
+  buildIa360SharedThreadFallback,
+  extractIa360LastQuestion,
+  isIa360AgentFailure,
+  loadIa360AccountContext,
+} = require('../services/ia360SharedThread');
 const { handleDiapazoInbound } = require('./diapazo-inbound'); // G7: ruteo INBOUND DIAPAZO (aditivo, flag-gated, reversible)
 const {
   IA360_DEFAULT_PIPELINE_NAME,
@@ -584,7 +592,7 @@ function ia360StageMode(stageName) {
 // los demás. Esto carga ese contexto desde la única fuente que ya comparten
 // todos: la base de datos (chat_history + el ledger de promesas).
 async function loadIa360ThreadContext({ record }) {
-  const ctx = { otroAgente: null, promesas: [] };
+  const ctx = { otroAgente: null, ultimaPregunta: null, promesas: [] };
   if (!record?.contact_number) return ctx;
   try {
     // ¿El último saliente del hilo lo mandó alguien que NO es Alekito? Si sí, lo
@@ -594,7 +602,9 @@ async function loadIa360ThreadContext({ record }) {
               EXTRACT(EPOCH FROM (NOW() - created_at))/60 AS minutos,
               CASE WHEN template_meta->>'label' LIKE 'ia360%'
                      OR template_meta->>'source' LIKE 'webhook%' THEN 'alekito'
-                   ELSE 'otro_agente' END AS autor
+                   ELSE 'otro_agente' END AS autor,
+              COALESCE(NULLIF(template_meta->>'case_ref', ''), NULLIF(case_ref, '')) AS case_ref,
+              NULLIF(template_meta->>'reply_context', '') AS reply_context
          FROM coexistence.chat_history
         WHERE direction = 'outgoing'
           AND contact_number = $1
@@ -604,13 +614,25 @@ async function loadIa360ThreadContext({ record }) {
         LIMIT 1`,
       [record.contact_number]
     );
-    if (rows.length && rows[0].autor === 'otro_agente') {
-      ctx.otroAgente = {
-        texto: String(rows[0].message_body || '').replace(/\s+/g, ' ').slice(0, 300),
-        minutos: Math.max(1, Math.round(Number(rows[0].minutos) || 1)),
-      };
-      console.log('[ia360-thread] hilo compartido: otro agente escribió hace %d min a %s',
-        ctx.otroAgente.minutos, maskIa360Number(record.contact_number));
+    if (rows.length) {
+      const lastOutgoing = rows[0];
+      const texto = String(lastOutgoing.message_body || '').replace(/\s+/g, ' ').slice(0, 300);
+      const minutos = Math.max(1, Math.round(Number(lastOutgoing.minutos) || 1));
+      const pregunta = extractIa360LastQuestion(texto);
+      if (pregunta) {
+        ctx.ultimaPregunta = {
+          texto: pregunta,
+          autor: lastOutgoing.autor,
+          minutos,
+          caseRef: lastOutgoing.case_ref || null,
+          replyContext: lastOutgoing.reply_context || null,
+        };
+      }
+      if (lastOutgoing.autor === 'otro_agente') {
+        ctx.otroAgente = { texto, minutos };
+        console.log('[ia360-thread] hilo compartido: otro agente escribió hace %d min a %s',
+          ctx.otroAgente.minutos, maskIa360Number(record.contact_number));
+      }
     }
   } catch (e) {
     console.error('[ia360-thread] último autor:', e.message);
@@ -842,9 +864,12 @@ function isPassiveIa360Text(text) {
   return /^(ok|okay|gracias|va|sale|listo|perfecto|sí|si|no|👍|👌)[\s.!¡!¿?]*$/i.test(String(text || '').trim());
 }
 
-function extractIa360MemorySignals({ record, contact, agent = {} }) {
+function extractIa360MemorySignals({ record, contact, agent = {}, threadContext = null }) {
   const text = String(record?.message_body || '').trim();
-  if (!text || isPassiveIa360Text(text)) return [];
+  if (!text) return [];
+  const contextualSignal = buildIa360ContextualMemorySignal({ record, threadContext });
+  if (contextualSignal) return [contextualSignal];
+  if (isPassiveIa360Text(text)) return [];
   const matches = IA360_MEMORY_SIGNAL_CATALOG.filter(item => item.regex.test(text));
   if (matches.length) return matches.map(item => ({ ...item, shouldBeFact: true }));
   const extracted = agent?.extracted || {};
@@ -876,6 +901,7 @@ function buildIa360MemoryEventPayload({ record, contact, signal }) {
   const payload = {
     schema: 'ia360_memory_event.v1',
     source: 'whatsapp',
+    case_ref: signal.caseRef || null,
     contact: {
       forgechat_contact_id: profile.forgechatContactId || '',
       espo_contact_id: profile.espoContactId || '',
@@ -1310,12 +1336,12 @@ function buildIa360OwnerMemoryReadout({ record, signals, persisted }) {
   return lines.join('\n');
 }
 
-async function handleIa360ClienteActivoBetaLearning({ record, deal, contact, captureOnly = false }) {
+async function handleIa360ClienteActivoBetaLearning({ record, deal, contact, threadContext = null, captureOnly = false }) {
   const memoryBefore = await lookupIa360MemoryContext({ record, contact }).catch(err => {
     console.error('[ia360-memory] lookup before reply:', err.message);
     return { events: [], facts: [] };
   });
-  const signals = extractIa360MemorySignals({ record, contact, agent: { action: 'cliente_activo_beta_learning' } });
+  const signals = extractIa360MemorySignals({ record, contact, agent: { action: 'cliente_activo_beta_learning' }, threadContext });
   if (!signals.length) return false;
   const persisted = await persistIa360MemorySignals({ record, contact, signals });
   const memoryAfter = await lookupIa360MemoryContext({ record, contact }).catch(() => memoryBefore);
@@ -3219,7 +3245,14 @@ async function getActiveNonTerminalIa360Deal(record) {
 
 const N8N_IA360_CONTACT_INTEL_WEBHOOK_URL = process.env.N8N_IA360_CONTACT_INTEL_WEBHOOK_URL || 'https://n8n.geekstudio.dev/webhook/ia360-contact-intelligence-agent-draft';
 
-function buildIa360AgentPayload({ record, stageName, history, source }) {
+function buildIa360AgentPayload({
+  record,
+  stageName,
+  history,
+  source,
+  accountContext = null,
+  conversationContext = null,
+}) {
   return {
     source,
     channel: 'whatsapp',
@@ -3238,10 +3271,18 @@ function buildIa360AgentPayload({ record, stageName, history, source }) {
     contract_version: 2,
     message_type: record.message_type || 'text',
     structured: buildIa360StructuredPayload(record),
+    account_context: accountContext,
+    conversation_context: conversationContext,
   };
 }
 
-async function shadowIa360ContactIntelligence({ record, stageName, history }) {
+async function shadowIa360ContactIntelligence({
+  record,
+  stageName,
+  history,
+  accountContext,
+  conversationContext,
+}) {
   const url = N8N_IA360_CONTACT_INTEL_WEBHOOK_URL;
   if (!url) return;
   try {
@@ -3253,6 +3294,8 @@ async function shadowIa360ContactIntelligence({ record, stageName, history }) {
         stageName,
         history,
         source: 'forgechat-ia360-contact-intelligence-shadow',
+        accountContext,
+        conversationContext,
       })),
     });
     if (!res.ok) console.error('[ia360-contact-intel] shadow failed:', res.status);
@@ -3261,7 +3304,7 @@ async function shadowIa360ContactIntelligence({ record, stageName, history }) {
   }
 }
 
-async function callIa360Agent({ record, stageName, roleHint = null, memory = null }) {
+async function callIa360Agent({ record, stageName, roleHint = null, memory = null, threadContext = null }) {
   // Conversación reciente (últimos 8 mensajes) CON AUTORÍA. Hasta 12-ago-2026 el
   // historial iba como {dir, body}: todo lo saliente parecía dicho por Alekito.
   // Ya no es cierto — a estos mismos contactos les escriben otros agentes de
@@ -3275,13 +3318,26 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
               WHEN template_meta->>'label' LIKE 'ia360%'
                 OR template_meta->>'source' LIKE 'webhook%' THEN 'alekito'
               ELSE 'otro_agente'
-            END AS autor
+            END AS autor,
+            NULLIF(template_meta->>'case_ref', '') AS case_ref,
+            NULLIF(template_meta->>'reply_context', '') AS reply_context
        FROM coexistence.chat_history
       WHERE wa_number = $1 AND contact_number = $2
       ORDER BY timestamp DESC LIMIT 8`,
     [record.wa_number, record.contact_number]
   );
-  const history = hist.reverse().map(h => ({ dir: h.dir, body: h.body, autor: h.autor }));
+  const history = hist.reverse().map(h => ({
+    dir: h.dir,
+    body: h.body,
+    autor: h.autor,
+    caseRef: h.case_ref || null,
+    replyContext: h.reply_context || null,
+  }));
+  const accountContext = await loadIa360AccountContext(pool, record).catch(error => {
+    console.error('[ia360-agent] account context failed:', error.message);
+    return null;
+  });
+  const conversationContext = buildIa360ContinuationContext(history, threadContext, record);
 
   // EXPEDIENTE: memoria por contacto (facts+events) para que el agente responda
   // con contexto real del negocio del contacto, no en frio. Best-effort.
@@ -3299,7 +3355,13 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
 
   const primaryIa360AgentUrl = process.env.N8N_IA360_AGENT_WEBHOOK_URL;
   if (N8N_IA360_CONTACT_INTEL_WEBHOOK_URL && N8N_IA360_CONTACT_INTEL_WEBHOOK_URL !== primaryIa360AgentUrl) {
-    shadowIa360ContactIntelligence({ record, stageName, history }).catch(() => {});
+    shadowIa360ContactIntelligence({
+      record,
+      stageName,
+      history,
+      accountContext,
+      conversationContext,
+    }).catch(() => {});
   }
 
   const url = primaryIa360AgentUrl;
@@ -3319,6 +3381,8 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
           stageName,
           history,
           source: 'forgechat-ia360-webhook',
+          accountContext,
+          conversationContext,
         }),
         memory: agentMemory,
         // G-LIVE: el Normalize del workflow mapea `role` a contact.role dentro del
@@ -8956,8 +9020,14 @@ async function handleIa360FreeText(record) {
       //    no suma latencia al camino caliente) y NUNCA cuenta como respuesta (la
       //    clase del bug de Andrés: dry-run devolvía true y el padre creía que ya
       //    había respondido).
-      handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext, captureOnly: true })
-        .catch(e => console.error('[ia360-memory] capture error:', e.message));
+      const betaThread = await loadIa360ThreadContext({ record });
+      handleIa360ClienteActivoBetaLearning({
+        record,
+        deal,
+        contact: contactContext,
+        threadContext: betaThread,
+        captureOnly: true,
+      }).catch(e => console.error('[ia360-memory] capture error:', e.message));
 
       // 2) Datos vivos del portal del cliente: WhatsApp no tiene acceso => handoff
       //    explícito y honesto. NUNCA inventar listas ni cifras.
@@ -9008,8 +9078,7 @@ async function handleIa360FreeText(record) {
       } catch (e) {
         console.error('[ia360-agent] beta memory lookup failed:', e.message);
       }
-      // MULTI-AGENTE: qué le dijo otro agente y qué le debemos ya.
-      const betaThread = await loadIa360ThreadContext({ record });
+      // MULTI-AGENTE: el hilo ya se cargó antes de capturar aprendizaje.
       const agentBeta = qaForceDown
         ? null
         : await callIa360Agent({
@@ -9020,8 +9089,10 @@ async function handleIa360FreeText(record) {
               buildIa360ConversationRoleHint({ contact: contactContext, stageName: deal.stage_name, convState: betaConvState, memory: betaMemory, messageBody: record.message_body, threadContext: betaThread, mediaCaption }),
             ].join(' | '),
             memory: betaMemory,
+            threadContext: betaThread,
           });
-      let betaReply = agentBeta && typeof agentBeta.reply === 'string' ? agentBeta.reply.trim() : '';
+      const betaAgentFailed = isIa360AgentFailure(agentBeta);
+      let betaReply = betaAgentFailed ? '' : agentBeta.reply.trim();
       // Deuda G-LIVE cerrada: post-filtro de pitch en código. Si el contacto es
       // do_not_pitch y el reply huele a venta, NO sale: respuesta segura + aviso.
       if (betaReply && isIa360DoNotPitchContact(contactContext) && ia360ReplySmellsLikePitch(betaReply)) {
@@ -9064,12 +9135,22 @@ async function handleIa360FreeText(record) {
         }
       }
 
-      // 4) Holding SOLO si el agente falló o no devolvió respuesta utilizable:
-      //    holding al contacto + alerta al owner + failure registrado.
+      // 4) Provider caído/canned reply: continuidad determinista si existe pregunta.
+      const betaContextualFallback = buildIa360SharedThreadFallback({ record, threadContext: betaThread });
+      let betaFallbackSent = false;
+      if (betaContextualFallback) {
+        betaFallbackSent = await enqueueIa360AgentReply({
+          record,
+          label: 'ia360_shared_thread_fallback',
+          body: betaContextualFallback,
+        }).catch(() => false);
+      }
       await handleIa360BotFailure({
         record,
-        reason: 'cliente activo/beta: agente IA sin respuesta utilizable (caído, timeout o reply vacío)',
-        alreadyResponded: false,
+        reason: agentBeta?.agent_error_code
+          ? `cliente activo/beta: ${agentBeta.agent_error_code}`
+          : 'cliente activo/beta: agente IA sin respuesta utilizable (caído, timeout o reply vacío)',
+        alreadyResponded: Boolean(betaFallbackSent),
       }).catch(e => console.error('[ia360-failure] cliente-activo fallback error:', e.message));
       responded = true;
       return;
@@ -9093,20 +9174,23 @@ async function handleIa360FreeText(record) {
       stageName: deal.stage_name,
       roleHint: buildIa360ConversationRoleHint({ contact: convContact, stageName: deal.stage_name, convState, memory: convMemory, messageBody: record.message_body, threadContext: convThread, mediaCaption }),
       memory: convMemory,
+      threadContext: convThread,
     });
-    if (!agent || !agent.reply) {
-      // Agent unavailable (n8n down / webhook unregistered) → holding reply, never silence.
-      // G-BRAIN: vía enqueueIa360AgentReply — si otra ruta ya contestó, ni holding.
-      await enqueueIa360AgentReply({ record, label: 'ia360_ai_holding', body: 'Déjame revisar esto y te confirmo en un momento.' }).catch(() => {});
+    if (isIa360AgentFailure(agent)) {
+      // Provider caído/canned reply: responder la pregunta compartida o usar el holding normal.
+      const contextualFallback = buildIa360SharedThreadFallback({ record, threadContext: convThread });
+      const fallbackSent = await enqueueIa360AgentReply({
+        record,
+        label: contextualFallback ? 'ia360_shared_thread_fallback' : 'ia360_ai_holding',
+        body: contextualFallback || 'Déjame revisar esto y te confirmo en un momento.',
+      }).catch(() => false);
       responded = true;
-      // D) ALERTA AL OWNER si el cerebro del bot (n8n) está caído/timeout. Además del
-      //    holding-reply de arriba (el contacto ya quedó atendido → alreadyResponded:true),
-      //    logueamos en ia360_bot_failures + alertamos a Alek, para que se entere de que el
-      //    agente IA no respondió (no solo silencio operativo).
       await handleIa360BotFailure({
         record,
-        reason: 'agente IA no disponible (n8n caído o timeout)',
-        alreadyResponded: true,
+        reason: agent?.agent_error_code
+          ? `agente IA no disponible (${agent.agent_error_code})`
+          : 'agente IA no disponible (n8n caído, timeout o reply genérico)',
+        alreadyResponded: Boolean(fallbackSent),
       }).catch(e => console.error('[ia360-failure] agent-down alert error:', e.message));
       return;
     }

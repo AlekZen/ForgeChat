@@ -1021,7 +1021,7 @@ router.post('/messages/star', async (req, res) => {
 
 /**
  * POST /messages/send
- * Body: { fromNumber, toNumber, text }
+ * Body: { fromNumber, toNumber, text, caseRef?, replyContext?, purpose?, surfaceKey? }
  * Inserts an optimistic chat_history row (status='sending') and enqueues a
  * BullMQ job. Returns the row immediately so the UI can render the bubble.
  */
@@ -1033,6 +1033,7 @@ router.post('/messages/send', async (req, res) => {
       text,
       contextMessageId,
       caseRef,
+      replyContext,
       purpose,
       surfaceKey,
     } = req.body || {};
@@ -1042,19 +1043,47 @@ router.post('/messages/send', async (req, res) => {
     if (String(text).length > 4096) {
       return res.status(400).json({ error: 'Message too long (max 4096 characters)' });
     }
-    const forbidden = ['account_key', 'accountKey', 'attestation', 'attestationRef', 'signature', 'url'];
+    const forbidden = [
+      'account_key', 'accountKey', 'attestation', 'attestationRef', 'signature', 'url',
+      'phone', 'author', 'history',
+    ];
     if (forbidden.some(key => Object.prototype.hasOwnProperty.call(req.body || {}, key))) {
       return res.status(400).json({ error: 'Server-derived surface fields are not accepted.', code: 'SURFACE_NOT_AUTHORIZED' });
     }
-    const contractFields = [caseRef, purpose, surfaceKey];
-    const hasContractField = contractFields.some(value => value != null && String(value).trim() !== '');
-    const hasCompleteContract = contractFields.every(value => value != null && String(value).trim() !== '');
-    if (hasContractField && !hasCompleteContract) {
+    const normalizedCaseRef = caseRef == null ? '' : String(caseRef).trim();
+    const normalizedReplyContext = replyContext == null ? '' : String(replyContext).trim();
+    const normalizedPurpose = purpose == null ? '' : String(purpose).trim();
+    const normalizedSurfaceKey = surfaceKey == null ? '' : String(surfaceKey).trim();
+    const hasCaseRef = normalizedCaseRef !== '';
+    const hasReplyContext = normalizedReplyContext !== '';
+    const hasPurpose = normalizedPurpose !== '';
+    const hasSurface = normalizedSurfaceKey !== '';
+    const someSurfaceDetails = hasPurpose || hasSurface;
+    const hasCompleteContract = hasCaseRef && hasPurpose && hasSurface;
+    if (someSurfaceDetails && !hasCompleteContract) {
       return res.status(400).json({
         error: 'caseRef, purpose and surfaceKey must be supplied together.',
         code: 'INVALID_PURPOSE',
       });
     }
+    if ((hasReplyContext && !hasCaseRef)
+        || (hasCaseRef && !hasReplyContext && !hasCompleteContract)) {
+      return res.status(400).json({
+        error: 'caseRef and replyContext must be supplied together when no surface contract is present.',
+        code: 'INVALID_CONTEXT_CONTRACT',
+      });
+    }
+    if (hasCaseRef && normalizedCaseRef.length > 120) {
+      return res.status(400).json({ error: 'caseRef too long (max 120 characters)', code: 'INVALID_CONTEXT_CONTRACT' });
+    }
+    if (hasReplyContext && normalizedReplyContext.length > 500) {
+      return res.status(400).json({ error: 'replyContext too long (max 500 characters)', code: 'INVALID_CONTEXT_CONTRACT' });
+    }
+    const handoffTemplateMeta = hasReplyContext ? {
+      source: 'nexus_cli',
+      case_ref: normalizedCaseRef,
+      reply_context: normalizedReplyContext,
+    } : null;
     if (!(await assertContactAccess(req, res, fromNumber, toNumber))) return;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: fromNumber });
@@ -1092,9 +1121,9 @@ router.post('/messages/send', async (req, res) => {
         const correlationId = localMessageId();
         const attestation = await attestOutboundPayload(client, {
           accountKey,
-          caseRef: String(caseRef),
-          purpose: String(purpose),
-          surfaceKey: String(surfaceKey),
+          caseRef: normalizedCaseRef,
+          purpose: normalizedPurpose,
+          surfaceKey: normalizedSurfaceKey,
           body: trimmedText,
           correlationId,
           actorId: String(req.user?.id || 'operator'),
@@ -1108,8 +1137,9 @@ router.post('/messages/send', async (req, res) => {
           db: client,
           correlationId,
           surfaceAttestationRef: attestation?.attestationRef || null,
-          outboundPurpose: String(purpose),
-          caseRef: String(caseRef),
+          outboundPurpose: normalizedPurpose,
+          caseRef: normalizedCaseRef,
+          templateMeta: handoffTemplateMeta,
         });
         await client.query('COMMIT');
       } catch (contractError) {
@@ -1125,6 +1155,7 @@ router.post('/messages/send', async (req, res) => {
         messageType: 'text',
         messageBody: trimmedText,
         contextMessageId: ctxId,
+        templateMeta: handoffTemplateMeta,
       });
     }
 
