@@ -173,4 +173,22 @@ async function sendReaction({ accessToken, phoneNumberId, to, messageId, emoji }
   });
 }
 
-module.exports = { sendText, sendTemplate, sendMedia, sendInteractive, sendLocation, sendContacts, sendReaction, uploadMedia };
+/**
+ * Marca un mensaje ENTRANTE como leído: las palomitas azules que ve el contacto.
+ *
+ * Portado de forgechat-g1g2 (`dac77fb`, 08-ago-2026), donde se escribió con su
+ * suite de integración pero nunca llegó al repo que corre en producción.
+ *
+ * NO se llama al recibir. Se llama cuando ya hay respuesta encolada para ese
+ * inbound (ver `insertPendingRow`): una palomita azul seguida de silencio es peor
+ * que ninguna palomita, porque promete atención que no llegó.
+ */
+async function markMessageRead({ accessToken, phoneNumberId, messageId }) {
+  return postJson(url(phoneNumberId), accessToken, {
+    messaging_product: 'whatsapp',
+    status: 'read',
+    message_id: String(messageId),
+  });
+}
+
+module.exports = { sendText, sendTemplate, sendMedia, sendInteractive, sendLocation, sendContacts, sendReaction, markMessageRead, uploadMedia };

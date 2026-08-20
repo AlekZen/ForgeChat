@@ -8,6 +8,7 @@ const cookieParser = require('cookie-parser');
 const pool = require('./db');
 const { router: authRouter, authMiddleware, ensureTables } = require('./auth');
 const { router: messagesRouter } = require('./routes/messages');
+const { router: followUpsRouter } = require('./routes/followUps');
 const { router: webhookRouter } = require('./routes/webhook');
 const { router: ia360IntakeRouter } = require('./routes/ia360-intake');
 const { router: ia360CalendarRouter } = require('./routes/ia360-calendar');
@@ -27,6 +28,7 @@ const { router: dashboardRouter } = require('./routes/dashboard');
 const { router: pipelinesRouter } = require('./routes/pipelines');
 const { startWorker: startMediaWorker, shutdown: shutdownMediaQueue } = require('./queue/mediaQueue');
 const { startSendWorker, shutdownSendQueue } = require('./queue/sendQueue');
+const { startFollowUpReconciler, stopFollowUpReconciler } = require('./services/followUpReconciler');
 const { startReminderScheduler } = require('./services/ia360Reminders');
 const { startDiapazoSesionRecordatorio } = require('./services/diapazoSesionRecordatorio');
 const { startIa360FailuresSweep } = require('./services/botFailuresDigest');
@@ -114,6 +116,7 @@ app.use('/api', authRouter);
 
 // Protected routes
 app.use('/api', authMiddleware, messagesRouter);
+app.use('/api', authMiddleware, followUpsRouter);
 app.use('/api', authMiddleware, categoriesRouter);
 app.use('/api', authMiddleware, contactFieldsRouter);
 app.use('/api', authMiddleware, usersRouter);
@@ -143,6 +146,7 @@ async function start() {
   );
   startMediaWorker();
   startSendWorker();
+  startFollowUpReconciler();
   startReminderScheduler(); // IA360 per-meeting reminders (self-contained)
   startDiapazoSesionRecordatorio(); // DIAPAZO: recordatorio de Sesión de Afinación abandonada (>24 h sin submit)
   startDiapazoPoller(); // G6: poll de taps diapazo_* del owner en chat_history (egress human-gated)
@@ -211,6 +215,7 @@ async function start() {
   const shutdown = async (sig) => {
     console.log(`[ForgeChat] ${sig} received, draining…`);
     server.close(() => {});
+    stopFollowUpReconciler();
     await shutdownMediaQueue();
     await shutdownSendQueue();
     process.exit(0);
