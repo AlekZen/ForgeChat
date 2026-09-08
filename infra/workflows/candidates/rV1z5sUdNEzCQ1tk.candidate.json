@@ -12,7 +12,7 @@
         "responseMode": "responseNode",
         "options": {}
       },
-      "id": "a1111111-1111-4111-8111-111111111111",
+      "id": "Webhook Cancel",
       "name": "Webhook Cancel",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
@@ -25,9 +25,9 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: Bearer token required for raw cancel writer');\n}\n\nconst payload = raw.body || raw;\nconst calendarEventId = String(payload.calendarEventId || payload.event_id || '').trim();\nconst zoomMeetingId = String(payload.zoomMeetingId || payload.zoom_id || '').trim();\nconst calendarId = payload.calendarId || 'ocompudoc@gmail.com';\n\nif (!calendarEventId && !zoomMeetingId) {\n  throw new Error('Missing calendarEventId/zoomMeetingId');\n}\n\nreturn [{ json: { calendarEventId, zoomMeetingId, calendarId } }];"
+        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: Bearer token required for raw cancel writer');\n}\n\nconst payload = raw.body || raw;\nlet rawRes = payload.resources;\nif (typeof rawRes === 'string') {\n  try { rawRes = JSON.parse(rawRes); } catch (e) { rawRes = rawRes.split(',').map(s => s.trim()); }\n}\nif (!Array.isArray(rawRes) || rawRes.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources es obligatorio y debe ser un array no vacio de \"calendar\" y/o \"zoom\".');\n}\nconst validSet = new Set(['calendar', 'zoom']);\nfor (const r of rawRes) {\n  if (!validSet.has(r)) {\n    throw new Error(`RECURSOS_INVALIDOS: recurso desconocido \"${r}\". Solo se permite \"calendar\" y/o \"zoom\".`);\n  }\n}\nconst unique = Array.from(new Set(rawRes));\nconst resources = ['calendar', 'zoom'].filter(r => unique.includes(r));\nif (resources.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources no contiene recursos validos.');\n}\n\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst calendarEventId = String(payload.calendarEventId || payload.event_id || '').trim();\nconst zoomMeetingId = String(payload.zoomMeetingId || payload.zoom_id || '').trim();\nconst calendarId = payload.calendarId || 'ocompudoc@gmail.com';\n\nif (needCalendar && !calendarEventId) {\n  throw new Error('MISSING_CALENDAR_EVENT_ID: calendarEventId es obligatorio para cancelar recurso calendar.');\n}\nif (needZoom && !zoomMeetingId) {\n  throw new Error('MISSING_ZOOM_MEETING_ID: zoomMeetingId es obligatorio para cancelar recurso zoom.');\n}\n\nreturn [{ json: { ...payload, resources, needCalendar, needZoom, calendarEventId, zoomMeetingId, calendarId } }];"
       },
-      "id": "d4444444-4444-4444-8444-444444444444",
+      "id": "Normalize Cancel",
       "name": "Normalize Cancel",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -38,51 +38,115 @@
     },
     {
       "parameters": {
-        "resource": "event",
-        "operation": "delete",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendarId }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $json.calendarEventId }}",
-        "options": {}
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-zoom-cancel-1",
+              "leftValue": "={{ $json.needZoom }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
       },
-      "id": "b2222222-2222-4222-8222-222222222222",
-      "name": "Delete Calendar Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.3,
+      "id": "If Cancel Zoom",
+      "name": "If Cancel Zoom",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
       "position": [
         440,
         0
-      ],
-      "credentials": {
-        "googleCalendarOAuth2Api": {
-          "id": "dvgs8BuVIihlfrTn",
-          "name": "Google Calendar account"
-        }
-      }
+      ]
     },
     {
       "parameters": {
         "resource": "meeting",
         "operation": "delete",
-        "meetingId": "={{ $node[\"Normalize Cancel\"].json.zoomMeetingId }}"
+        "meetingId": "={{ $('Normalize Cancel').first().json.zoomMeetingId }}"
       },
-      "id": "c3333333-3333-4333-8333-333333333333",
+      "id": "Delete Zoom Meeting",
       "name": "Delete Zoom Meeting",
       "type": "n8n-nodes-base.zoom",
       "typeVersion": 1,
       "position": [
         660,
-        0
+        -120
       ],
       "credentials": {
         "zoomOAuth2Api": {
           "id": "21lumQ7GPjOQv2gr",
           "name": "Zoom account"
         }
-      }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-cal-cancel-1",
+              "leftValue": "={{ $('Normalize Cancel').first().json.needCalendar }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "If Cancel Calendar",
+      "name": "If Cancel Calendar",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "event",
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Normalize Cancel').first().json.calendarId }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $('Normalize Cancel').first().json.calendarEventId }}",
+        "options": {}
+      },
+      "id": "Delete Calendar Event",
+      "name": "Delete Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        -120
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "dvgs8BuVIihlfrTn",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
@@ -100,13 +164,13 @@
           "timeout": 30000
         }
       },
-      "id": "c6666666-6666-4666-8666-666666666666",
+      "id": "Verify Event Absence in Calendar",
       "name": "Verify Event Absence in Calendar",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        880,
-        0
+        1320,
+        -120
       ],
       "credentials": {
         "googleCalendarOAuth2Api": {
@@ -118,14 +182,14 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const norm = $('Normalize Cancel').first().json;\nconst getResp = $input.first() ? $input.first().json : {};\nconst statusCode = Number(getResp.statusCode || (getResp.status === 404 || getResp.status === 410 ? getResp.status : 0));\nconst body = getResp.body || getResp;\n\n// Google Calendar returns 404/410 or status 'cancelled' once deleted\nconst isAbsentInCalendar = !norm.calendarEventId || statusCode === 404 || statusCode === 410 || body.status === 'cancelled' || body.error?.code === 404 || body.error?.code === 410;\nconst verified = Boolean(isAbsentInCalendar);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'cancelled' : 'uncertain',\n    state: verified ? 'cancelada' : 'incierta',\n    calendarEventId: norm.calendarEventId,\n    zoomMeetingId: norm.zoomMeetingId,\n    provider_absence_verified: isAbsentInCalendar,\n    get_http_status: statusCode\n  }\n}];"
+        "jsCode": "const norm = $('Normalize Cancel').first().json;\nconst resources = norm.resources || [];\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst components = {};\nlet allVerified = true;\n\nif (needZoom) {\n  let zoomDelResp = null;\n  try { zoomDelResp = $('Delete Zoom Meeting').first()?.json; } catch (e) {}\n  const zoomError = zoomDelResp?.error?.message || zoomDelResp?.error || null;\n  const isZoomDeleted = !zoomError && (zoomDelResp?.success !== false);\n\n  if (isZoomDeleted) {\n    components.zoom = {\n      state: 'verified',\n      id: norm.zoomMeetingId\n    };\n  } else {\n    allVerified = false;\n    components.zoom = {\n      state: 'failed',\n      id: norm.zoomMeetingId,\n      error: zoomError || 'Zoom meeting deletion failed'\n    };\n  }\n}\n\nif (needCalendar) {\n  let getResp = null;\n  try { getResp = $('Verify Event Absence in Calendar').first()?.json; } catch (e) {}\n  const statusCode = Number(getResp?.statusCode || (getResp?.status === 404 || getResp?.status === 410 ? getResp.status : 0));\n  const body = getResp?.body || getResp || {};\n  const isAbsent = statusCode === 404 || statusCode === 410 || body.status === 'cancelled' || body.error?.code === 404 || body.error?.code === 410;\n\n  if (isAbsent) {\n    components.calendar = {\n      state: 'verified',\n      id: norm.calendarEventId\n    };\n  } else {\n    allVerified = false;\n    components.calendar = {\n      state: statusCode === 200 ? 'uncertain' : 'failed',\n      id: norm.calendarEventId,\n      error: `Calendar event still present (HTTP ${statusCode})`\n    };\n  }\n}\n\nconst verified = Boolean(allVerified && resources.length > 0);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'cancelled' : 'uncertain',\n    state: verified ? 'cancelada' : 'incierta',\n    resources,\n    components,\n    calendarEventId: norm.calendarEventId || null,\n    zoomMeetingId: norm.zoomMeetingId || null\n  }\n}];"
       },
-      "id": "c5555555-5555-4555-8555-555555555555",
+      "id": "Build Cancel Response",
       "name": "Build Cancel Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1100,
+        1540,
         0
       ]
     },
@@ -135,12 +199,12 @@
         "responseBody": "={{ $json }}",
         "options": {}
       },
-      "id": "c7777777-7777-4777-8777-777777777777",
+      "id": "Respond Cancel",
       "name": "Respond Cancel",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        1320,
+        1760,
         0
       ]
     }
@@ -161,14 +225,14 @@
       "main": [
         [
           {
-            "node": "Delete Calendar Event",
+            "node": "If Cancel Zoom",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Delete Calendar Event": {
+    "If Cancel Zoom": {
       "main": [
         [
           {
@@ -176,10 +240,46 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "If Cancel Calendar",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
     "Delete Zoom Meeting": {
+      "main": [
+        [
+          {
+            "node": "If Cancel Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Cancel Calendar": {
+      "main": [
+        [
+          {
+            "node": "Delete Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Cancel Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Calendar Event": {
       "main": [
         [
           {

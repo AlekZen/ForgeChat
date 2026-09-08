@@ -236,21 +236,17 @@ async function runReminderSweep() {
     return { ok: false, error: error || 'no account' };
   }
 
-  // Una fila POR REUNIÓN, no por destino. El reclamo atómico de fireReminder es
-  // at-most-once por (token, offset); desde que al confirmar se emiten DOS tokens
-  // para el mismo event_id (kind='cal' para calendario y kind='zoom' para la sala),
-  // barrer ambos mandaría el recordatorio DOS VECES. Medido en QA: dos
-  // ia360_os_meeting_reminder_1d idénticos entregados por la misma reunión.
-  // Anclar en kind='cal' conserva exactamente el comportamiento anterior (todas
-  // las filas existentes son 'cal') y deja el token 'zoom' solo para el botón
-  // "Entrar a la reunión".
+  // Una fila POR REUNIÓN, no por destino.
+  // Anclar en kind='cal' o (kind='zoom' cuando no hay event_id asociado)
+  // evita duplicar recordatorios cuando una reunión tiene Calendar y Zoom,
+  // al tiempo que cubre reuniones de Zoom solo.
   const { rows } = await pool.query(
     `SELECT token, contact_number, start_utc, summary, zoom_join_url, kind,
             reminder_1d_sent_at, reminder_sameday_am_sent_at,
             reminder_1h_sent_at, reminder_starting_sent_at
        FROM coexistence.ia360_meeting_links
       WHERE start_utc IS NOT NULL
-        AND kind = 'cal'
+        AND (kind = 'cal' OR (kind = 'zoom' AND (event_id IS NULL OR event_id = '')))
         AND start_utc > NOW() - INTERVAL '15 minutes'
         AND (reminder_1d_sent_at IS NULL
              OR reminder_sameday_am_sent_at IS NULL

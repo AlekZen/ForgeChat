@@ -20,8 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PRIVATE = Path('/home/alek/.config/diapazo/forgechat-musio-20260908/n8n')
 ORDER = ['IA360CalendarBook20260602', 'rV1z5sUdNEzCQ1tk', 'sjrkjf7IcM7ski0n', 'F1sj5tcJVa9R3Q9Z', 'IA360ContactIntelDraft20260605']
 MANIFEST = json.loads((ROOT / 'manifest/cutover-manifest.json').read_text())
-DRAFTS = dict(MANIFEST['active_baselines'])
-DRAFTS['IA360ContactIntelDraft20260605'] = '4cacd72f-6788-4585-8d39-d3c03e5bb84a'
+DRAFTS = MANIFEST['draft_baselines']
 NODE_SETTINGS = ('onError', 'retryOnFail', 'maxTries', 'waitBetweenTries', 'alwaysOutputData', 'executeOnce')
 ADD_FIELDS = ('id', 'name', 'type', 'typeVersion', 'parameters', 'position', 'credentials', 'disabled', 'notes')
 
@@ -151,8 +150,9 @@ class MCP:
             parts = [item['text'] for item in result.get('content', []) if item.get('type') == 'text']
             data = json.loads(parts[0]) if parts else {}
         if result.get('isError') or data.get('error') or data.get('success') is False:
-            # No payload dump: workflow errors can contain confidential node data.
-            raise RuntimeError('n8n_tool_failed:' + name + ':' + str(data.get('reason', 'inspect_private_journal')))
+            # Keep confidential details private, but retain the actual rejection.
+            private_write(PRIVATE / 'last-mcp-error.json', {'tool': name, 'result': result})
+            raise RuntimeError('n8n_tool_failed:' + name + ':inspect_private_last-mcp-error.json')
         return data
 
 
@@ -163,6 +163,14 @@ def assert_version(wid, active, draft):
     return value
 
 
+def restore_snapshot(api, wid, snapshot):
+    ops = operations(current(wid), snapshot)
+    if ops:
+        result = api.call('update_workflow', {'workflowId': wid, 'operations': ops, 'versionName': 'Preserve exact pre-cutover draft'})
+        if result.get('appliedOperations') != len(ops) or result.get('skippedOperations'):
+            raise RuntimeError('snapshot_restore_incomplete:' + wid)
+
+
 def plan():
     rows = []
     for wid in ORDER:
@@ -170,9 +178,10 @@ def plan():
         after = candidate(wid)
         ops = operations(before, after)
         rows.append({'workflow': wid, 'operations': len(ops), 'candidate_hash': digest(after), 'active': before['activeVersionId'], 'draft': before['versionId']})
-    # Authenticate only; this does not execute a workflow.
+    # Check access to EVERY target before the first write. No workflow execution.
     api = MCP()
-    api.call('get_workflow_details', {'workflowId': ORDER[-1], 'detailLevel': 'execution'})
+    for wid in ORDER:
+        api.call('get_workflow_details', {'workflowId': wid, 'detailLevel': 'execution'})
     return rows
 
 
@@ -213,8 +222,9 @@ def apply():
             raise RuntimeError('runtime_version_readback_mismatch:' + wid)
         entry.update(new_active=live['activeVersionId'], stage='published')
         private_write(state_path, journal)
-        if before['versionId'] != before['activeVersionId']:
-            api.call('restore_workflow_version', {'workflowId': wid, 'versionId': before['versionId']})
+        if before['versionId'] != before['activeVersionId'] or digest(before) != digest(historical(wid, before['activeVersionId'])):
+            # Stored draft content can differ from history even with an equal ID.
+            restore_snapshot(api, wid, before)
             restored = current(wid)
             if restored['activeVersionId'] != live['activeVersionId'] or digest(restored) != digest(before):
                 raise RuntimeError('preserved_draft_readback_mismatch:' + wid)
@@ -230,16 +240,24 @@ def rollback():
     api = MCP()
     for entry in reversed(journal['entries']):
         wid = entry['workflow']
+        if entry['stage'] == 'rolled_back':
+            continue
         if entry['stage'] == 'before_update':
-            raise RuntimeError('ambiguous_update_requires_inspection:' + wid)
+            untouched = assert_version(wid, entry['old_active'], entry['old_draft'])
+            saved = json.loads((PRIVATE / (wid + '.before.json')).read_text())
+            if digest(untouched) != digest(saved['draft']):
+                raise RuntimeError('ambiguous_update_requires_inspection:' + wid)
+            entry.update(stage='rolled_back', readback_unchanged=True)
+            private_write(path, journal)
+            continue
         expected_active = entry.get('new_active', entry['old_active'])
         expected_draft = entry.get('preserved_draft_version', entry['new_draft'])
         assert_version(wid, expected_active, expected_draft)
         if entry.get('new_active'):
             api.call('publish_workflow', {'workflowId': wid, 'versionId': entry['old_active']})
-        api.call('restore_workflow_version', {'workflowId': wid, 'versionId': entry['old_draft']})
-        restored = current(wid)
         before = json.loads((PRIVATE / (wid + '.before.json')).read_text())
+        restore_snapshot(api, wid, before['draft'])
+        restored = current(wid)
         if restored['activeVersionId'] != entry['old_active'] or digest(restored) != digest(before['draft']):
             raise RuntimeError('rollback_readback_failed:' + wid)
         entry['stage'] = 'rolled_back'

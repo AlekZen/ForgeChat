@@ -15,6 +15,14 @@
               "type": "string"
             },
             {
+              "name": "zoom_id",
+              "type": "string"
+            },
+            {
+              "name": "resources",
+              "type": "string"
+            },
+            {
               "name": "numero_contacto",
               "type": "string"
             },
@@ -45,7 +53,7 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const inp = $input.first().json || {};\nconst eventoId = String(inp.evento_id || '').trim();\nconst contacto = String(inp.numero_contacto || '').replace(/\\D/g, '');\nconst wa = String(inp.wa_number || '').replace(/\\D/g, '');\nconst sourceMsgId = String(inp.source_message_id || '').trim();\nconst dryRun = Boolean(inp.dry_run);\n\nif (!eventoId) {\n  throw new Error('FALTA_EVENTO: evento_id es obligatorio para proponer la cancelacion.');\n}\nif (!contacto) {\n  throw new Error('FALTA_CONTACTO: numero_contacto es obligatorio.');\n}\n\nconst payload = {\n  wa_number: wa || null,\n  contact_number: contacto,\n  source_message_id: sourceMsgId || null,\n  kind: 'cancel',\n  event_id: eventoId,\n  dry_run: dryRun\n};\n\nreturn [{ json: payload }];"
+        "jsCode": "const inp = $input.first().json || {};\nconst contacto = String(inp.numero_contacto || '').replace(/\\D/g, '');\nconst wa = String(inp.wa_number || '').replace(/\\D/g, '');\nconst sourceMsgId = String(inp.source_message_id || '').trim();\nconst dryRun = Boolean(inp.dry_run);\n\nlet rawRes = inp.resources;\nif (typeof rawRes === 'string') {\n  try { rawRes = JSON.parse(rawRes); } catch (e) { rawRes = rawRes.split(',').map(s => s.trim()); }\n}\nif (!Array.isArray(rawRes) || rawRes.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources es obligatorio y debe ser un array no vacio de \"calendar\" y/o \"zoom\".');\n}\nconst validSet = new Set(['calendar', 'zoom']);\nfor (const r of rawRes) {\n  if (!validSet.has(r)) {\n    throw new Error(`RECURSOS_INVALIDOS: recurso desconocido \"${r}\". Solo se permite \"calendar\" y/o \"zoom\".`);\n  }\n}\nconst unique = Array.from(new Set(rawRes));\nconst resources = ['calendar', 'zoom'].filter(r => unique.includes(r));\nif (resources.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources no contiene recursos validos.');\n}\n\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst eventoId = String(inp.evento_id || inp.event_id || '').trim();\nconst zoomId = String(inp.zoom_id || inp.zoom_meeting_id || '').trim();\n\nif (needCalendar && !eventoId) {\n  throw new Error('FALTA_EVENTO: evento_id es obligatorio para proponer la cancelacion del recurso calendar.');\n}\nif (needZoom && !zoomId) {\n  throw new Error('FALTA_ZOOM_ID: zoom_id es obligatorio para proponer la cancelacion del recurso zoom.');\n}\nif (!contacto) {\n  throw new Error('FALTA_CONTACTO: numero_contacto es obligatorio.');\n}\n\nconst payload = {\n  wa_number: wa || null,\n  contact_number: contacto,\n  source_message_id: sourceMsgId || null,\n  kind: 'cancel',\n  resources,\n  event_id: eventoId || null,\n  zoom_id: zoomId || null,\n  dry_run: dryRun\n};\n\nreturn [{ json: payload }];"
       },
       "id": "f1111111-1111-4111-8111-111111111111",
       "name": "Preparar Propuesta Cancelacion",
@@ -98,7 +106,7 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const resp = $input.first().json || {};\nconst prep = $('Preparar Propuesta Cancelacion').first().json || {};\nconst ok = resp.ok === true;\nconst proposalId = resp.proposal_id || null;\nconst state = resp.state || (ok ? 'pending_owner_confirmation' : 'blocked');\nconst msg = resp.message || (ok\n  ? `Propuesta de cancelaci\u00f3n de cita (${prep.event_id}) enviada a Alek para confirmaci\u00f3n.`\n  : `No se pudo generar la propuesta de cancelaci\u00f3n: ${resp.error || 'error desconocido'}`);\n\nreturn [{\n  json: {\n    ok,\n    estado: ok ? 'propuesta_cancelacion_creada' : 'error_propuesta',\n    state,\n    proposal_id: proposalId,\n    event_id: prep.event_id,\n    mensaje: msg,\n    requires_owner_tap: ok && state === 'pending_owner_confirmation'\n  }\n}];"
+        "jsCode": "const resp = $input.first().json || {};\nconst prep = $('Preparar Propuesta Cancelacion').first().json || {};\nconst ok = resp.ok === true;\nconst proposalId = resp.proposal_id || null;\nconst state = resp.state || (ok ? 'pending_owner_confirmation' : 'blocked');\nconst msg = resp.message || (ok\n  ? `Propuesta de cancelaci\u00f3n de cita (${prep.resources.join(', ')}) enviada a Alek para confirmaci\u00f3n.`\n  : `No se pudo generar la propuesta de cancelaci\u00f3n: ${resp.error || 'error desconocido'}`);\n\nreturn [{\n  json: {\n    ok,\n    estado: ok ? 'propuesta_cancelacion_creada' : 'error_propuesta',\n    state,\n    proposal_id: proposalId,\n    resources: prep.resources,\n    event_id: prep.event_id,\n    zoom_id: prep.zoom_id,\n    mensaje: msg,\n    requires_owner_tap: ok && state === 'pending_owner_confirmation'\n  }\n}];"
       },
       "id": "f3333333-3333-4333-8333-333333333333",
       "name": "Responder Propuesta Cancelacion",
@@ -129,7 +137,7 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: agenda local requiere bearer token valido de N8N_CALENDAR_TOKEN');\n}\n\nconst inp = raw.body || raw;\nconst confirmado = String(inp.confirmado_por_owner || '').toLowerCase() === 'true';\nif (!confirmado) {\n  throw new Error('CONFIRMACION_REQUERIDA: cancelar borra el evento del calendario real de Alek. Requiere confirmacion del owner.');\n}\n\nconst eventoId = String(inp.evento_id || inp.event_id || inp.calendarEventId || '').trim();\nif (!eventoId) {\n  throw new Error('FALTA_EVENTO: evento_id es obligatorio para cancelar.');\n}\nconst zoomId = String(inp.zoom_id || inp.zoomMeetingId || '').trim();\nconst opId = String(inp.operation_id || inp.proposal_id || '').trim();\n\nreturn [{\n  json: {\n    calendarEventId: eventoId,\n    zoomMeetingId: zoomId,\n    operation_id: opId || null\n  }\n}];"
+        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: agenda local requiere bearer token valido de N8N_CALENDAR_TOKEN');\n}\n\nconst inp = raw.body || raw;\nconst confirmado = String(inp.confirmado_por_owner || '').toLowerCase() === 'true';\nif (!confirmado) {\n  throw new Error('CONFIRMACION_REQUERIDA: cancelar borra el evento del calendario real de Alek. Requiere confirmacion del owner.');\n}\n\nlet rawRes = inp.resources;\nif (typeof rawRes === 'string') {\n  try { rawRes = JSON.parse(rawRes); } catch (e) { rawRes = rawRes.split(',').map(s => s.trim()); }\n}\nif (!Array.isArray(rawRes) || rawRes.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources es obligatorio y debe ser un array no vacio de \"calendar\" y/o \"zoom\".');\n}\nconst validSet = new Set(['calendar', 'zoom']);\nfor (const r of rawRes) {\n  if (!validSet.has(r)) {\n    throw new Error(`RECURSOS_INVALIDOS: recurso desconocido \"${r}\". Solo se permite \"calendar\" y/o \"zoom\".`);\n  }\n}\nconst unique = Array.from(new Set(rawRes));\nconst resources = ['calendar', 'zoom'].filter(r => unique.includes(r));\nif (resources.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources no contiene recursos validos.');\n}\n\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst eventoId = String(inp.evento_id || inp.event_id || inp.calendarEventId || '').trim();\nconst zoomId = String(inp.zoom_id || inp.zoom_meeting_id || inp.zoomMeetingId || '').trim();\nconst opId = String(inp.operation_id || inp.proposal_id || '').trim();\n\nif (needCalendar && !eventoId) {\n  throw new Error('FALTA_EVENTO: evento_id es obligatorio para cancelar recurso calendar.');\n}\nif (needZoom && !zoomId) {\n  throw new Error('FALTA_ZOOM_ID: zoom_id es obligatorio para cancelar recurso zoom.');\n}\n\nreturn [{\n  json: {\n    resources,\n    calendarEventId: eventoId || null,\n    zoomMeetingId: zoomId || null,\n    operation_id: opId || null\n  }\n}];"
       },
       "id": "28607c24-2096-4528-890a-2f23871e8ab0",
       "name": "Preparar Cancelacion",
@@ -160,7 +168,7 @@
         "sendBody": true,
         "contentType": "json",
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ calendarEventId: $json.calendarEventId, zoomMeetingId: $json.zoomMeetingId, operation_id: $json.operation_id }) }}",
+        "jsonBody": "={{ JSON.stringify({ resources: $json.resources, calendarEventId: $json.calendarEventId, zoomMeetingId: $json.zoomMeetingId, operation_id: $json.operation_id }) }}",
         "options": {
           "response": {
             "response": {
@@ -182,19 +190,50 @@
     },
     {
       "parameters": {
-        "operation": "executeQuery",
-        "query": "DELETE FROM coexistence.ia360_meeting_links WHERE event_id = $1 AND $2::int BETWEEN 200 AND 299 RETURNING token, event_id;",
-        "options": {
-          "queryReplacement": "={{ $('Preparar Cancelacion').first().json.calendarEventId }},{{ $('Cancelar Calendar y Zoom').first().json.statusCode || 200 }}"
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-cancel-ok-1",
+              "leftValue": "={{ Boolean(($json.body && $json.body.ok === true) || $json.ok === true || ($json.body && $json.body.components && (Boolean($json.body.components.calendar && $json.body.components.calendar.state === 'verified') || Boolean($json.body.components.zoom && $json.body.components.zoom.state === 'verified')))) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
         }
       },
-      "id": "b0f6a045-24c7-4149-ad06-30bf2b5f5aaa",
-      "name": "Borrar Enlace de la Cita",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
+      "id": "If Proveedor Cancelo",
+      "name": "If Proveedor Cancelo",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
       "position": [
         660,
         300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH matched AS (\n  SELECT token, event_id, zoom_meeting_id, zoom_join_url, kind\n    FROM coexistence.ia360_meeting_links\n   WHERE ($1::text <> '' AND event_id = $1)\n      OR ($2::text <> '' AND zoom_meeting_id::text = $2)\n   LIMIT 1\n),\nto_delete AS (\n  DELETE FROM coexistence.ia360_meeting_links m\n   USING matched\n   WHERE m.token = matched.token\n     AND (\n       ($3::boolean AND $4::boolean)\n       OR ($3::boolean AND (matched.zoom_meeting_id IS NULL OR matched.zoom_join_url IS NULL))\n       OR ($4::boolean AND (matched.event_id IS NULL OR matched.event_id = ''))\n     )\n   RETURNING m.token, m.event_id, m.zoom_meeting_id, 'deleted' AS op\n),\nto_update AS (\n  UPDATE coexistence.ia360_meeting_links m\n     SET event_id = CASE WHEN $3::boolean THEN NULL ELSE m.event_id END,\n         zoom_meeting_id = CASE WHEN $4::boolean THEN NULL ELSE m.zoom_meeting_id END,\n         zoom_join_url = CASE WHEN $4::boolean THEN NULL ELSE m.zoom_join_url END,\n         kind = CASE WHEN $3::boolean THEN 'zoom' WHEN $4::boolean THEN 'cal' ELSE m.kind END\n    FROM matched\n   WHERE m.token = matched.token\n     AND NOT EXISTS (SELECT 1 FROM to_delete)\n   RETURNING m.token, m.event_id, m.zoom_meeting_id, 'updated' AS op\n)\nSELECT * FROM to_delete\nUNION ALL\nSELECT * FROM to_update;",
+        "options": {
+          "queryReplacement": "={{ [ $('Preparar Cancelacion').first().json.calendarEventId || '', $('Preparar Cancelacion').first().json.zoomMeetingId || '', Boolean(($node['Cancelar Calendar y Zoom'].json.body?.components?.calendar?.state === 'verified') || ($node['Cancelar Calendar y Zoom'].json.components?.calendar?.state === 'verified') || ($('Preparar Cancelacion').first().json.resources.includes('calendar') && ($node['Cancelar Calendar y Zoom'].json.body?.ok || $node['Cancelar Calendar y Zoom'].json.ok))), Boolean(($node['Cancelar Calendar y Zoom'].json.body?.components?.zoom?.state === 'verified') || ($node['Cancelar Calendar y Zoom'].json.components?.zoom?.state === 'verified') || ($('Preparar Cancelacion').first().json.resources.includes('zoom') && ($node['Cancelar Calendar y Zoom'].json.body?.ok || $node['Cancelar Calendar y Zoom'].json.ok))) ] }}"
+        }
+      },
+      "id": "Borrar o Actualizar Enlace",
+      "name": "Borrar o Actualizar Enlace",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        200
       ],
       "credentials": {
         "postgres": {
@@ -206,15 +245,29 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const prep = $('Preparar Cancelacion').first().json;\nconst respuesta = $('Cancelar Calendar y Zoom').first().json || {};\nconst codigo = Number(respuesta.statusCode || 0);\nconst rawBody = respuesta.body || respuesta;\nconst dbRow = $input.first() ? ($input.first().json || {}) : {};\n\nconst providerDeleted = (codigo >= 200 && codigo < 300) || rawBody.verified === true;\nconst dbDeleted = Boolean(dbRow && dbRow.token);\nconst verified = Boolean(providerDeleted && dbDeleted);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    state: verified ? 'cancelada' : (providerDeleted ? 'incierta' : 'no_cancelada'),\n    estado: verified ? 'cancelada' : 'no_cancelada',\n    event_id: prep.calendarEventId,\n    enlace_retirado: dbDeleted,\n    provider_verified: providerDeleted,\n    db_deleted: dbDeleted\n  }\n}];"
+        "jsCode": "const prep = $('Preparar Cancelacion').first().json;\nconst respuestaRaw = $('Cancelar Calendar y Zoom').first().json || {};\nconst rawBody = respuestaRaw.body || respuestaRaw;\nconst dbRow = $input.first() ? ($input.first().json || {}) : {};\n\nconst resources = prep.resources || rawBody.resources || [];\nconst components = rawBody.components || {};\nconst providerVerified = rawBody.ok === true && rawBody.verified === true;\nconst dbModified = Boolean(dbRow && dbRow.token);\nconst verified = Boolean(providerVerified && dbModified);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    state: verified ? 'cancelada' : (providerVerified ? 'incierta' : 'no_cancelada'),\n    estado: verified ? 'cancelada' : 'no_cancelada',\n    resources,\n    components,\n    event_id: prep.calendarEventId || null,\n    zoom_id: prep.zoomMeetingId || null,\n    enlace_retirado: dbModified && dbRow.op === 'deleted',\n    enlace_actualizado: dbModified && dbRow.op === 'updated',\n    db_modified: dbModified,\n    provider_verified: providerVerified\n  }\n}];"
       },
-      "id": "045e947d-6d5c-4735-acf3-33af447cd80f",
+      "id": "Responder Cancelacion",
       "name": "Responder Cancelacion",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rawResp = $input.first() ? ($input.first().json || {}) : {};\nconst raw = rawResp.body || rawResp;\nconst prep = $('Preparar Cancelacion').first()?.json || {};\n\nreturn [{\n  json: {\n    ok: false,\n    verified: false,\n    state: 'no_cancelada',\n    estado: 'no_cancelada',\n    resources: prep.resources || [],\n    components: raw.components || {},\n    error: raw.error || 'El proveedor no pudo verificar la cancelacion de los recursos solicitados.',\n    enlace_retirado: false,\n    db_modified: false\n  }\n}];"
+      },
+      "id": "Responder Fallo Cancelacion",
+      "name": "Responder Fallo Cancelacion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
         880,
-        300
+        400
       ]
     }
   ],
@@ -278,14 +331,32 @@
       "main": [
         [
           {
-            "node": "Borrar Enlace de la Cita",
+            "node": "If Proveedor Cancelo",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Borrar Enlace de la Cita": {
+    "If Proveedor Cancelo": {
+      "main": [
+        [
+          {
+            "node": "Borrar o Actualizar Enlace",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder Fallo Cancelacion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Borrar o Actualizar Enlace": {
       "main": [
         [
           {
@@ -302,8 +373,5 @@
     "availableInMCP": true,
     "executionOrder": "v1"
   },
-  "meta": {
-    "aiBuilderAssisted": true,
-    "builderVariant": "mcp"
-  }
+  "meta": null
 }

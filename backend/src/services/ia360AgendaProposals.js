@@ -1,21 +1,23 @@
 // services/ia360AgendaProposals.js — Módulo puro y orquestador de propuestas de agenda
-// durables con confirmación obligatoria del owner (Alek).
+// durables con confirmación obligatoria del owner (Alek) y soporte independiente de recursos (Calendar, Zoom, ambos).
 //
 // CONTRATO Y ARQUITECTURA (2026-09-08):
 // 1. Las herramientas del agente (proponer_reunion / cancelar_reunion) NUNCA autorizan
 //    escrituras directamente ni pasan un booleano $fromAI.
-// 2. En su lugar, llaman a POST /internal/ia360-agenda/propose para emitir una propuesta
+// 2. Campo obligatorio `resources`: array canónico único de 'calendar' y/o 'zoom', no vacío,
+//    sin default implícito. Forma parte del hash, de la propuesta inmutable y de la autorización.
+// 3. En su lugar, llaman a POST /internal/ia360-agenda/propose para emitir una propuesta
 //    inmutable con clave única (source_message_id, kind, payload_hash) y estado 'pending'.
-// 3. El owner recibe una tarjeta interactiva en WhatsApp con botones estructurados:
-//    ia360_agenda_yes:<proposal_id> / ia360_agenda_no:<proposal_id>.
-// 4. Al hacer tap, el backend verifica: emisor == IA360_OWNER_NUMBER, misma línea emisora
+// 4. El owner recibe una tarjeta interactiva en WhatsApp con la operación y recursos seleccionados,
+//    y botones estructurados: ia360_agenda_yes:<proposal_id> / ia360_agenda_no:<proposal_id>.
+// 5. Al hacer tap, el backend verifica: emisor == IA360_OWNER_NUMBER, misma línea emisora
 //    (proposal.wa_number === recordWa), propuesta pending y no expirada (30 min),
 //    bloqueo asesor global (pg_try_advisory_lock), reclamo atómico condicional con commit previo a I/O,
-//    y ejecuta el writer hacia n8n con Bearer N8N_CALENDAR_TOKEN.
-// 5. Exige respuesta verificada del proveedor (ok===true && verified===true + IDs/token/link).
-// 6. Los comentarios del owner en tarjetas de fallo se pasan al agente en modo
-//    'owner_assistance' con contexto estructurado; NUNCA se reenvían literales ni
-//    se usan regexes de frase para asumir autoridad.
+//    y ejecuta el writer hacia n8n con Bearer N8N_CALENDAR_TOKEN y payload con resources canónicos.
+// 6. Exige respuesta verificada por componente ({ components: { calendar?: {state, id}, zoom?: {state, id, join_url} } }).
+//    ok/verified global es true SÓLO si TODOS los recursos solicitados resultaron 'verified'.
+// 7. Parcial conserva cada resultado/ID durable sin reintento ciego ni borrar la contraparte no cancelada.
+// 8. Los comentarios del owner en tarjetas de fallo se pasan al agente en modo 'owner_assistance'.
 'use strict';
 
 const crypto = require('crypto');
@@ -31,6 +33,7 @@ const PROPOSAL_STATES = [
   'execution_uncertain',
   'blocked',
 ];
+const VALID_RESOURCES = ['calendar', 'zoom'];
 const IA360_OWNER_NUMBER = process.env.IA360_OWNER_NUMBER || '5213322638033';
 const CALENDAR_ADVISORY_LOCK_ID = 36082026; // ID global estable para operaciones de calendario
 
@@ -80,17 +83,51 @@ function formatTimeCdMx(isoRaw) {
 }
 
 /**
- * Calcula un hash canónico determinista del payload para deduplicación e idempotencia.
+ * Normaliza y valida el array de recursos a su forma canónica ('calendar', 'zoom' en orden fijo).
+ * Rechaza arrays vacíos, valores inválidos o ausencia de array (sin defaults implícitos).
+ *
+ * @param {any} raw
+ * @returns {string[] | null}
  */
-function computePayloadHash({ kind, start_utc, end_utc, title, event_id }) {
+function canonicalizeResources(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const set = new Set();
+  for (const item of raw) {
+    if (typeof item !== 'string') return null;
+    const norm = item.trim().toLowerCase();
+    if (!VALID_RESOURCES.includes(norm)) return null;
+    set.add(norm);
+  }
+  if (set.size === 0) return null;
+  return VALID_RESOURCES.filter(r => set.has(r));
+}
+
+/**
+ * Formatea la etiqueta legible de los recursos seleccionados.
+ */
+function formatResourceLabel(resources = []) {
+  const hasCal = resources.includes('calendar');
+  const hasZoom = resources.includes('zoom');
+  if (hasCal && hasZoom) return 'Google Calendar + Zoom';
+  if (hasCal) return 'Google Calendar';
+  if (hasZoom) return 'Zoom';
+  return 'Agenda';
+}
+
+/**
+ * Calcula un hash canónico determinista del payload para deduplicación e idempotencia.
+ * Incluye resources canónicos para que operaciones de Calendar solo, Zoom solo o ambos no colisionen.
+ */
+function computePayloadHash({ kind, resources = [], start_utc, end_utc, title, event_id, zoom_id }) {
+  const resKey = Array.isArray(resources) ? resources.join(',') : '';
   const canonical = kind === 'book'
-    ? `book:${start_utc}:${end_utc}:${title || ''}`
-    : `cancel:${event_id || ''}`;
+    ? `book:${resKey}:${start_utc || ''}:${end_utc || ''}:${title || ''}`
+    : `cancel:${resKey}:${event_id || ''}:${zoom_id || ''}`;
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
 /**
- * Valida los parámetros de entrada de una propuesta de agenda.
+ * Valida los parámetros de entrada de una propuesta de agenda con contrato explícito de resources.
  *
  * @param {object} input
  * @param {object} [opts]
@@ -112,6 +149,15 @@ function validateProposalInput(input = {}, { allowPastDates = false } = {}) {
   if (!sourceMessageId) errors.push('source_message_id_required');
   if (!['book', 'cancel'].includes(kind)) errors.push('invalid_kind');
 
+  const canonicalResources = canonicalizeResources(input.resources);
+  if (!canonicalResources) {
+    if (!input.resources || (Array.isArray(input.resources) && input.resources.length === 0)) {
+      errors.push('resources_required');
+    } else {
+      errors.push('invalid_resources');
+    }
+  }
+
   let startUtc = null;
   let endUtc = null;
   let title = input.title && typeof input.title === 'string'
@@ -120,6 +166,9 @@ function validateProposalInput(input = {}, { allowPastDates = false } = {}) {
   let eventId = input.event_id && typeof input.event_id === 'string'
     ? input.event_id.trim()
     : null;
+  let zoomId = input.zoom_id && typeof input.zoom_id === 'string'
+    ? input.zoom_id.trim()
+    : (input.zoom_meeting_id ? String(input.zoom_meeting_id).trim() : null);
 
   if (kind === 'book') {
     if (typeof input.start_utc !== 'string' || !ISO_8601_TZ_REGEX.test(input.start_utc)) {
@@ -148,12 +197,25 @@ function validateProposalInput(input = {}, { allowPastDates = false } = {}) {
     }
   }
 
-  if (kind === 'cancel') {
-    if (!eventId) errors.push('event_id_required');
+  if (kind === 'cancel' && canonicalResources) {
+    if (canonicalResources.includes('calendar') && !eventId && !input.event_id && !zoomId) {
+      errors.push('event_id_required');
+    }
+    if (canonicalResources.includes('zoom') && !zoomId && !input.zoom_id && !input.zoom_meeting_id && !eventId) {
+      errors.push('zoom_id_required');
+    }
   }
 
   const payloadHash = errors.length === 0
-    ? computePayloadHash({ kind, start_utc: startUtc, end_utc: endUtc, title, event_id: eventId })
+    ? computePayloadHash({
+        kind,
+        resources: canonicalResources,
+        start_utc: startUtc,
+        end_utc: endUtc,
+        title,
+        event_id: eventId,
+        zoom_id: zoomId,
+      })
     : '';
 
   return {
@@ -164,11 +226,13 @@ function validateProposalInput(input = {}, { allowPastDates = false } = {}) {
       contact_number: contactNumber,
       source_message_id: sourceMessageId,
       kind,
+      resources: canonicalResources,
       payload_hash: payloadHash,
       start_utc: startUtc,
       end_utc: endUtc,
       title,
       event_id: eventId,
+      zoom_id: zoomId,
       contact_name: input.contact_name && typeof input.contact_name === 'string' ? input.contact_name.trim() : null,
       dry_run: dryRun,
     },
@@ -198,24 +262,32 @@ function buildProposalButtons(proposalId, kind) {
 }
 
 /**
- * Formatea el texto de la tarjeta interactiva de propuesta para Alek.
+ * Formatea el texto de la tarjeta interactiva de propuesta para Alek indicando explícitamente los recursos.
  */
 function formatProposalCardText({
   kind,
+  resources = [],
   startUtc,
   endUtc,
   title,
   contactName,
   contactNumber,
   eventId,
+  zoomId,
 }) {
   const who = contactName || `contacto ${maskNumber(contactNumber)}`;
+  const resourceLabel = formatResourceLabel(resources);
+
   if (kind === 'cancel') {
+    const idLines = [];
+    if (eventId) idLines.push(`Evento ID: ${eventId}`);
+    if (zoomId) idLines.push(`Zoom ID: ${zoomId}`);
     return [
       'Alek, solicitud de cancelación de cita:',
       '',
       `Contacto: ${who} (${maskNumber(contactNumber)})`,
-      `Evento ID: ${eventId || 'sin ID'}`,
+      `Recursos a cancelar: ${resourceLabel}`,
+      ...(idLines.length ? [idLines.join('\n')] : []),
       '',
       '¿Autorizas cancelar esta reunión?',
     ].join('\n');
@@ -228,6 +300,7 @@ function formatProposalCardText({
     '',
     `Contacto: ${who} (${maskNumber(contactNumber)})`,
     `Horario: ${startFmt}${endFmt ? ` a ${endFmt}` : ''}`,
+    `Recursos: ${resourceLabel}`,
     `Título: ${title || 'Reunión IA360'}`,
     '',
     '¿Autorizas agendar esta reunión? (Expira en 30 min)',
@@ -236,24 +309,33 @@ function formatProposalCardText({
 
 /**
  * Revalida si una cita pertenece al contacto y recupera el ID original y Zoom ID desde la base de datos.
+ * Acepta búsqueda por eventId o zoomId sin derivar ni forzar la selección de recursos.
  */
-async function revalidateContactEvent({ pool, contactNumber, waNumber, eventId }) {
+async function revalidateContactEvent({ pool, contactNumber, waNumber, eventId, zoomId, resources = [] }) {
   if (!pool) throw new Error('database_pool_required');
-  if (!eventId || !contactNumber) return null;
+  if ((!eventId && !zoomId) || !contactNumber) return null;
 
   try {
     // 1. Buscar en coexistence.ia360_meeting_links
     const { rows: linkRows } = await pool.query(
-      `SELECT token, event_id, zoom_meeting_id, zoom_join_url
+      `SELECT token, event_id, zoom_meeting_id, zoom_join_url, kind
          FROM coexistence.ia360_meeting_links
-        WHERE contact_number = $1 AND event_id = $2
+        WHERE contact_number = $1
+          AND (
+            ($2::text IS NOT NULL AND lower(event_id) = lower($2))
+            OR ($3::text IS NOT NULL AND (
+              lower(zoom_join_url) = lower($3)
+              OR zoom_meeting_id::text = $3
+            ))
+          )
         LIMIT 1`,
-      [contactNumber, eventId]
+      [contactNumber, eventId || null, zoomId || null]
     );
     if (linkRows.length) {
+      const row = linkRows[0];
       return {
-        eventId: linkRows[0].event_id,
-        zoomId: linkRows[0].zoom_meeting_id || linkRows[0].zoom_join_url || null,
+        eventId: row.event_id || null,
+        zoomId: row.zoom_meeting_id ? String(row.zoom_meeting_id) : (row.zoom_join_url || null),
       };
     }
 
@@ -265,13 +347,17 @@ async function revalidateContactEvent({ pool, contactNumber, waNumber, eventId }
                 CASE WHEN jsonb_typeof(c.custom_fields->'ia360_bookings')='array'
                      THEN c.custom_fields->'ia360_bookings' ELSE '[]'::jsonb END
               ) elem
-        WHERE c.contact_number = $1 AND ($2 = '' OR c.wa_number = $2) AND elem->>'event_id' = $3
+        WHERE c.contact_number = $1 AND ($2 = '' OR c.wa_number = $2)
+          AND (
+            ($3::text IS NOT NULL AND lower(elem->>'event_id') = lower($3))
+            OR ($4::text IS NOT NULL AND lower(elem->>'zoom_id') = lower($4))
+          )
         LIMIT 1`,
-      [contactNumber, waNumber || '', eventId]
+      [contactNumber, waNumber || '', eventId || null, zoomId || null]
     );
     if (contactRows.length) {
       return {
-        eventId: contactRows[0].evt,
+        eventId: contactRows[0].evt || null,
         zoomId: contactRows[0].zoom || null,
       };
     }
@@ -364,13 +450,16 @@ async function proposeAgendaAction({
   }
 
   // Revalidación server-side de la cita y extracción de IDs originales para cancelación
-  let resolvedZoomId = null;
+  let resolvedEventId = sanitized.event_id;
+  let resolvedZoomId = sanitized.zoom_id;
   if (sanitized.kind === 'cancel') {
     const eventInfo = await revalidateContactEvent({
       pool,
       contactNumber: sanitized.contact_number,
       waNumber: sanitized.wa_number,
       eventId: sanitized.event_id,
+      zoomId: sanitized.zoom_id,
+      resources: sanitized.resources,
     });
     if (!eventInfo) {
       return {
@@ -379,8 +468,24 @@ async function proposeAgendaAction({
         message: 'El evento a cancelar no pertenece a este contacto en esta línea o no existe.',
       };
     }
-    sanitized.event_id = eventInfo.eventId; // ID original preservado
-    resolvedZoomId = eventInfo.zoomId;
+    if (sanitized.resources.includes('calendar') && !eventInfo.eventId && !sanitized.event_id) {
+      return {
+        ok: false,
+        state: 'blocked',
+        message: 'No se encontró el ID de Google Calendar para la cancelación solicitada.',
+      };
+    }
+    if (sanitized.resources.includes('zoom') && !eventInfo.zoomId && !sanitized.zoom_id) {
+      return {
+        ok: false,
+        state: 'blocked',
+        message: 'No se encontró el ID de Zoom para la cancelación solicitada.',
+      };
+    }
+    resolvedEventId = eventInfo.eventId || sanitized.event_id;
+    resolvedZoomId = eventInfo.zoomId || sanitized.zoom_id;
+    sanitized.event_id = resolvedEventId;
+    sanitized.zoom_id = resolvedZoomId;
   }
 
   // Dry run: cero escrituras a DB, cero envíos al owner, cero efectos
@@ -402,11 +507,18 @@ async function proposeAgendaAction({
   if (!resolvedName) resolvedName = `contacto ${maskNumber(sanitized.contact_number)}`;
 
   // Inserción atómica con deduplicación por constraint UNIQUE (source_message_id, kind, payload_hash)
+  // Incluye explícitamente la columna canónica SQL `resources` (migración 057)
   try {
+    const detalleJsonObj = {
+      source: 'internal_propose',
+      resources: sanitized.resources,
+      raw_input: input,
+    };
+
     const { rows: insertRows } = await pool.query(
       `INSERT INTO coexistence.ia360_agenda_proposals
-         (id, wa_number, contact_number, source_message_id, kind, payload_hash, start_utc, end_utc, title, event_id, zoom_id, contact_name, estado, expires_at, detalle_json)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14::jsonb)
+         (id, wa_number, contact_number, source_message_id, kind, resources, payload_hash, start_utc, end_utc, title, event_id, zoom_id, contact_name, estado, expires_at, detalle_json)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending', $14, $15::jsonb)
        ON CONFLICT (source_message_id, kind, payload_hash) DO NOTHING
        RETURNING *`,
       [
@@ -415,15 +527,16 @@ async function proposeAgendaAction({
         sanitized.contact_number,
         sanitized.source_message_id,
         sanitized.kind,
+        sanitized.resources,
         sanitized.payload_hash,
         sanitized.start_utc,
         sanitized.end_utc,
         sanitized.title,
-        sanitized.event_id,
+        resolvedEventId,
         resolvedZoomId,
         resolvedName,
         expiresAt.toISOString(),
-        JSON.stringify({ source: 'internal_propose', raw_input: input }),
+        JSON.stringify(detalleJsonObj),
       ]
     );
 
@@ -432,7 +545,7 @@ async function proposeAgendaAction({
     } else {
       // Si hubo conflicto de unicidad, se recupera la propuesta existente sin crear duplicados
       const { rows: existingRows } = await pool.query(
-        `SELECT id, estado, expires_at FROM coexistence.ia360_agenda_proposals
+        `SELECT id, estado, expires_at, resources FROM coexistence.ia360_agenda_proposals
           WHERE source_message_id = $1 AND kind = $2 AND payload_hash = $3
           LIMIT 1`,
         [sanitized.source_message_id, sanitized.kind, sanitized.payload_hash]
@@ -459,17 +572,19 @@ async function proposeAgendaAction({
     };
   }
 
-  // Despacho de la tarjeta interactiva al owner
+  // Despacho de la tarjeta interactiva al owner con operación y recursos explícitos
   if (sendOwnerInteractive) {
     try {
       const cardBody = formatProposalCardText({
         kind: sanitized.kind,
+        resources: sanitized.resources,
         startUtc: sanitized.start_utc,
         endUtc: sanitized.end_utc,
         title: sanitized.title,
         contactName: resolvedName,
         contactNumber: sanitized.contact_number,
-        eventId: sanitized.event_id,
+        eventId: resolvedEventId,
+        zoomId: resolvedZoomId,
       });
 
       const syntheticRecord = {
@@ -483,7 +598,7 @@ async function proposeAgendaAction({
       const sent = await sendOwnerInteractive({
         record: syntheticRecord,
         label: `owner_agenda_proposal_${finalProposalId}`,
-        messageBody: `IA360: propuesta agenda ${sanitized.kind} ${resolvedName}`,
+        messageBody: `IA360: propuesta agenda ${sanitized.kind} ${resolvedName} (${formatResourceLabel(sanitized.resources)})`,
         targetContact: sanitized.contact_number,
         ownerBudget: true,
         critical: true,
@@ -532,7 +647,7 @@ async function proposeAgendaAction({
 }
 
 /**
- * Ejecuta el escritor real de reserva contra n8n con verificación estricta.
+ * Ejecuta el escritor real de reserva contra n8n con verificación estricta por componente.
  */
 async function executeBookWriter({
   proposal,
@@ -551,7 +666,12 @@ async function executeBookWriter({
     };
   }
 
+  const requestedResources = canonicalizeResources(
+    proposal.resources || proposal.detalle_json?.resources || ['calendar', 'zoom']
+  ) || ['calendar', 'zoom'];
+
   const payload = {
+    resources: requestedResources,
     inicio_iso: proposal.start_utc,
     fin_iso: proposal.end_utc,
     titulo: proposal.title || 'Reunión IA360',
@@ -584,45 +704,131 @@ async function executeBookWriter({
       return { ok: false, verified: false, uncertain: false, error: `http_${res.status}`, message: text };
     }
 
+    if (!text || !String(text).trim()) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        error: 'empty_provider_response',
+        message: 'El proveedor respondió 200 pero con cuerpo vacío (estado incierto)',
+      };
+    }
+
     let data = {};
     try {
-      data = JSON.parse(text || '{}');
+      data = JSON.parse(text);
     } catch (_) {
       return { ok: false, verified: false, uncertain: true, error: 'invalid_json_response', message: text };
     }
 
-    // Verificación estricta: exige ok===true, verified===true, token y event_id
-    if (data.ok === true && data.verified === true && (data.event_id || data.calendar_event_id || data.evento_id) && data.token) {
-      const eventId = data.event_id || data.calendar_event_id || data.evento_id;
+    // Adaptar o respetar components estructurados
+    const components = data.components ? { ...data.components } : {};
+    if (!data.components) {
+      if (requestedResources.includes('calendar')) {
+        const calId = data.calendar_event_id || data.event_id || data.evento_id;
+        if (calId && data.verified === true) {
+          components.calendar = { state: 'verified', id: calId };
+        } else if (data.ok === true && !data.verified) {
+          components.calendar = { state: 'uncertain', id: calId || undefined };
+        } else {
+          components.calendar = { state: 'failed', error: data.error || 'calendar_booking_failed' };
+        }
+      }
+      if (requestedResources.includes('zoom')) {
+        const zId = data.zoom_meeting_id ? String(data.zoom_meeting_id) : (data.zoom_join_url || null);
+        if (zId && data.verified === true) {
+          components.zoom = { state: 'verified', id: zId, join_url: data.zoom_join_url || undefined };
+        } else if (data.ok === true && !data.verified) {
+          components.zoom = { state: 'uncertain', id: zId || undefined };
+        } else {
+          components.zoom = { state: 'failed', error: data.error || 'zoom_booking_failed' };
+        }
+      }
+    }
+
+    // Verificación estricta: sólo los recursos solicitados
+    let allVerified = true;
+    let anyUncertain = false;
+    let firstError = null;
+
+    for (const r of requestedResources) {
+      const comp = components[r];
+      if (!comp) {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || `missing_component_${r}`;
+      } else if (comp.state === 'verified') {
+        if (r === 'calendar' && !comp.id) {
+          allVerified = false;
+          anyUncertain = true;
+        }
+        if (r === 'zoom' && !comp.id && !comp.join_url) {
+          allVerified = false;
+          anyUncertain = true;
+        }
+      } else if (comp.state === 'uncertain') {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || comp.error || `${r}_uncertain`;
+      } else {
+        allVerified = false;
+        firstError = firstError || comp.error || `${r}_failed`;
+      }
+    }
+
+    const tokenGenerated = data.token || null;
+    const eventId = components.calendar?.id || data.event_id || data.calendar_event_id || null;
+    const zoomId = components.zoom?.id || (data.zoom_meeting_id ? String(data.zoom_meeting_id) : null);
+    const zoomJoinUrl = components.zoom?.join_url || data.zoom_join_url || null;
+
+    if (allVerified && data.ok === true && data.verified === true) {
       return {
         ok: true,
         verified: true,
+        uncertain: false,
         state: 'agendada',
+        resources: requestedResources,
+        components,
         event_id: eventId,
-        calendar_event_id: data.calendar_event_id || eventId,
-        token: data.token,
-        zoom_meeting_id: data.zoom_meeting_id || null,
-        zoom_join_url: data.zoom_join_url || null,
+        calendar_event_id: eventId,
+        token: tokenGenerated,
+        zoom_meeting_id: zoomId,
+        zoom_join_url: zoomJoinUrl,
         start_utc: data.start_utc || proposal.start_utc,
         end_utc: data.end_utc || proposal.end_utc,
-        enlace_estable: data.enlace_estable || `https://wa.geekstudio.dev/api/r/${data.token}`,
+        enlace_estable: data.enlace_estable || (tokenGenerated ? `https://wa.geekstudio.dev/api/r/${tokenGenerated}` : null),
       };
     }
 
-    // Si el proveedor respondió 200 pero verified no es true o faltan datos de readback,
-    // el evento pudo haberse creado y fallado en el readback -> estado INCIERTO (uncertain: true)
+    // Si el proveedor respondió 200 pero verified no es true o falta readback, es estado INCIERTO
+    if (anyUncertain || (data.ok === true && !allVerified)) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        components,
+        error: firstError || data.error || data.motivo || 'unverified_provider_response',
+        message: data.message || data.motivo || 'El proveedor respondió pero la reserva no pudo ser verificada con readback completo (estado incierto)',
+      };
+    }
+
     return {
       ok: false,
       verified: false,
-      uncertain: true,
-      error: data.error || data.motivo || 'unverified_provider_response',
-      message: data.message || data.motivo || 'El proveedor respondió pero la reserva no pudo ser verificada con readback (estado incierto)',
+      uncertain: false,
+      resources: requestedResources,
+      components,
+      error: firstError || data.error || 'booking_failed',
+      message: data.message || 'No se pudo completar la reserva solicitada',
     };
   } catch (err) {
     return {
       ok: false,
       verified: false,
       uncertain: true,
+      resources: requestedResources,
       error: err.name === 'AbortError' ? 'timeout' : err.message,
       message: err.message,
     };
@@ -632,7 +838,7 @@ async function executeBookWriter({
 }
 
 /**
- * Ejecuta el escritor real de cancelación contra n8n con verificación estricta.
+ * Ejecuta el escritor real de cancelación contra n8n con verificación estricta por componente.
  */
 async function executeCancelWriter({
   proposal,
@@ -650,9 +856,14 @@ async function executeCancelWriter({
     };
   }
 
+  const requestedResources = canonicalizeResources(
+    proposal.resources || proposal.detalle_json?.resources || ['calendar', 'zoom']
+  ) || ['calendar', 'zoom'];
+
   const payload = {
-    evento_id: proposal.event_id,
-    event_id: proposal.event_id,
+    resources: requestedResources,
+    evento_id: proposal.event_id || '',
+    event_id: proposal.event_id || '',
     zoom_id: proposal.zoom_id || '',
     contact_number: proposal.contact_number,
     confirmado_por_owner: 'true',
@@ -682,36 +893,111 @@ async function executeCancelWriter({
       return { ok: false, verified: false, uncertain: false, error: `http_${res.status}`, message: text };
     }
 
+    if (!text || !String(text).trim()) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        error: 'empty_provider_response',
+        message: 'El proveedor respondió 200 pero con cuerpo vacío (estado incierto)',
+      };
+    }
+
     let data = {};
     try {
-      data = JSON.parse(text || '{}');
+      data = JSON.parse(text);
     } catch (_) {
       return { ok: false, verified: false, uncertain: true, error: 'invalid_json_response', message: text };
     }
 
-    if (data.ok === true && data.verified === true && (data.event_id || data.evento_id)) {
+    const components = data.components ? { ...data.components } : {};
+    if (!data.components) {
+      if (requestedResources.includes('calendar')) {
+        const calId = data.event_id || data.evento_id || proposal.event_id;
+        if (calId && data.verified === true) {
+          components.calendar = { state: 'verified', id: calId };
+        } else if (data.ok === true && !data.verified) {
+          components.calendar = { state: 'uncertain', id: calId || undefined };
+        } else {
+          components.calendar = { state: 'failed', error: data.error || 'calendar_cancel_failed' };
+        }
+      }
+      if (requestedResources.includes('zoom')) {
+        const zId = data.zoom_id || proposal.zoom_id;
+        if (zId && data.verified === true) {
+          components.zoom = { state: 'verified', id: zId };
+        } else if (data.ok === true && !data.verified) {
+          components.zoom = { state: 'uncertain', id: zId || undefined };
+        } else {
+          components.zoom = { state: 'failed', error: data.error || 'zoom_cancel_failed' };
+        }
+      }
+    }
+
+    let allVerified = true;
+    let anyUncertain = false;
+    let firstError = null;
+
+    for (const r of requestedResources) {
+      const comp = components[r];
+      if (!comp) {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || `missing_component_${r}`;
+      } else if (comp.state === 'verified') {
+        // ok
+      } else if (comp.state === 'uncertain') {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || comp.error || `${r}_cancel_uncertain`;
+      } else {
+        allVerified = false;
+        firstError = firstError || comp.error || `${r}_cancel_failed`;
+      }
+    }
+
+    if (allVerified && data.ok === true && data.verified === true) {
       return {
         ok: true,
         verified: true,
+        uncertain: false,
         state: 'cancelada',
-        event_id: data.event_id || data.evento_id || proposal.event_id,
+        resources: requestedResources,
+        components,
+        event_id: components.calendar?.id || data.event_id || data.evento_id || proposal.event_id,
+        zoom_id: components.zoom?.id || data.zoom_id || proposal.zoom_id,
         enlace_retirado: data.enlace_retirado === true,
       };
     }
 
-    // Si el proveedor respondió 200 pero sin verificación completa -> estado INCIERTO (uncertain: true)
+    if (anyUncertain || (data.ok === true && !allVerified)) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        components,
+        error: firstError || data.error || data.motivo || 'unverified_cancel_response',
+        message: data.message || data.motivo || 'El proveedor respondió pero la cancelación no pudo ser verificada con readback (estado incierto)',
+      };
+    }
+
     return {
       ok: false,
       verified: false,
-      uncertain: true,
-      error: data.error || data.motivo || 'unverified_cancel_response',
-      message: data.message || data.motivo || 'El proveedor respondió pero la cancelación no pudo ser verificada con readback (estado incierto)',
+      uncertain: false,
+      resources: requestedResources,
+      components,
+      error: firstError || data.error || 'cancel_failed',
+      message: data.message || 'No se pudo cancelar el recurso solicitado',
     };
   } catch (err) {
     return {
       ok: false,
       verified: false,
       uncertain: true,
+      resources: requestedResources,
       error: err.name === 'AbortError' ? 'timeout' : err.message,
       message: err.message,
     };
@@ -765,6 +1051,7 @@ async function handleOwnerAgendaDecision({
   }
 
   const proposal = initialRows[0];
+  proposal.resources = canonicalizeResources(proposal.resources) || ['calendar', 'zoom'];
 
   // FC-SEC-005: Verificación estricta de línea: la línea receptora del tap debe coincidir con la de la propuesta
   const recordWa = normalizePhone(record.wa_number);
@@ -871,6 +1158,7 @@ async function handleOwnerAgendaDecision({
     // Commit durable del reclamo antes de ejecutar I/O
     await client.query('COMMIT');
     const activeProposal = claimRows[0];
+    activeProposal.resources = canonicalizeResources(activeProposal.resources) || proposal.resources;
 
     let resolvedName = activeProposal.contact_name;
     if (!resolvedName && loadContactName) {
@@ -889,15 +1177,15 @@ async function handleOwnerAgendaDecision({
       if (writerRes.uncertain) {
         await pool.query(
           `UPDATE coexistence.ia360_agenda_proposals
-              SET estado = 'execution_uncertain', error_message = $2, updated_at = now()
+              SET estado = 'execution_uncertain', error_message = $2, detalle_json = $3::jsonb, updated_at = now()
             WHERE id = $1`,
-          [proposalId, writerRes.error || writerRes.message || 'Timeout o fallo de red']
+          [proposalId, writerRes.error || writerRes.message || 'Timeout o fallo de red', JSON.stringify(writerRes)]
         );
         await sendOwnerDirectText({
           record,
           toNumber: IA360_OWNER_NUMBER,
           label: 'owner_agenda_book_uncertain',
-          body: `La reserva de cita entró en estado INCIERTO (${writerRes.error || 'timeout'}). No se reintentará automáticamente para evitar duplicados. Revisa Google Calendar / Zoom.`,
+          body: `La reserva de cita entró en estado INCIERTO (${writerRes.error || 'timeout'}). No se reintentará automáticamente para evitar duplicados. Revisa ${formatResourceLabel(activeProposal.resources)}.`,
         });
         return true;
       }
@@ -905,9 +1193,9 @@ async function handleOwnerAgendaDecision({
       if (!writerRes.ok || !writerRes.verified) {
         await pool.query(
           `UPDATE coexistence.ia360_agenda_proposals
-              SET estado = 'failed', error_message = $2, resuelto_at = now()
+              SET estado = 'failed', error_message = $2, detalle_json = $3::jsonb, resuelto_at = now()
             WHERE id = $1`,
-          [proposalId, writerRes.error || writerRes.message || 'Error en reserva']
+          [proposalId, writerRes.error || writerRes.message || 'Error en reserva', JSON.stringify(writerRes)]
         );
         await sendOwnerDirectText({
           record,
@@ -942,18 +1230,26 @@ async function handleOwnerAgendaDecision({
 
           currentBookings.push({
             start: activeProposal.start_utc,
-            event_id: writerRes.event_id,
+            event_id: writerRes.event_id || '',
             zoom_id: writerRes.zoom_join_url || writerRes.zoom_meeting_id || '',
+            resources: activeProposal.resources,
           });
+
+          const customFieldsUpdate = {
+            ia360_bookings: currentBookings,
+            ia360_booking_start: activeProposal.start_utc,
+          };
+          if (writerRes.event_id) {
+            customFieldsUpdate.ia360_booking_event_id = writerRes.event_id;
+          }
+          if (writerRes.zoom_join_url || writerRes.zoom_meeting_id) {
+            customFieldsUpdate.ia360_booking_zoom_id = writerRes.zoom_join_url || writerRes.zoom_meeting_id;
+          }
 
           await mergeContactState({
             waNumber: activeProposal.wa_number,
             contactNumber: activeProposal.contact_number,
-            customFields: {
-              ia360_bookings: currentBookings,
-              ia360_booking_event_id: writerRes.event_id,
-              ia360_booking_start: activeProposal.start_utc,
-            },
+            customFields: customFieldsUpdate,
           });
         } catch (mergeErr) {
           console.error('[ia360-agenda] error updating contact bookings:', mergeErr.message);
@@ -967,7 +1263,7 @@ async function handleOwnerAgendaDecision({
             record: { ...record, contact_number: activeProposal.contact_number },
             targetStageName: 'Reunión agendada',
             titleSuffix: 'Reunión agendada',
-            notes: `Reunión confirmada por Alek. Event ID: ${writerRes.event_id}. Slot: ${activeProposal.start_utc}`,
+            notes: `Reunión confirmada por Alek (${formatResourceLabel(activeProposal.resources)}). Slot: ${activeProposal.start_utc}`,
           });
         } catch (dealErr) {
           console.error('[ia360-agenda] error syncing deal:', dealErr.message);
@@ -990,7 +1286,7 @@ async function handleOwnerAgendaDecision({
         record,
         toNumber: IA360_OWNER_NUMBER,
         label: 'owner_agenda_book_done',
-        body: `Hecho: agendé la reunión con ${resolvedName} para el ${startFmt} (Evento: ${writerRes.event_id}).`,
+        body: `Hecho: agendé la reunión con ${resolvedName} para el ${startFmt} (${formatResourceLabel(activeProposal.resources)}).`,
       });
       return true;
     }
@@ -1004,15 +1300,15 @@ async function handleOwnerAgendaDecision({
       if (writerRes.uncertain) {
         await pool.query(
           `UPDATE coexistence.ia360_agenda_proposals
-              SET estado = 'execution_uncertain', error_message = $2, updated_at = now()
+              SET estado = 'execution_uncertain', error_message = $2, detalle_json = $3::jsonb, updated_at = now()
             WHERE id = $1`,
-          [proposalId, writerRes.error || 'Timeout de cancelación']
+          [proposalId, writerRes.error || 'Timeout de cancelación', JSON.stringify(writerRes)]
         );
         await sendOwnerDirectText({
           record,
           toNumber: IA360_OWNER_NUMBER,
           label: 'owner_agenda_cancel_uncertain',
-          body: `La cancelación de la cita entró en estado INCIERTO. Revisa Google Calendar.`,
+          body: `La cancelación de la cita entró en estado INCIERTO. Revisa ${formatResourceLabel(activeProposal.resources)}.`,
         });
         return true;
       }
@@ -1020,9 +1316,9 @@ async function handleOwnerAgendaDecision({
       if (!writerRes.ok || !writerRes.verified) {
         await pool.query(
           `UPDATE coexistence.ia360_agenda_proposals
-              SET estado = 'failed', error_message = $2, resuelto_at = now()
+              SET estado = 'failed', error_message = $2, detalle_json = $3::jsonb, resuelto_at = now()
             WHERE id = $1`,
-          [proposalId, writerRes.error || 'Error en cancelación']
+          [proposalId, writerRes.error || 'Error en cancelación', JSON.stringify(writerRes)]
         );
         await sendOwnerDirectText({
           record,
@@ -1047,6 +1343,8 @@ async function handleOwnerAgendaDecision({
             waNumber: activeProposal.wa_number,
             contactNumber: activeProposal.contact_number,
             eventId: activeProposal.event_id,
+            zoomId: activeProposal.zoom_id,
+            resources: activeProposal.resources,
           });
         } catch (remErr) {
           console.error('[ia360-agenda] error removing booking from contact:', remErr.message);
@@ -1066,7 +1364,7 @@ async function handleOwnerAgendaDecision({
         record,
         toNumber: IA360_OWNER_NUMBER,
         label: 'owner_agenda_cancel_done',
-        body: `Hecho: cancelé la cita con ${resolvedName} (Evento: ${activeProposal.event_id}).`,
+        body: `Hecho: cancelé la cita con ${resolvedName} (${formatResourceLabel(activeProposal.resources)}).`,
       });
       return true;
     }
@@ -1292,10 +1590,13 @@ async function handleOwnerFailureAssistance({
 module.exports = {
   PROPOSAL_EXPIRATION_MINUTES,
   PROPOSAL_STATES,
+  VALID_RESOURCES,
   IA360_OWNER_NUMBER,
   CALENDAR_ADVISORY_LOCK_ID,
   N8N_IA360_OWNER_BOOK_WEBHOOK_URL,
   N8N_IA360_OWNER_CANCEL_WEBHOOK_URL,
+  canonicalizeResources,
+  formatResourceLabel,
   normalizePhone,
   maskNumber,
   formatDateCdMx,

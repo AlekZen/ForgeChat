@@ -70,5 +70,15 @@
         "Build Cancel Response: emits verified:true upon absence verification"
       ]
     }
+  },
+  "draft_baselines": {
+    "IA360ContactIntelDraft20260605": "4cacd72f-6788-4585-8d39-d3c03e5bb84a",
+    "sjrkjf7IcM7ski0n": "899ca4a8-a61e-4437-81eb-4a87c1015cce",
+    "F1sj5tcJVa9R3Q9Z": "ce84d4c4-e870-4742-9579-aab9e876bd81",
+    "IA360CalendarBook20260602": "7e0a6e86-6fb8-44fc-9c53-a459cc1cd081",
+    "rV1z5sUdNEzCQ1tk": "01ac3120-83c2-4d6f-84b7-317d2d667d26",
+    "LCFkBV47IEkjh9ss": "23c6d302-389c-4fa1-9ffc-6d9e55f27bc2",
+    "i4IapJoxLObQTPW1": "06b2eb7e-0fa9-47b8-9bbb-90dc406a14ed",
+    "4IJC78aFkI5ihNZD": "f70dc217-3da7-4dd3-9a3b-3e1659e37927"
   }
 }

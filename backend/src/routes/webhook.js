@@ -8305,19 +8305,27 @@ async function loadIa360BookingsForList(contactNumber) {
   const cached = await loadIa360Bookings(contactNumber);
   try {
     const { rows } = await pool.query(
-      `SELECT event_id, start_utc
+      `SELECT event_id, zoom_meeting_id, zoom_join_url, kind, start_utc
          FROM coexistence.ia360_meeting_links
-        WHERE contact_number = $1 AND kind = 'cal' AND start_utc > now()
+        WHERE contact_number = $1 AND kind IN ('cal', 'zoom') AND start_utc > now()
         ORDER BY start_utc ASC`,
       [contactNumber]
     );
-    const seen = new Set(cached.map(b => String(b.event_id || '').toLowerCase()).filter(Boolean));
+    const seenCal = new Set(cached.map(b => String(b.event_id || '').toLowerCase()).filter(Boolean));
+    const seenZoom = new Set(cached.map(b => String(b.zoom_id || '').toLowerCase()).filter(Boolean));
     const merged = cached.slice();
     for (const r of rows) {
       const eid = String(r.event_id || '').toLowerCase();
-      if (!eid || seen.has(eid)) continue;
-      seen.add(eid);
-      merged.push({ start: r.start_utc ? new Date(r.start_utc).toISOString() : '', event_id: r.event_id || '', zoom_id: '' });
+      const zid = String(r.zoom_meeting_id ? String(r.zoom_meeting_id) : (r.zoom_join_url || '')).toLowerCase();
+      if (eid && seenCal.has(eid)) continue;
+      if (zid && seenZoom.has(zid)) continue;
+      if (eid) seenCal.add(eid);
+      if (zid) seenZoom.add(zid);
+      merged.push({
+        start: r.start_utc ? new Date(r.start_utc).toISOString() : '',
+        event_id: r.event_id || '',
+        zoom_id: r.zoom_meeting_id ? String(r.zoom_meeting_id) : (r.zoom_join_url || ''),
+      });
     }
     merged.sort((a, b) => String(a.start || '').localeCompare(String(b.start || '')));
     if (merged.length !== cached.length) {
@@ -8477,21 +8485,72 @@ async function findBookingByEventId(eventId) {
 
 // Quita una cita (por event_id, case-insensitive) del array `ia360_bookings` de un
 // contacto y reescribe el array. Devuelve el array resultante (puede quedar vacio).
-async function removeIa360Booking({ waNumber, contactNumber, eventId }) {
+async function removeIa360Booking({ waNumber, contactNumber, eventId, zoomId, resources = ['calendar', 'zoom'] }) {
   const current = await loadIa360Bookings(contactNumber);
   const eid = String(eventId || '').toLowerCase();
-  const next = current.filter(b => String(b.event_id || '').toLowerCase() !== eid);
-  console.log('[ia360-multicita] remove event=%s -> %d cita(s)', String(eventId || '-'), next.length);
+  const zid = String(zoomId || '').toLowerCase();
+  const cancelCal = Array.isArray(resources) ? resources.includes('calendar') : true;
+  const cancelZoom = Array.isArray(resources) ? resources.includes('zoom') : true;
+
+  const next = [];
+  for (const b of current) {
+    const bEid = String(b.event_id || '').toLowerCase();
+    const bZid = String(b.zoom_id || '').toLowerCase();
+    const matchesCal = eid && bEid === eid;
+    const matchesZoom = zid && bZid === zid;
+    const matches = matchesCal || matchesZoom;
+
+    if (!matches) {
+      next.push(b);
+      continue;
+    }
+
+    if (cancelCal && cancelZoom) {
+      // Ambos cancelados -> se retira la reserva por completo
+      continue;
+    } else if (cancelCal) {
+      // Solo calendar cancelado -> limpiar event_id, conservar zoom_id
+      if (b.zoom_id) {
+        next.push({ ...b, event_id: '' });
+      }
+    } else if (cancelZoom) {
+      // Solo zoom cancelado -> limpiar zoom_id, conservar event_id
+      if (b.event_id) {
+        next.push({ ...b, zoom_id: '' });
+      }
+    } else {
+      next.push(b);
+    }
+  }
+
+  console.log('[ia360-multicita] remove event=%s zoom=%s resources=%s -> %d cita(s)',
+    String(eventId || '-'), String(zoomId || '-'), Array.isArray(resources) ? resources.join(',') : 'all', next.length);
+
   const extra = { ia360_bookings: next };
-  // Si la cita removida era la "ultima" reflejada en campos sueltos, limpialos.
   extra.ia360_booking_event_id = next.length ? (next[next.length - 1].event_id || '') : '';
   extra.ia360_booking_zoom_id = next.length ? (next[next.length - 1].zoom_id || '') : '';
   extra.ia360_booking_start = next.length ? (next[next.length - 1].start || '') : '';
-  // Gap#5: mantener `ia360_meeting_links` en sync para que list_bookings (que también
-  // lee de ahí) NO resucite una cita cancelada (la tabla no tiene columna status).
+
   try {
-    await pool.query(`DELETE FROM coexistence.ia360_meeting_links WHERE lower(event_id) = lower($1)`, [String(eventId || '')]);
-  } catch (e) { console.error('[ia360-multicita] meeting_links cleanup error:', e.message); }
+    if (cancelCal && eventId) {
+      await pool.query(`DELETE FROM coexistence.ia360_meeting_links WHERE lower(event_id) = lower($1) AND kind = 'cal'`, [String(eventId)]);
+    }
+    if (cancelZoom && (zoomId || eventId)) {
+      if (zoomId) {
+        await pool.query(
+          `DELETE FROM coexistence.ia360_meeting_links
+             WHERE kind = 'zoom' AND (lower(zoom_join_url) = lower($1) OR zoom_meeting_id::text = $1)`,
+          [String(zoomId)]
+        );
+      }
+      if (cancelCal && eventId) {
+        await pool.query(`DELETE FROM coexistence.ia360_meeting_links WHERE lower(event_id) = lower($1) AND kind = 'zoom'`, [String(eventId)]);
+      }
+    }
+  } catch (e) {
+    console.error('[ia360-multicita] meeting_links cleanup error:', e.message);
+  }
+
   await mergeContactIa360State({ waNumber, contactNumber, customFields: extra });
   return next;
 }

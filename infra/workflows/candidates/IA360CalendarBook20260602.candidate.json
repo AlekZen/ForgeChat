@@ -27,7 +27,7 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: Bearer token required for raw booking writer');\n}\n\nconst payload = raw.body || raw;\nif (!payload.start || !payload.end) throw new Error('Missing start/end');\n\nconst calendarId = payload.calendarId || 'ocompudoc@gmail.com';\nconst contact = payload.contact || {};\nconst displayName = contact.contactName || payload.contactName || 'Lead IA360';\nconst wa = contact.contactNumber || payload.contactNumber || '';\nconst summary = String(payload.summary || '').trim() || `IA360 diagn\u00f3stico - ${displayName}`;\nconst description = String(payload.description || '').trim() || `Reuni\u00f3n IA360 agendada desde WhatsApp. Contacto: ${displayName} (+${wa}).`;\n\nreturn [{\n  json: {\n    ...payload,\n    calendarId,\n    displayName,\n    wa,\n    start: payload.start,\n    end: payload.end,\n    tz: 'America/Mexico_City',\n    summary,\n    description\n  }\n}];"
+        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: Bearer token required for raw booking writer');\n}\n\nconst payload = raw.body || raw;\nif (!payload.start || !payload.end) throw new Error('Missing start/end');\n\nlet rawRes = payload.resources;\nif (typeof rawRes === 'string') {\n  try { rawRes = JSON.parse(rawRes); } catch (e) { rawRes = rawRes.split(',').map(s => s.trim()); }\n}\nif (!Array.isArray(rawRes) || rawRes.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources es obligatorio y debe ser un array no vacio de \"calendar\" y/o \"zoom\".');\n}\nconst validSet = new Set(['calendar', 'zoom']);\nfor (const r of rawRes) {\n  if (!validSet.has(r)) {\n    throw new Error(`RECURSOS_INVALIDOS: recurso desconocido \"${r}\". Solo se permite \"calendar\" y/o \"zoom\".`);\n  }\n}\nconst unique = Array.from(new Set(rawRes));\nconst resources = ['calendar', 'zoom'].filter(r => unique.includes(r));\nif (resources.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources no contiene recursos validos.');\n}\n\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst calendarId = payload.calendarId || 'ocompudoc@gmail.com';\nconst contact = payload.contact || {};\nconst displayName = contact.contactName || payload.contactName || 'Lead IA360';\nconst wa = contact.contactNumber || payload.contactNumber || '';\nconst summary = String(payload.summary || '').trim() || `IA360 diagnóstico - ${displayName}`;\nconst description = String(payload.description || '').trim() || `Reunión IA360 agendada desde WhatsApp. Contacto: ${displayName} (+${wa}).`;\n\nreturn [{\n  json: {\n    ...payload,\n    resources,\n    needCalendar,\n    needZoom,\n    calendarId,\n    displayName,\n    wa,\n    start: payload.start,\n    end: payload.end,\n    tz: 'America/Mexico_City',\n    summary,\n    description,\n    zoomMeetingId: null,\n    zoomJoinUrl: ''\n  }\n}];"
       },
       "id": "Normalize Booking",
       "name": "Normalize Booking",
@@ -40,49 +40,32 @@
     },
     {
       "parameters": {
-        "resource": "calendar",
-        "operation": "availability",
-        "calendar": {
-          "mode": "id",
-          "value": "={{$json.calendarId}}"
-        },
-        "timeMin": "={{$json.start}}",
-        "timeMax": "={{$json.end}}",
-        "options": {
-          "outputFormat": "raw",
-          "timezone": {
-            "mode": "id",
-            "value": "America/Mexico_City"
-          }
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-zoom-1",
+              "leftValue": "={{ $json.needZoom }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
         }
       },
-      "id": "Recheck Calendar Availability",
-      "name": "Recheck Calendar Availability",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.3,
+      "id": "If Needs Zoom",
+      "name": "If Needs Zoom",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
       "position": [
-        460,
-        0
-      ],
-      "credentials": {
-        "googleCalendarOAuth2Api": {
-          "id": "dvgs8BuVIihlfrTn",
-          "name": "Google Calendar account"
-        }
-      },
-      "alwaysOutputData": true
-    },
-    {
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "\nconst raw = $input.first().json;\nconst meta = $('Normalize Booking').first().json;\nconst busy = raw.calendars?.[meta.calendarId]?.busy || raw.busy || [];\nif (busy.length > 0) throw new Error('slot_busy');\nreturn [{ json: { ok:true, busy, ...meta } }];\n"
-      },
-      "id": "Assert Slot Free",
-      "name": "Assert Slot Free",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        700,
+        440,
         0
       ]
     },
@@ -110,28 +93,110 @@
       "type": "n8n-nodes-base.zoom",
       "typeVersion": 1,
       "position": [
-        940,
-        0
+        660,
+        -120
       ],
       "credentials": {
         "zoomOAuth2Api": {
           "id": "21lumQ7GPjOQv2gr",
           "name": "Zoom account"
         }
-      }
+      },
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "\nconst booking = $('Normalize Booking').first().json;\nconst zoom = $input.first().json;\nreturn [{ json: { ...booking, zoomMeetingId: zoom.id, zoomJoinUrl: zoom.join_url } }];\n"
+        "jsCode": "const norm = $('Normalize Booking').first().json;\nconst zoom = $input.first() ? $input.first().json : {};\nconst zoomId = zoom.id || zoom.zoomMeetingId || null;\nconst zoomJoinUrl = zoom.join_url || zoom.zoomJoinUrl || '';\n\nreturn [{\n  json: {\n    ...norm,\n    zoomMeetingId: zoomId,\n    zoomJoinUrl: zoomJoinUrl,\n    zoom_raw: zoom\n  }\n}];"
       },
-      "id": "Merge Zoom Booking",
-      "name": "Merge Zoom Booking",
+      "id": "Merge Zoom Info",
+      "name": "Merge Zoom Info",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1160,
+        880,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-cal-1",
+              "leftValue": "={{ $json.needCalendar }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "If Needs Calendar",
+      "name": "If Needs Calendar",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
         0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "calendar",
+        "operation": "availability",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendarId }}",
+          "mode": "id"
+        },
+        "timeMin": "={{ $json.start }}",
+        "timeMax": "={{ $json.end }}",
+        "options": {
+          "outputFormat": "raw",
+          "timezone": {
+            "__rl": true,
+            "value": "America/Mexico_City",
+            "mode": "id"
+          }
+        }
+      },
+      "id": "Recheck Calendar Availability",
+      "name": "Recheck Calendar Availability",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1320,
+        -120
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "dvgs8BuVIihlfrTn",
+          "name": "Google Calendar account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const raw = $input.first().json;\nconst meta = $('If Needs Calendar').first().json;\nconst busy = raw.calendars?.[meta.calendarId]?.busy || raw.busy || [];\nif (busy.length > 0) throw new Error('slot_busy');\nreturn [{ json: { ok: true, busy, ...meta } }];"
+      },
+      "id": "Assert Slot Free",
+      "name": "Assert Slot Free",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        -120
       ]
     },
     {
@@ -139,16 +204,17 @@
         "resource": "event",
         "operation": "create",
         "calendar": {
-          "mode": "id",
-          "value": "={{$json.calendarId}}"
+          "__rl": true,
+          "value": "={{ $json.calendarId }}",
+          "mode": "id"
         },
-        "start": "={{$json.start}}",
-        "end": "={{$json.end}}",
+        "start": "={{ $json.start }}",
+        "end": "={{ $json.end }}",
         "useDefaultReminders": true,
         "additionalFields": {
-          "summary": "={{$json.summary}}",
-          "description": "={{$json.description + '\\n\\nZoom: ' + $json.zoomJoinUrl}}",
-          "location": "={{$json.zoomJoinUrl}}",
+          "summary": "={{ $json.summary }}",
+          "description": "={{ $json.description + ($json.zoomJoinUrl ? ('\\n\\nZoom: ' + $json.zoomJoinUrl) : '') }}",
+          "location": "={{ $json.zoomJoinUrl || '' }}",
           "visibility": "private"
         }
       },
@@ -157,27 +223,56 @@
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.3,
       "position": [
-        1380,
-        0
+        1760,
+        -120
       ],
       "credentials": {
         "googleCalendarOAuth2Api": {
           "id": "dvgs8BuVIihlfrTn",
           "name": "Google Calendar account"
         }
-      }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "event",
+        "operation": "get",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('If Needs Calendar').first().json.calendarId }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.id }}",
+        "options": {}
+      },
+      "id": "Verify Calendar Event Exists",
+      "name": "Verify Calendar Event Exists",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1980,
+        -120
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "dvgs8BuVIihlfrTn",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const booking = $('Merge Zoom Booking').first().json;\nconst readbackEv = $input.first() ? $input.first().json : {};\n\nif (!readbackEv || !readbackEv.id) {\n  throw new Error('READBACK_FAILED: Google Calendar event was not verified by readback');\n}\n\nconst readStart = readbackEv.start?.dateTime || readbackEv.start?.date || '';\nconst readEnd = readbackEv.end?.dateTime || readbackEv.end?.date || '';\nconst readSummary = String(readbackEv.summary || '').trim();\n\nconst startMatch = Boolean(readStart && new Date(readStart).toISOString() === new Date(booking.start).toISOString());\nconst endMatch = Boolean(readEnd && new Date(readEnd).toISOString() === new Date(booking.end).toISOString());\nconst titleMatch = Boolean(!booking.summary || readSummary === String(booking.summary).trim());\nconst zoomVerified = Boolean(!booking.zoomMeetingId || (booking.zoomJoinUrl && String(booking.zoomJoinUrl).startsWith('http')));\n\nconst verified = Boolean(startMatch && endMatch && titleMatch && zoomVerified);\n\nreturn [{\n  json: {\n    ok: true,\n    verified,\n    status: 'booked',\n    state: verified ? 'agendada' : 'incierta',\n    start: booking.start,\n    end: booking.end,\n    summary: booking.summary,\n    contactName: booking.displayName,\n    contactNumber: booking.wa,\n    calendarEventId: readbackEv.id,\n    calendarHtmlLink: readbackEv.htmlLink || null,\n    zoomMeetingId: booking.zoomMeetingId || null,\n    zoomJoinUrl: booking.zoomJoinUrl || null,\n    verification_details: {\n      start_match: startMatch,\n      end_match: endMatch,\n      title_match: titleMatch,\n      zoom_verified: zoomVerified\n    }\n  }\n}];"
+        "jsCode": "const norm = $('Normalize Booking').first().json;\nconst resources = norm.resources || [];\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst components = {};\nlet allVerified = true;\n\nif (needZoom) {\n  let zoomData = null;\n  try { zoomData = $('Merge Zoom Info').first()?.json || $('Create Zoom Meeting').first()?.json; } catch (e) {}\n  const zoomId = zoomData?.zoomMeetingId ? String(zoomData.zoomMeetingId) : (zoomData?.id ? String(zoomData.id) : null);\n  const zoomJoinUrl = zoomData?.zoomJoinUrl || zoomData?.join_url || null;\n  const zoomError = zoomData?.error?.message || zoomData?.error || null;\n  \n  const zoomVerified = Boolean(zoomId && zoomJoinUrl && String(zoomJoinUrl).startsWith('http'));\n  if (zoomVerified) {\n    components.zoom = {\n      state: 'verified',\n      id: zoomId,\n      join_url: zoomJoinUrl\n    };\n  } else {\n    allVerified = false;\n    components.zoom = {\n      state: zoomId ? 'uncertain' : 'failed',\n      id: zoomId || undefined,\n      join_url: zoomJoinUrl || undefined,\n      error: zoomError || 'Zoom meeting was not verified by provider'\n    };\n  }\n}\n\nif (needCalendar) {\n  let calData = null;\n  try { calData = $('Verify Calendar Event Exists').first()?.json; } catch (e) {}\n  if (!calData || !calData.id) {\n    try { calData = $('Create Calendar Event').first()?.json; } catch (e) {}\n  }\n  const calId = calData?.id ? String(calData.id) : null;\n  const calError = calData?.error?.message || calData?.error || null;\n  const readStart = calData?.start?.dateTime || calData?.start?.date || '';\n  const readEnd = calData?.end?.dateTime || calData?.end?.date || '';\n  const readSummary = String(calData?.summary || '').trim();\n\n  const startMatch = Boolean(readStart && new Date(readStart).toISOString() === new Date(norm.start).toISOString());\n  const endMatch = Boolean(readEnd && new Date(readEnd).toISOString() === new Date(norm.end).toISOString());\n  const titleMatch = Boolean(!norm.summary || readSummary === String(norm.summary).trim());\n  const calVerified = Boolean(calId && startMatch && endMatch && titleMatch);\n\n  if (calVerified) {\n    components.calendar = {\n      state: 'verified',\n      id: calId,\n      htmlLink: calData.htmlLink || undefined\n    };\n  } else {\n    allVerified = false;\n    components.calendar = {\n      state: calId ? 'uncertain' : 'failed',\n      id: calId || undefined,\n      error: calError || (calId ? 'Calendar event slot/title mismatch' : 'READBACK_FAILED: Google Calendar event was not verified by readback')\n    };\n  }\n}\n\nconst verified = Boolean(allVerified && resources.length > 0);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'booked' : 'uncertain',\n    state: verified ? 'agendada' : 'incierta',\n    resources,\n    components,\n    start: norm.start,\n    end: norm.end,\n    summary: norm.summary,\n    contactName: norm.displayName,\n    contactNumber: norm.wa,\n    calendarEventId: components.calendar?.id || null,\n    calendarHtmlLink: components.calendar?.htmlLink || null,\n    zoomMeetingId: components.zoom?.id || null,\n    zoomJoinUrl: components.zoom?.join_url || null\n  }\n}];"
       },
       "id": "Build Booking Response",
       "name": "Build Booking Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1600,
+        2200,
         0
       ]
     },
@@ -192,36 +287,9 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        1820,
+        2420,
         0
       ]
-    },
-    {
-      "parameters": {
-        "resource": "event",
-        "operation": "get",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $node[\"Normalize Booking\"].json.calendarId }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $json.id }}",
-        "options": {}
-      },
-      "id": "b7777777-7777-4777-8777-777777777777",
-      "name": "Verify Calendar Event Exists",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.3,
-      "position": [
-        1180,
-        240
-      ],
-      "credentials": {
-        "googleCalendarOAuth2Api": {
-          "id": "dvgs8BuVIihlfrTn",
-          "name": "Google Calendar account"
-        }
-      }
     }
   ],
   "connections": {
@@ -240,7 +308,65 @@
       "main": [
         [
           {
+            "node": "If Needs Zoom",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Needs Zoom": {
+      "main": [
+        [
+          {
+            "node": "Create Zoom Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "If Needs Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Zoom Meeting": {
+      "main": [
+        [
+          {
+            "node": "Merge Zoom Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Zoom Info": {
+      "main": [
+        [
+          {
+            "node": "If Needs Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Needs Calendar": {
+      "main": [
+        [
+          {
             "node": "Recheck Calendar Availability",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Booking Response",
             "type": "main",
             "index": 0
           }
@@ -262,28 +388,6 @@
       "main": [
         [
           {
-            "node": "Create Zoom Meeting",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Create Zoom Meeting": {
-      "main": [
-        [
-          {
-            "node": "Merge Zoom Booking",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Merge Zoom Booking": {
-      "main": [
-        [
-          {
             "node": "Create Calendar Event",
             "type": "main",
             "index": 0
@@ -302,22 +406,22 @@
         ]
       ]
     },
-    "Build Booking Response": {
+    "Verify Calendar Event Exists": {
       "main": [
         [
           {
-            "node": "Respond Booked",
+            "node": "Build Booking Response",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Verify Calendar Event Exists": {
+    "Build Booking Response": {
       "main": [
         [
           {
-            "node": "Build Booking Response",
+            "node": "Respond Booked",
             "type": "main",
             "index": 0
           }

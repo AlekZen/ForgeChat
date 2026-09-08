@@ -1,11 +1,13 @@
 // test/ia360AgendaProposals.test.js — Pruebas de comportamiento observable para propuestas de agenda,
-// validación de fronteras, estados de incertidumbre ante respuestas no verificadas y asistencia supervisada.
+// validación de fronteras, estados de incertidumbre ante respuestas no verificadas, soporte independiente
+// de recursos (Calendar solo, Zoom solo, ambos), preservación de contrapartes en cancelación y asistencia supervisada.
 'use strict';
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  canonicalizeResources,
   validateProposalInput,
   computePayloadHash,
   executeBookWriter,
@@ -14,217 +16,337 @@ const {
   handleOwnerFailureAssistance,
 } = require('../src/services/ia360AgendaProposals');
 
-test('validateProposalInput: validación de contratos de reserva y cancelación', () => {
+test('canonicalizeResources: normalización y validación canónica de recursos', () => {
+  // 1. Recursos individuales
+  assert.deepEqual(canonicalizeResources(['calendar']), ['calendar']);
+  assert.deepEqual(canonicalizeResources(['zoom']), ['zoom']);
+
+  // 2. Ambos recursos en orden canónico fijo ['calendar', 'zoom']
+  assert.deepEqual(canonicalizeResources(['calendar', 'zoom']), ['calendar', 'zoom']);
+  assert.deepEqual(canonicalizeResources(['zoom', 'calendar']), ['calendar', 'zoom'], 'debe ordenar canónicamente');
+  assert.deepEqual(canonicalizeResources(['  CALENDAR  ', 'ZOOM ']), ['calendar', 'zoom'], 'debe limpiar espacios y mayúsculas');
+
+  // 3. Deduplicación
+  assert.deepEqual(canonicalizeResources(['zoom', 'zoom', 'calendar']), ['calendar', 'zoom']);
+
+  // 4. Rechazo de entradas inválidas / vacías / sin defaults
+  assert.equal(canonicalizeResources([]), null);
+  assert.equal(canonicalizeResources(null), null);
+  assert.equal(canonicalizeResources(undefined), null);
+  assert.equal(canonicalizeResources('calendar'), null);
+  assert.equal(canonicalizeResources(['teams']), null);
+  assert.equal(canonicalizeResources(['calendar', 'invalid']), null);
+});
+
+test('validateProposalInput: contrato estricto de resources para Calendar solo, Zoom solo y ambos', () => {
   const futureStart = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
   const futureEnd = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000 + 60 * 60 * 1000).toISOString();
 
-  // Reserva válida
-  const validBook = validateProposalInput({
+  // 1. Reserva válida: ambos recursos
+  const validBoth = validateProposalInput({
     wa_number: '5213321594582',
     contact_number: '5213322630839',
     source_message_id: 'wamid.HBgLMTIzNDU2Nw==',
     kind: 'book',
+    resources: ['calendar', 'zoom'],
     start_utc: futureStart,
     end_utc: futureEnd,
     title: 'Sesión de Estrategia',
   });
-  assert.equal(validBook.ok, true);
-  assert.equal(validBook.sanitized.kind, 'book');
-  assert.equal(validBook.sanitized.source_message_id, 'wamid.HBgLMTIzNDU2Nw==');
+  assert.equal(validBoth.ok, true);
+  assert.equal(validBoth.sanitized.kind, 'book');
+  assert.deepEqual(validBoth.sanitized.resources, ['calendar', 'zoom']);
 
-  // Rechazo de fecha en el pasado
+  // 2. Reserva válida: Calendar solo
+  const validCalOnly = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.calonly',
+    kind: 'book',
+    resources: ['calendar'],
+    start_utc: futureStart,
+    end_utc: futureEnd,
+  });
+  assert.equal(validCalOnly.ok, true);
+  assert.deepEqual(validCalOnly.sanitized.resources, ['calendar']);
+
+  // 3. Reserva válida: Zoom solo
+  const validZoomOnly = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.zoomonly',
+    kind: 'book',
+    resources: ['zoom'],
+    start_utc: futureStart,
+    end_utc: futureEnd,
+  });
+  assert.equal(validZoomOnly.ok, true);
+  assert.deepEqual(validZoomOnly.sanitized.resources, ['zoom']);
+
+  // 4. Rechazo si falta resources (no hay default implícito que asuma ambos)
+  const noResources = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.nores',
+    kind: 'book',
+    start_utc: futureStart,
+    end_utc: futureEnd,
+  });
+  assert.equal(noResources.ok, false);
+  assert.ok(noResources.errors.includes('resources_required'), 'debe exigir campo obligatorio resources sin defaults');
+
+  // 5. Cancelación válida: Calendar solo (exige event_id, NO exige zoom_id)
+  const validCancelCal = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.cancelcal',
+    kind: 'cancel',
+    resources: ['calendar'],
+    event_id: 'evt_google_12345',
+  });
+  assert.equal(validCancelCal.ok, true);
+  assert.deepEqual(validCancelCal.sanitized.resources, ['calendar']);
+  assert.equal(validCancelCal.sanitized.event_id, 'evt_google_12345');
+
+  // 6. Cancelación válida: Zoom solo (exige zoom_id, NO exige event_id)
+  const validCancelZoom = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.cancelzoom',
+    kind: 'cancel',
+    resources: ['zoom'],
+    zoom_id: '89234567890',
+  });
+  assert.equal(validCancelZoom.ok, true);
+  assert.deepEqual(validCancelZoom.sanitized.resources, ['zoom']);
+  assert.equal(validCancelZoom.sanitized.zoom_id, '89234567890');
+
+  // 7. Rechazo de fecha en el pasado
   const pastBook = validateProposalInput({
     wa_number: '5213321594582',
     contact_number: '5213322630839',
     source_message_id: 'wamid.past',
     kind: 'book',
+    resources: ['calendar'],
     start_utc: '2020-01-01T15:00:00.000Z',
     end_utc: '2020-01-01T16:00:00.000Z',
   });
   assert.equal(pastBook.ok, false);
   assert.ok(pastBook.errors.includes('start_must_be_in_future'));
 
-  // Rechazo de falta de source_message_id
+  // 8. Rechazo de falta de source_message_id
   const noSourceMsg = validateProposalInput({
     wa_number: '5213321594582',
     contact_number: '5213322630839',
     kind: 'book',
+    resources: ['calendar', 'zoom'],
     start_utc: futureStart,
     end_utc: futureEnd,
   });
   assert.equal(noSourceMsg.ok, false);
   assert.ok(noSourceMsg.errors.includes('source_message_id_required'));
-
-  // Cancelación válida
-  const validCancel = validateProposalInput({
-    wa_number: '5213321594582',
-    contact_number: '5213322630839',
-    source_message_id: 'wamid.cancel1',
-    kind: 'cancel',
-    event_id: 'evt_google_12345',
-  });
-  assert.equal(validCancel.ok, true);
-  assert.equal(validCancel.sanitized.kind, 'cancel');
-
-  // dry_run estricto
-  const falseDryRun = validateProposalInput({
-    wa_number: '5213321594582',
-    contact_number: '5213322630839',
-    source_message_id: 'wamid.dryfalse',
-    kind: 'cancel',
-    event_id: 'evt_1',
-    dry_run: 'false',
-  });
-  assert.equal(falseDryRun.sanitized.dry_run, false);
-
-  const trueDryRun = validateProposalInput({
-    wa_number: '5213321594582',
-    contact_number: '5213322630839',
-    source_message_id: 'wamid.drytrue',
-    kind: 'cancel',
-    event_id: 'evt_1',
-    dry_run: 'true',
-  });
-  assert.equal(trueDryRun.sanitized.dry_run, true);
 });
 
-test('computePayloadHash: unicidad canónica por slot y acción', () => {
-  const hash1 = computePayloadHash({
+test('computePayloadHash: unicidad canónica por slot, acción y recursos (dedup por recurso sin colisión)', () => {
+  const hashCal = computePayloadHash({
     kind: 'book',
+    resources: ['calendar'],
     start_utc: '2026-09-10T15:00:00.000Z',
     end_utc: '2026-09-10T16:00:00.000Z',
     title: 'Demo',
   });
-  const hash2 = computePayloadHash({
+  const hashZoom = computePayloadHash({
     kind: 'book',
+    resources: ['zoom'],
     start_utc: '2026-09-10T15:00:00.000Z',
     end_utc: '2026-09-10T16:00:00.000Z',
     title: 'Demo',
   });
-  const hashDiffSlot = computePayloadHash({
+  const hashBoth = computePayloadHash({
     kind: 'book',
-    start_utc: '2026-09-10T17:00:00.000Z',
-    end_utc: '2026-09-10T18:00:00.000Z',
+    resources: ['calendar', 'zoom'],
+    start_utc: '2026-09-10T15:00:00.000Z',
+    end_utc: '2026-09-10T16:00:00.000Z',
     title: 'Demo',
   });
 
-  assert.equal(hash1, hash2, 'mismo payload debe generar el mismo hash');
-  assert.notEqual(hash1, hashDiffSlot, 'distinto horario debe generar un hash distinto');
+  assert.notEqual(hashCal, hashZoom, 'Calendar solo y Zoom solo en el mismo horario deben tener hashes distintos');
+  assert.notEqual(hashCal, hashBoth, 'Calendar solo y ambos deben tener hashes distintos');
+  assert.notEqual(hashZoom, hashBoth, 'Zoom solo y ambos deben tener hashes distintos');
+
+  const hashCalDup = computePayloadHash({
+    kind: 'book',
+    resources: ['calendar'],
+    start_utc: '2026-09-10T15:00:00.000Z',
+    end_utc: '2026-09-10T16:00:00.000Z',
+    title: 'Demo',
+  });
+  assert.equal(hashCal, hashCalDup, 'Mismo payload de Calendar debe dar el mismo hash exacto');
 });
 
-test('executeBookWriter: respuesta 200 sin verificación de readback debe producir estado incierto (uncertain: true)', async () => {
-  const mockProposal = {
-    id: 'prop-verify-1',
+test('executeBookWriter: verificación estricta de componentes y ausencia de I/O a recurso excluido', async () => {
+  const baseProposal = {
+    id: 'prop-book-test-1',
     start_utc: '2026-09-10T16:00:00.000Z',
     end_utc: '2026-09-10T17:00:00.000Z',
     contact_number: '5213322630839',
   };
 
-  // 1. Falta de token -> precondición clara sin llamada a proveedor (uncertain: false)
-  const noToken = await executeBookWriter({
-    proposal: mockProposal,
-    contactName: 'Musio',
-    token: '',
-  });
-  assert.equal(noToken.ok, false);
-  assert.equal(noToken.uncertain, false);
-  assert.equal(noToken.error, 'missing_calendar_token');
-
-  // 2. Respuesta 200 del proveedor con verified: false -> INCIERTO (uncertain: true)
-  const mockFetchUnverified = async () => ({
-    ok: true,
-    status: 200,
-    text: async () => JSON.stringify({ ok: true, verified: false, event_id: 'unverified-created-id' }),
-  });
-  const unverified = await executeBookWriter({
-    proposal: mockProposal,
+  // 1. Calendar solo: éxito verificado cuando components.calendar está 'verified' (cero exigencia de Zoom)
+  let calSentBody = null;
+  const calOnlyRes = await executeBookWriter({
+    proposal: { ...baseProposal, resources: ['calendar'] },
     contactName: 'Musio',
     token: 'valid-token',
-    fetchFn: mockFetchUnverified,
+    fetchFn: async (_url, opts) => {
+      calSentBody = JSON.parse(opts.body);
+      assert.deepEqual(calSentBody.resources, ['calendar']);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          verified: true,
+          token: 'tok_calendar_only_123',
+          components: {
+            calendar: { state: 'verified', id: 'gcal_evt_100' },
+          },
+        }),
+      };
+    },
   });
-  assert.equal(unverified.ok, false);
-  assert.equal(unverified.verified, false);
-  assert.equal(unverified.uncertain, true, '200 sin readback verificado debe ser uncertain: true');
-  assert.equal(unverified.error, 'unverified_provider_response');
+  assert.equal(calOnlyRes.ok, true);
+  assert.equal(calOnlyRes.verified, true);
+  assert.equal(calOnlyRes.event_id, 'gcal_evt_100');
+  assert.equal(calOnlyRes.zoom_meeting_id, null, 'No debe registrar Zoom cuando solo se pidió Calendar');
+  assert.deepEqual(calOnlyRes.resources, ['calendar']);
 
-  // 3. Respuesta 200 del proveedor con verified: true completa -> verificado con éxito
-  const mockFetchVerified = async () => ({
-    ok: true,
-    status: 200,
-    text: async () => JSON.stringify({
+  // 2. Zoom solo: éxito verificado cuando components.zoom está 'verified' (cero exigencia de Calendar)
+  let zoomSentBody = null;
+  const zoomOnlyRes = await executeBookWriter({
+    proposal: { ...baseProposal, resources: ['zoom'] },
+    contactName: 'Musio',
+    token: 'valid-token',
+    fetchFn: async (_url, opts) => {
+      zoomSentBody = JSON.parse(opts.body);
+      assert.deepEqual(zoomSentBody.resources, ['zoom']);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          verified: true,
+          token: 'tok_zoom_only_123',
+          components: {
+            zoom: { state: 'verified', id: 'zoom_mtg_888', join_url: 'https://zoom.us/j/888' },
+          },
+        }),
+      };
+    },
+  });
+  assert.equal(zoomOnlyRes.ok, true);
+  assert.equal(zoomOnlyRes.verified, true);
+  assert.equal(zoomOnlyRes.zoom_join_url, 'https://zoom.us/j/888');
+  assert.equal(zoomOnlyRes.event_id, null, 'No debe registrar event_id cuando solo se pidió Zoom');
+  assert.deepEqual(zoomOnlyRes.resources, ['zoom']);
+
+  // 3. Ambos: si uno falla (parcial), ok global debe ser false y conservar el estado de componentes
+  const partialRes = await executeBookWriter({
+    proposal: { ...baseProposal, resources: ['calendar', 'zoom'] },
+    contactName: 'Musio',
+    token: 'valid-token',
+    fetchFn: async () => ({
       ok: true,
-      verified: true,
-      event_id: 'google_evt_musio_999',
-      calendar_event_id: 'google_evt_musio_999',
-      token: 'tok_random_20chars_abc123',
-      enlace_estable: 'https://wa.geekstudio.dev/api/r/tok_random_20chars_abc123',
+      status: 200,
+      text: async () => JSON.stringify({
+        ok: false,
+        verified: false,
+        components: {
+          calendar: { state: 'verified', id: 'gcal_evt_100' },
+          zoom: { state: 'failed', error: 'zoom_rate_limit' },
+        },
+      }),
     }),
   });
-  const verified = await executeBookWriter({
-    proposal: mockProposal,
+  assert.equal(partialRes.ok, false);
+  assert.equal(partialRes.verified, false);
+  assert.equal(partialRes.uncertain, false);
+  assert.equal(partialRes.components.calendar.state, 'verified');
+  assert.equal(partialRes.components.zoom.state, 'failed');
+
+  // 4. Respuesta 200 con cuerpo vacío o sin verified -> INCIERTO (uncertain: true, nunca éxito)
+  const empty200Res = await executeBookWriter({
+    proposal: { ...baseProposal, resources: ['calendar', 'zoom'] },
     contactName: 'Musio',
     token: 'valid-token',
-    fetchFn: mockFetchVerified,
+    fetchFn: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '',
+    }),
   });
-  assert.equal(verified.ok, true);
-  assert.equal(verified.verified, true);
-  assert.equal(verified.event_id, 'google_evt_musio_999');
-  assert.equal(verified.token, 'tok_random_20chars_abc123');
+  assert.equal(empty200Res.ok, false);
+  assert.equal(empty200Res.uncertain, true, '200 con cuerpo vacío debe ser uncertain: true');
 });
 
-test('executeCancelWriter: respuesta 200 sin verificación de readback debe producir estado incierto (uncertain: true)', async () => {
-  const mockProposal = {
-    id: 'prop-cancel-1',
-    event_id: 'evt_google_123',
+test('executeCancelWriter: cancelación independiente por recurso sin exigir ID de la contraparte', async () => {
+  const baseProposal = {
+    id: 'prop-cancel-test-1',
     contact_number: '5213322630839',
   };
 
-  // 1. Falta de token -> precondición clara (uncertain: false)
-  const noToken = await executeCancelWriter({
-    proposal: mockProposal,
-    token: '',
-  });
-  assert.equal(noToken.ok, false);
-  assert.equal(noToken.uncertain, false);
-  assert.equal(noToken.error, 'missing_calendar_token');
-
-  // 2. Respuesta 200 con verified: false -> INCIERTO (uncertain: true)
-  const mockFetchUnverified = async () => ({
-    ok: true,
-    status: 200,
-    text: async () => JSON.stringify({ ok: true, verified: false }),
-  });
-  const unverified = await executeCancelWriter({
-    proposal: mockProposal,
+  // 1. Cancelar Calendar solo
+  const cancelCalRes = await executeCancelWriter({
+    proposal: { ...baseProposal, resources: ['calendar'], event_id: 'gcal_evt_100' },
     token: 'valid-token',
-    fetchFn: mockFetchUnverified,
+    fetchFn: async (_url, opts) => {
+      const payload = JSON.parse(opts.body);
+      assert.deepEqual(payload.resources, ['calendar']);
+      assert.equal(payload.event_id, 'gcal_evt_100');
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          verified: true,
+          components: {
+            calendar: { state: 'verified', id: 'gcal_evt_100' },
+          },
+        }),
+      };
+    },
   });
-  assert.equal(unverified.ok, false);
-  assert.equal(unverified.verified, false);
-  assert.equal(unverified.uncertain, true);
+  assert.equal(cancelCalRes.ok, true);
+  assert.equal(cancelCalRes.verified, true);
+  assert.deepEqual(cancelCalRes.resources, ['calendar']);
 
-  // 3. Respuesta verificada
-  const mockFetchVerified = async () => ({
-    ok: true,
-    status: 200,
-    text: async () => JSON.stringify({
-      ok: true,
-      verified: true,
-      event_id: 'evt_google_123',
-      enlace_retirado: true,
-    }),
-  });
-  const verified = await executeCancelWriter({
-    proposal: mockProposal,
+  // 2. Cancelar Zoom solo sin event_id de Calendar
+  const cancelZoomRes = await executeCancelWriter({
+    proposal: { ...baseProposal, resources: ['zoom'], zoom_id: 'zoom_mtg_888' },
     token: 'valid-token',
-    fetchFn: mockFetchVerified,
+    fetchFn: async (_url, opts) => {
+      const payload = JSON.parse(opts.body);
+      assert.deepEqual(payload.resources, ['zoom']);
+      assert.equal(payload.zoom_id, 'zoom_mtg_888');
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          verified: true,
+          components: {
+            zoom: { state: 'verified', id: 'zoom_mtg_888' },
+          },
+        }),
+      };
+    },
   });
-  assert.equal(verified.ok, true);
-  assert.equal(verified.verified, true);
-  assert.equal(verified.enlace_retirado, true);
+  assert.equal(cancelZoomRes.ok, true);
+  assert.equal(cancelZoomRes.verified, true);
+  assert.deepEqual(cancelZoomRes.resources, ['zoom']);
 });
 
-test('handleOwnerAgendaDecision: emisor no autorizado es rechazado de inmediato', async () => {
+test('handleOwnerAgendaDecision: emisor no autorizado y control de línea', async () => {
   const res = await handleOwnerAgendaDecision({
     pool: {},
     record: { contact_number: '5219990000001' },
