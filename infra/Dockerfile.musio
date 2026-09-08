@@ -1,0 +1,7 @@
+# Tag the recorded deployed image as forgechat-musio-runtime-base:20260908
+# after verifying its image ID. This avoids rebuilding unrelated dependencies.
+FROM forgechat-musio-runtime-base:20260908
+ARG SOURCE_REVISION
+WORKDIR /app
+COPY backend/src/ /app/src/
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION

@@ -1,0 +1,152 @@
+{
+  "id": "i4IapJoxLObQTPW1",
+  "versionId": "06b2eb7e-0fa9-47b8-9bbb-90dc406a14ed",
+  "name": "IA360 Agenda - Citas del Contacto (Tool)",
+  "active": true,
+  "activeVersionId": "06b2eb7e-0fa9-47b8-9bbb-90dc406a14ed",
+  "nodes": [
+    {
+      "id": "250d4ab8-cccb-490d-ab06-cc3b59feb71f",
+      "name": "Entrada",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "numero_contacto",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4fd6b90d-7b03-4086-8e34-3142dd8285c2",
+      "name": "Leer Citas del Contacto",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT token, event_id, start_utc, end_utc, summary, zoom_join_url, zoom_meeting_id FROM coexistence.ia360_meeting_links WHERE regexp_replace(coalesce(contact_number, ''), '[^0-9]', '', 'g') = regexp_replace($1, '[^0-9]', '', 'g') AND end_utc >= now() - interval '2 hours' ORDER BY start_utc LIMIT 10",
+        "options": {
+          "queryReplacement": "={{ $json.numero }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "ia360forgechatRO01",
+          "name": "ForgeChat Postgres RO (coexistence)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "422856e8-59c7-427f-a890-a7579658ef0f",
+      "name": "Responder Citas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const filas = $input.all().map((i) => i.json).filter((f) => f && f.start_utc);\nconst tz = 'America/Mexico_City';\nfunction fecha(iso) { return new Intl.DateTimeFormat('es-MX', { timeZone: tz, dateStyle: 'full' }).format(new Date(iso)); }\nfunction hora(iso) { return new Intl.DateTimeFormat('es-MX', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso)); }\nif (filas.length === 0) {\n  return [{ json: { ok: true, tiene_citas: false, citas: [], resumen: 'Este contacto no tiene ninguna cita registrada a futuro.' } }];\n}\nconst citas = filas.map((f) => ({ evento_id: f.event_id, zoom_id: f.zoom_meeting_id ? String(f.zoom_meeting_id) : null, titulo: f.summary, dia: fecha(f.start_utc), de: hora(f.start_utc), a: hora(f.end_utc), inicio_utc: f.start_utc, fin_utc: f.end_utc, zoom: f.zoom_join_url || null, enlace: 'https://wa.geekstudio.dev/api/r/' + f.token }));\nconst resumen = citas.map((c) => c.titulo + ': ' + c.dia + ', de ' + c.de + ' a ' + c.a + ' (hora del centro de Mexico)').join('; ');\nreturn [{ json: { ok: true, tiene_citas: true, citas, resumen } }];"
+      }
+    },
+    {
+      "id": "ebc9a055-8713-4b09-b732-f37e07436f0f",
+      "name": "Normalizar Numero",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        110,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json || {};\nif (raw.body) {\n  const expected = $env.N8N_CALENDAR_TOKEN;\n  const auth = raw.headers?.authorization || raw.headers?.Authorization || '';\n  if (!expected || auth !== `Bearer ${expected}`) throw new Error('AUTH_FAILED: agenda local requiere bearer valido del VPS.');\n}\nconst inp = raw.body || raw;\nconst crudo = inp.numero_contacto ?? inp.contact_number ?? inp.numero ?? '';\nconst numero = String(crudo).replace(/[^0-9]/g, '');\nif (!numero) throw new Error('FALTA_NUMERO: citas_del_contacto necesita el numero de WhatsApp del contacto.');\nreturn [{ json: { numero } }];"
+      }
+    },
+    {
+      "id": "0833a140-68d1-413a-a66f-b532cb68c084",
+      "name": "Webhook Citas Contacto",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ia360-owner-agenda-contact",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "1012c42b-71e9-47ee-96ac-1b84cea52bb5"
+    }
+  ],
+  "connections": {
+    "Leer Citas del Contacto": {
+      "main": [
+        [
+          {
+            "node": "Responder Citas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Entrada": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Numero",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Numero": {
+      "main": [
+        [
+          {
+            "node": "Leer Citas del Contacto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Citas Contacto": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Numero",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "errorWorkflow": "aXJ4yskqJhxgX1B1",
+    "availableInMCP": true,
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}

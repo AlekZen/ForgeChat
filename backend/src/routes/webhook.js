@@ -29,6 +29,11 @@ const { leerMedio, componerMensajeConLectura, tipoDeLectura } = require('../serv
 const { leerDocumento } = require('../services/documentUnderstanding');
 // Triaje de desconocidos: quién es el que escribe cuando no está en ningún embudo.
 const { clasificarDesconocido, decidirTriaje } = require('../services/ia360Triaje');
+const {
+  proposeAgendaAction,
+  handleOwnerAgendaDecision,
+  handleOwnerFailureAssistance,
+} = require('../services/ia360AgendaProposals');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId, normalizeOpenerReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
@@ -1230,36 +1235,7 @@ async function loadIa360FailureTarget(failureId) {
   return rows[0] || null;
 }
 
-function buildIa360OwnerCommentReply(comment) {
-  const text = String(comment || '').trim();
-  if (!text) return '';
-  return `Alek me confirmó lo siguiente:\n\n${text}`;
-}
 
-async function sendIa360OwnerCommentToFailureContact({ ownerRecord, failureId, comment }) {
-  const target = await loadIa360FailureTarget(failureId);
-  const targetNumber = normalizePhone(target?.contact_number || '');
-  const body = buildIa360OwnerCommentReply(comment);
-  if (!target || !targetNumber || !body) return { ok: false, reason: 'missing_target_or_body' };
-  const targetRecord = {
-    ...ownerRecord,
-    contact_number: targetNumber,
-    contact_name: target.contact_name || '',
-    message_id: `owner_comment_fail:${String(failureId).replace(/\D/g, '')}:${Date.now()}`,
-    message_type: 'text',
-    message_body: target.contact_message || '',
-  };
-  const sent = await enqueueIa360Text({
-    record: targetRecord,
-    label: 'ia360_owner_supervised_reply',
-    body,
-  });
-  return {
-    ok: sent === true,
-    contactName: target.contact_name || '',
-    contactNumber: targetNumber,
-  };
-}
 
 async function captureIa360OwnerFailureComment(record) {
   if (record.message_type !== 'text'
@@ -1277,42 +1253,16 @@ async function captureIa360OwnerFailureComment(record) {
     if (!awaitingFid || String(awaitingFid).trim() === '') return false;
     const comment = String(record.message_body || '').trim();
     const fid = String(awaitingFid).replace(/\D/g, '');
-    await pool.query(
-      `UPDATE coexistence.ia360_bot_failures
-          SET owner_comment=$1, owner_action='respondio_con_comentario', status='comentario_recibido'
-        WHERE id=$2`,
-      [comment, fid]
-    ).catch(e => console.error('[ia360-failure] save comment:', e.message));
-    let supervised = { ok: false, reason: 'not_attempted' };
-    try {
-      supervised = await sendIa360OwnerCommentToFailureContact({
-        ownerRecord: record,
-        failureId: fid,
-        comment,
-      });
-    } catch (sendErr) {
-      supervised = { ok: false, reason: sendErr.message };
-      console.error('[ia360-failure] send owner comment to contact:', sendErr.message);
-    }
-    await pool.query(
-      `UPDATE coexistence.ia360_bot_failures
-          SET status=$1
-        WHERE id=$2`,
-      [supervised.ok ? 'respondido_por_comentario_owner' : 'comentado_envio_fallo', fid]
-    ).catch(e => console.error('[ia360-failure] mark comment send:', e.message));
-    await mergeContactIa360State({
-      waNumber: record.wa_number,
-      contactNumber: record.contact_number,
-      customFields: { ia360_awaiting_comment_failure: '' },
-    }).catch(e => console.error('[ia360-failure] clear awaiting:', e.message));
-    const ackName = supervised.contactName || (supervised.contactNumber ? `contacto ${maskIa360Number(supervised.contactNumber)}` : 'el contacto');
-    await sendIa360DirectText({
+    await handleOwnerFailureAssistance({
+      pool,
       record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'owner_comment_fail_saved',
-      body: supervised.ok
-        ? `Listo: guardé tu comentario y se lo envié a ${ackName}.`
-        : `Guardé tu comentario, pero no pude enviarlo al contacto (${supervised.reason || 'error desconocido'}).`,
+      failureId: fid,
+      comment,
+      loadFailureTarget: loadIa360FailureTarget,
+      callIa360Agent,
+      enqueueIa360Text,
+      sendIa360DirectText,
+      mergeContactState: mergeContactIa360State,
     });
     return true;
   } catch (capErr) {
@@ -3132,12 +3082,20 @@ function parseIa360SlotId(replyId) {
 }
 
 async function bookIa360Slot({ record, start, end }) {
-  const url = process.env.N8N_IA360_BOOK_WEBHOOK_URL;
-  if (!url) return null;
+  const token = process.env.N8N_CALENDAR_TOKEN || '';
+  if (!token || !String(token).trim()) {
+    console.error('[ia360-calendar] N8N_CALENDAR_TOKEN is missing');
+    return { ok: false, uncertain: false, reason: 'missing_calendar_token' };
+  }
+  const url = process.env.N8N_IA360_BOOK_WEBHOOK_URL || 'http://n8n:5678/webhook/ia360-calendar-book';
+  if (!url) return { ok: false, uncertain: false, reason: 'missing_book_url' };
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
       body: JSON.stringify({
         source: 'forgechat-ia360-webhook',
         start,
@@ -3152,17 +3110,29 @@ async function bookIa360Slot({ record, start, end }) {
     const text = await res.text();
     if (!res.ok) {
       console.error('[ia360-calendar] book failed:', res.status, text);
-      return { ok: false, reason: 'book_failed' };
+      return { ok: false, uncertain: res.status >= 500, reason: 'book_failed' };
     }
-    return JSON.parse(text || '{}');
+    let data = {};
+    try { data = JSON.parse(text || '{}'); } catch (_) { data = {}; }
+    const eventId = data.calendarEventId || data.event_id || data.calendar_event_id;
+    if (data.ok === true && data.verified === true && eventId) {
+      return {
+        ok: true,
+        verified: true,
+        start: data.start || start,
+        end: data.end || end,
+        calendarEventId: eventId,
+        zoomMeetingId: data.zoomMeetingId || data.zoom_meeting_id || '',
+        data,
+      };
+    }
+    return { ok: false, uncertain: true, reason: 'booking_unverified' };
   } catch (err) {
     console.error('[ia360-calendar] book error:', err.message);
-    return { ok: false, reason: 'book_error' };
+    return { ok: false, uncertain: true, reason: 'book_error' };
   }
 }
 
-// Delega en el módulo puro ./ia360OpenerReply (mismo parse, sin DB) para que los
-// tests ejerciten exactamente la extracción que corre en producción.
 function getInteractiveReplyId(record) {
   return extractInteractiveReplyId(record);
 }
@@ -3253,27 +3223,40 @@ function buildIa360AgentPayload({
   source,
   accountContext = null,
   conversationContext = null,
+  threadContext = null,
 }) {
+  const isOwnerAssistance = threadContext?.input_mode === 'owner_assistance';
   return {
-    source,
+    source: isOwnerAssistance ? 'webhook_owner_assistance' : source,
     channel: 'whatsapp',
     dry_run: source === 'forgechat-ia360-contact-intelligence-shadow',
-    text: record.message_body || '',
+    text: isOwnerAssistance ? (threadContext.owner_instruction || record.message_body || '') : (record.message_body || ''),
     stage: stageName,
     history,
-    message_id: record.message_id || null,
+    message_id: isOwnerAssistance ? (threadContext.source_message_id || record.message_id) : (record.message_id || null),
+    source_message_id: threadContext?.source_message_id || record.message_id || null,
+    owner_message_id: threadContext?.owner_message_id || null,
     wa_number: record.wa_number || null,
     contact_number: record.contact_number || null,
     contact_name: record.contact_name || record.profile_name || null,
-    // ── P16 (19-ago-2026). Estrictamente ADITIVO: los 10 campos de arriba no
-    // cambian de nombre ni de forma, asi que el workflow actual sigue igual.
-    // `contract_version` permite al workflow distinguir un payload viejo de
-    // uno nuevo sin adivinar por presencia de campos.
     contract_version: 2,
     message_type: record.message_type || 'text',
     structured: buildIa360StructuredPayload(record),
     account_context: accountContext,
     conversation_context: conversationContext,
+    input_mode: threadContext?.input_mode || 'standard',
+    owner_instruction: threadContext?.owner_instruction || null,
+    original_request: threadContext?.original_request || null,
+    failure_id: threadContext?.failure_id || null,
+    failure_reason: threadContext?.failure_reason || null,
+    owner_assistance: isOwnerAssistance ? {
+      failure_id: threadContext.failure_id,
+      owner_instruction: threadContext.owner_instruction,
+      original_request: threadContext.original_request,
+      source_message_id: threadContext.source_message_id,
+      owner_message_id: threadContext.owner_message_id,
+    } : null,
+    thread_context: threadContext || null,
   };
 }
 
@@ -3384,6 +3367,7 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
           source: 'forgechat-ia360-webhook',
           accountContext,
           conversationContext,
+          threadContext,
         }),
         memory: agentMemory,
         // G-LIVE: el Normalize del workflow mapea `role` a contact.role dentro del
@@ -8232,19 +8216,39 @@ async function handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId }) {
 // POST al workflow n8n de cancelar (borra Calendar + Zoom). Requiere User-Agent
 // tipo Chrome por Cloudflare (los otros helpers n8n no lo necesitan; este SI).
 async function cancelIa360Booking({ calendarEventId, zoomMeetingId }) {
-  const url = process.env.N8N_IA360_CANCEL_WEBHOOK_URL || 'https://n8n.geekstudio.dev/webhook/ia360-calendar-cancel';
+  const token = process.env.N8N_CALENDAR_TOKEN || '';
+  if (!token || !String(token).trim()) {
+    console.error('[ia360-cancel] N8N_CALENDAR_TOKEN is missing');
+    return { ok: false, error: 'missing_calendar_token' };
+  }
+  const url = process.env.N8N_IA360_CANCEL_WEBHOOK_URL || 'http://n8n:5678/webhook/ia360-calendar-cancel';
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify({ calendarEventId: calendarEventId || '', zoomMeetingId: zoomMeetingId || '' }),
+      body: JSON.stringify({
+        calendarEventId: calendarEventId || '',
+        event_id: calendarEventId || '',
+        zoomMeetingId: zoomMeetingId || '',
+        zoom_id: zoomMeetingId || '',
+        confirmado_por_owner: 'true',
+      }),
     });
     const text = await res.text().catch(() => '');
-    if (!res.ok) { console.error('[ia360-cancel] webhook failed:', res.status, text); return { ok: false, status: res.status }; }
-    return { ok: true, body: text };
+    if (!res.ok) {
+      console.error('[ia360-cancel] webhook failed:', res.status, text);
+      return { ok: false, status: res.status, error: text };
+    }
+    let data = {};
+    try { data = JSON.parse(text || '{}'); } catch (_) { data = {}; }
+    const isSuccess = data.ok === true && data.verified === true;
+    if (isSuccess) {
+      return { ok: true, data };
+    }
+    return { ok: false, error: data.error || data.motivo || 'cancel_unverified' };
   } catch (err) {
     console.error('[ia360-cancel] webhook error:', err.message);
     return { ok: false, error: err.message };
@@ -10083,12 +10087,26 @@ async function handleIa360LiteInteractive(record) {
   // getInteractiveReplyId ya devuelve el id en minusculas; por eso los ids owner
   // se emiten en minusculas con guion_bajo y el contactNumber sobrevive (digitos).
   const ownerReplyId = getInteractiveReplyId(record);
-  if (ownerReplyId && ownerReplyId.startsWith('owner_')) {
+  if (ownerReplyId && (ownerReplyId.startsWith('owner_') || ownerReplyId.startsWith('ia360_agenda_yes:') || ownerReplyId.startsWith('ia360_agenda_no:'))) {
     if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
       console.warn('[ia360-owner] ignored owner-prefixed reply from non-owner contact=%s id=%s', record.contact_number || '-', ownerReplyId);
       return;
     }
     try {
+      if (ownerReplyId.startsWith('ia360_agenda_yes:') || ownerReplyId.startsWith('ia360_agenda_no:')) {
+        await handleOwnerAgendaDecision({
+          pool,
+          record,
+          buttonId: ownerReplyId,
+          sendOwnerDirectText: sendIa360DirectText,
+          sendContactDirectText: (opts) => sendIa360DirectText({ ...opts, ownerBudget: false }),
+          syncDeal: syncIa360Deal,
+          mergeContactState: mergeContactIa360State,
+          removeBooking: removeIa360Booking,
+          loadContactName: (num) => nombreDeContacto(num),
+        });
+        return;
+      }
       const [ownerAction, ownerArg, ownerPipe] = ownerReplyId.split(':');
       // call/keep cargan el numero del contacto (digit-strip OK). owner_cancel_yes
       // carga el EVENT_ID (alfanumerico) → NO digit-stripear ese arg.
@@ -13049,6 +13067,25 @@ async function evaluarPropuestaDeAlcance({ contactNumber, accountKey }) {
     detalle: { nombre: r.nombre, ult4: contactNumber.slice(-4), mensajes: r.mensajes, ya_asignado: r.ya_asignado || null },
   };
 }
+
+router.post('/internal/ia360-agenda/propose', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const result = await proposeAgendaAction({
+      pool,
+      input: b,
+      sendOwnerInteractive,
+      loadContactName: async (contactNumber) => nombreDeContacto(contactNumber),
+    });
+    return res.status(200).json(result);
+  } catch (err) {
+    console.error('[ia360-agenda-propose] error:', err.message);
+    return res.status(500).json({ ok: false, state: 'blocked', message: 'Error interno en propuesta de agenda: ' + err.message });
+  }
+});
 
 router.post('/internal/ia360-scope/propose', async (req, res) => {
   if (!isIa360InternalAuthorized(req)) {

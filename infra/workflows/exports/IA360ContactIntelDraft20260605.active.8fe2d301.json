@@ -1,0 +1,1663 @@
+{
+  "id": "IA360ContactIntelDraft20260605",
+  "versionId": "8fe2d301-e59f-4cb7-8cb3-80e1476484a6",
+  "name": "IA360 Contact Intelligence Agent (Producci\u00f3n)",
+  "active": true,
+  "activeVersionId": "8fe2d301-e59f-4cb7-8cb3-80e1476484a6",
+  "nodes": [
+    {
+      "id": "wh_contact_intel",
+      "name": "Webhook WhatsApp Contact Intelligence",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        -896,
+        0
+      ],
+      "webhookId": "71ffb541-06e6-44b4-8b33-a360c1da0001",
+      "parameters": {
+        "path": "ia360-contact-intelligence-agent-draft",
+        "options": {},
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "code_normalize",
+      "name": "Normalize WhatsApp Context",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        -672,
+        -208
+      ],
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst p = input.body || input;\nconst tz = 'America/Mexico_City';\nconst now = new Date();\nconst todayCDMX = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);\nconst requestId = String(p.request_id || p.message_id || p.id || `ci-${Date.now()}`);\nconst text = String(p.text || p.message || p.body || '').slice(0, 1200);\nconst history = Array.isArray(p.history) ? p.history.slice(-12) : [];\nconst accountContext = p.account_context && typeof p.account_context === 'object'\n  ? p.account_context : null;\nconst conversationContext = p.conversation_context && typeof p.conversation_context === 'object'\n  ? p.conversation_context : null;\nconst contextualText = String(\n  conversationContext?.contextualText\n    || [conversationContext?.previousQuestion, conversationContext?.currentReply]\n      .filter(Boolean).join('\\nRespuesta: ')\n    || text\n).slice(0, 1200);\nconst contact = {\n  wa_number: p.wa_number || p.waNumber || p.account_wa_number || null,\n  contact_number: p.contact_number || p.contactNumber || p.from || p.phone || null,\n  name: p.contact_name || p.contactName || p.name || null,\n  espo_id: p.espo_id || p.espoId || null,\n  role: p.role || p.contact?.role || null\n};\nconst accountInput = accountContext || p.account || {};\nconst projects = Array.isArray(accountContext?.projects) ? accountContext.projects : [];\nconst primaryProject = projects.find(project => project?.isDefault) || projects[0] || null;\nconst account = {\n  name: accountInput.name || p.account_name || p.company || null,\n  project: accountInput.project || primaryProject?.projectKey || p.project || p.project_name || null,\n  project_slug: accountInput.project_slug || primaryProject?.projectKey || p.project_slug || null\n};\nconst identityStatus = contact.espo_id ? 'known' : (contact.contact_number ? 'candidate' : 'unknown');\nconst context = {\n  source: p.source || 'unknown',\n  request_id: requestId,\n  channel: p.channel || 'whatsapp',\n  text,\n  stage: p.stage || 'desconocido',\n  history,\n  contact,\n  account,\n  account_key: accountContext?.accountKey || p.account_key || null,\n  account_context: accountContext,\n  conversation_context: conversationContext,\n  contextual_text: contextualText,\n  project_slug: account.project_slug || account.project || 'ia360',\n  dry_run: true,\n  today_cdmx: todayCDMX,\n  identity_status_seed: identityStatus,\n  // --- P16 (19-ago-2026) -----------------------------------------------------\n  // El tipo REAL del mensaje y su carga estructurada. Antes todo llegaba\n  // aplanado a `text`: un tap de boton y alguien tecleando esa misma palabra\n  // eran indistinguibles para el modelo, y las respuestas de Flow\n  // (interactive.nfm_reply.response_json) no llegaban nunca.\n  // `structured` NO es fuente de identidad: la tenencia se resuelve aguas\n  // arriba y el modelo no puede elegirla desde aqui.\n  message_type: p.message_type || 'text',\n  structured: p.structured || null,\n  contract_version: p.contract_version || 1,\n  architecture_note: 'Draft agentic workflow: identity -> classification -> tools/RAG -> response contract. No sends or CRM writes from n8n.'\n};\nreturn [{ json: { ...context, agent_input: JSON.stringify(context, null, 2) } }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "code_identity",
+      "name": "Identity Snapshot",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        -608,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst seed = {\n  identity_status: j.identity_status_seed || 'unknown',\n  contact_number_present: !!(j.contact && j.contact.contact_number),\n  espo_id_present: !!(j.contact && j.contact.espo_id),\n  source: j.source,\n  note: 'Draft snapshot only. Real lookup/write remains pending for ForgeChat/EspoCRM subworkflow.'\n};\nreturn [{ json: { ...j, identity_snapshot: seed } }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "agent_contact_intel",
+      "name": "IA360 Contact Intelligence Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "position": [
+        576,
+        320
+      ],
+      "parameters": {
+        "text": "={{ $('Prepare RAG Pinecone Dry Run').first().json.agent_input }}",
+        "options": {
+          "maxIterations": 4,
+          "systemMessage": "Eres la IA de Alek para IA360, atendiendo conversaciones por WhatsApp. Hablas como una persona real del equipo de Alek: c\u00e1lida, directa, con criterio. Arquitectura pipeline-first.\n\nQUI\u00c9N ERES (si te preguntan):\n- Eres la asistente de IA de Alek para IA360. Si alguien pregunta si eres humano o un bot, dilo con naturalidad y sin rodeos: eres la IA de Alek, y aun as\u00ed est\u00e1s para ayudar de verdad.\n- No finjas ser Alek en persona; eres su IA.\n\nREGLA CR\u00cdTICA DE IDIOMA:\n- Responde SIEMPRE en espa\u00f1ol mexicano impecable.\n- Prohibido contestar en ingl\u00e9s, incluso si el usuario usa palabras en ingl\u00e9s.\n- Usa acentos, \u00f1 y la palabra a\u00f1o/a\u00f1os cuando aplique.\n- Nunca uses frases como \"Currently\", \"However\", \"Let's\", \"I can't\" o \"workflow\" en ingl\u00e9s.\n\nTONO Y FORMA DE HABLAR (lo m\u00e1s importante):\n- Suena a persona, no a formulario. PROHIBIDO usar plantillas o etiquetas tipo \"Hallazgo:\", \"Dato m\u00ednimo faltante:\", \"Siguiente acci\u00f3n:\", \"Lo registro como:\", \"Lo dejo para revisi\u00f3n\", \"clasificado\", \"operaci\u00f3n cliente\", \"route\", \"intent\". Eso es mec\u00e1nica interna: NUNCA aparece en lo que lee el cliente.\n- Una respuesta natural fluye en 1-3 frases conversacionales. Si necesitas un dato, p\u00eddelo como lo har\u00eda una persona (\"\u00bfDe qu\u00e9 tama\u00f1o es tu equipo de ventas?\"), no como un campo de captura.\n- Habla SOLO de lo que el contacto trajo en su \u00faltimo mensaje. No arrastres dolores, \u00e1reas ni hallazgos viejos a una conversaci\u00f3n que no los toca.\n- No inventes contexto: si no sabes de qu\u00e9 trata una reuni\u00f3n, no le pongas tema. S\u00f3lo puedes afirmar lo que te devolvi\u00f3 una herramienta.\n- Cuando algo queda pendiente de Alek (un alta, un env\u00edo, agendar algo), dilo en humano: \"se lo paso a Alek y te confirmo\", \"lo dejo listo para que Alek le d\u00e9 el ok antes de enviar\". Nunca digas \"revisi\u00f3n humana\" ni \"lo dejo en revisi\u00f3n\".\n\nCONTRATO (estructura t\u00e9cnica, invisible para el cliente):\n- Devuelve SIEMPRE un objeto JSON v\u00e1lido, sin markdown y sin texto fuera del JSON.\n- Conserva el contrato que ForgeChat espera: reply, intent, date, action, extracted.\n- El campo reply es lo \u00fanico que lee la persona: breve, c\u00e1lido, \u00fatil; m\u00e1ximo 600 caracteres; sin etiquetas ni jerga interna.\n- No inventes horarios libres; si quiere agendar usa action=offer_slots.\n- No env\u00edes mensajes, no escribas CRM y no cambies pipeline desde n8n. Si hace falta una acci\u00f3n externa, prepara la respuesta para pedir lo que falte o dejarlo listo para el ok de Alek (en el JSON marca requires_human_approval, pero en reply suena natural).\n\nCITAS: CALENDARIO Y ZOOM (cuatro herramientas; dos leen, dos son peligrosas):\n- REGLA DE ORDEN: si el mensaje menciona una cita, reuni\u00f3n, sesi\u00f3n, horario o \"el s\u00e1bado/lunes/ma\u00f1ana\", lo PRIMERO que haces es llamar a citas_del_contacto. Es la fuente de la verdad de lo ya acordado.\n- Si citas_del_contacto devuelve una cita que encaja con lo que pregunta, RESPONDE CON ESA CITA: d\u00eda y hora exactos tal como vienen, y no ofrezcas horarios nuevos ni vuelvas a agendar. \"\u00bfA qu\u00e9 hora quedamos el s\u00e1bado?\" se contesta con la hora de esa cita, no con huecos libres.\n- consultar_disponibilidad es SOLO LECTURA y da los huecos LIBRES de un d\u00eda. \u00dasala \u00fanicamente cuando haga falta proponer un horario NUEVO. Ojo: los huecos libres son lo contrario de una cita agendada; no los confundas. Si responde dia_libre=true, ese d\u00eda no tiene ning\u00fan evento.\n- proponer_reunion y cancelar_reunion ESCRIBEN Y BORRAN en el calendario real de Alek. NUNCA las ejecutes por iniciativa propia, ni porque el contacto lo pida, ni porque parezca obvio. El camino es siempre el mismo: propones el horario en texto, marcas requires_human_approval, y esperas a que Alek confirme. S\u00f3lo con la confirmaci\u00f3n expl\u00edcita de Alek en este hilo se llaman con confirmado_por_owner=true. Sin esa confirmaci\u00f3n fallan a prop\u00f3sito, y ese fallo es correcto, no un error que debas sortear.\n- Si el contacto pide mover o cancelar una cita, PROPONES el cambio y pides el ok; no tocas el calendario.\n- Jam\u00e1s inventes un horario, un enlace de Zoom ni un identificador de evento: si no vino de una herramienta, no existe.\n\nCONTEXTO DE PRUEBA / COMANDOS DE ALEK:\n- Si el contacto es Alek o escribe como due\u00f1o con comandos tipo \"da de alta\", \"agrega\", \"env\u00edale\", \"mueve\", \"pipeline\", tr\u00e1talo como instrucci\u00f3n operativa interna, no como prospecto.\n- Para comandos internos, NO digas que no puedes. Responde resolviendo: qu\u00e9 dato te falta y que lo dejas listo para su ok.\n- Ejemplo: \"da de alta a andres y env\u00edale un pipeline\" -> \"Va. Para dar de alta a Andr\u00e9s necesito su WhatsApp y cu\u00e1l pipeline quieres. P\u00e1samelos y lo dejo listo para que le des el ok antes de mandarlo.\" Usa intent=provide_info, action=nurture, route=human_review (esto en el JSON; el reply nunca menciona \"human_review\").\n\nTAXONOM\u00cdA (solo para los campos JSON):\nintent: book | ask_pain | provide_info | optout | smalltalk | other | list_bookings\naction: offer_slots | book | cancel | reschedule | list_bookings | advance_pain | nurture | optout | none\nroute: agenda | diagnostico | crm_update | human_review | nurture | optout | no_action\n\nRESPUESTA ESPERADA:\n{\n  \"reply\": \"respuesta natural y humana, en espa\u00f1ol mexicano, sin etiquetas ni jerga interna\",\n  \"intent\": \"...\",\n  \"date\": \"YYYY-MM-DD o null\",\n  \"action\": \"...\",\n  \"extracted\": {\"area_operacion\":\"texto o null\", \"urgencia\":\"alta|media|baja|null\"},\n  \"contact_intelligence\": {\n    \"identity_status\":\"known|candidate|unknown\",\n    \"route\":\"agenda|diagnostico|crm_update|human_review|nurture|optout|no_action\",\n    \"stage_signal\":\"texto breve\",\n    \"tools_used\":[\"nombres de tools consultadas o []\"],\n    \"confidence\":0.0,\n    \"next_best_action\":\"texto breve en espa\u00f1ol\",\n    \"human_review_required\":true\n  },\n  \"dry_run\": true,\n  \"requires_human_approval\": true\n}\n\nC\u00d3MO DECIDIR (interno; nunca se lo expliques al cliente):\n- Pregunta por una cita ya acordada -> intent=list_bookings/action=list_bookings, con lo que devolvi\u00f3 citas_del_contacto.\n- Quiere horarios nuevos, reagendar o cancelar -> intent=book; usa offer_slots, reschedule o cancel seg\u00fan corresponda, siempre pidiendo el ok de Alek.\n- Describe dolor operativo, trabajo manual, falta de visibilidad, CRM, WhatsApp, ERP, reportes, automatizaci\u00f3n o IA -> intent=ask_pain/action=advance_pain. Conversa sobre eso con curiosidad genuina; no saltes a agenda salvo que lo pida.\n- Comando interno de Alek -> intent=provide_info/action=nurture/route=human_review.\n- Saludo sin intenci\u00f3n -> smalltalk/none.\n\n\nCONTINUIDAD DEL HILO COMPARTIDO:\n- El texto actual vive en text. Usa history y conversation_context para entender a qu\u00e9 pregunta previa est\u00e1 respondiendo el contacto.\n- Si conversation_context trae previousQuestion y currentReply, responde a esa relaci\u00f3n; no hagas una pregunta nueva ni prometas ejecuci\u00f3n.\n- account_context es identidad server-side: \u00fasala para ubicar cuenta/proyecto, nunca la reemplaces ni la infieras.\n",
+          "returnIntermediateSteps": false
+        },
+        "promptType": "define",
+        "hasOutputParser": true,
+        "needsFallback": true
+      },
+      "typeVersion": 3.1,
+      "onError": "continueRegularOutput",
+      "notes": "P27: onError continueRegularOutput. Gemini crashea el nodo cuando el candidato no trae parts; sin esto se pierde TODA la respuesta y el contacto recibe el enlatado. Normalize ForgeChat Contract tiene guardia final humana."
+    },
+    {
+      "id": "code_contract",
+      "name": "Normalize ForgeChat Contract",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        864,
+        400
+      ],
+      "parameters": {
+        "jsCode": "const base = ($('Prepare RAG Pinecone Dry Run').first()?.json) || $('Lookup IA360 Memory').first().json || $('Identity Snapshot').first().json;\nconst memoryContext = base.memory_context || null;\nconst memorySeen = Boolean(memoryContext && (memoryContext.facts_count > 0 || memoryContext.events_count > 0 || memoryContext.schema === 'ia360_memory_context_for_agent.v1'));\nconst signalClassification = base.signal_classification || null;\nconst ragContext = base.rag_context || null;\nconst rawItem = $input.first().json;\nconst agentErrorCode = typeof rawItem?.error === 'string' && rawItem.error.trim()\n  ? 'AGENT_PROVIDER_UNAVAILABLE' : null;\nlet candidate = rawItem.output ?? rawItem.text ?? rawItem;\nif (typeof candidate === 'string') {\n  const trimmed = candidate.trim().replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n  try { candidate = JSON.parse(trimmed); } catch (e) { candidate = { reply: trimmed }; }\n}\nif (!candidate || typeof candidate !== 'object') candidate = {};\nconst allowedIntents = new Set(['book','ask_pain','provide_info','optout','smalltalk','other','list_bookings']);\nconst allowedActions = new Set(['offer_slots','book','cancel','reschedule','list_bookings','advance_pain','nurture','optout','none']);\nconst ci = candidate.contact_intelligence && typeof candidate.contact_intelligence === 'object' ? candidate.contact_intelligence : {};\nconst toolsUsed = Array.isArray(ci.tools_used) ? [...ci.tools_used] : [];\nif (memorySeen && !toolsUsed.includes('ia360_memory_lookup')) toolsUsed.push('ia360_memory_lookup');\nif (signalClassification && !toolsUsed.includes('ia360_signal_classifier_gpt_5_5')) toolsUsed.push('ia360_signal_classifier_gpt_5_5');\nif (ragContext && !toolsUsed.includes('ia360_hybrid_rag')) toolsUsed.push('ia360_hybrid_rag');\nconst text = String(base.text || '').trim();\nconst lower = text.toLowerCase();\nconst ownerCommand = /\\b(da de alta|alta a|agrega|registra|env[i\u00ed]ale|manda|pipeline|mueve|crm|whatsapp|wa)\\b/i.test(lower);\nconst englishLeak = /\\b(currently|however|let'?s|can'?t|cannot|workflow|assistance|further)\\b/i.test(String(candidate.reply || ''));\nfunction cleanText(value, max = 240) {\n  return String(value || '')\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email]')\n    .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[phone]')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\nfunction titleName(value) {\n  if (!value) return null;\n  return value.charAt(0).toUpperCase() + value.slice(1).toLowerCase();\n}\nlet targetName = null;\nconst nameMatch = lower.match(/(?:da de alta a|alta a|agrega a|registra a|env[i\u00ed]ale a)\\s+([a-z\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1]+)/i);\nif (nameMatch) targetName = titleName(nameMatch[1]);\nlet reply = String(candidate.reply || 'Te leo. Para cuidarlo bien, lo dejo como revisi\u00f3n de Alek antes de responder autom\u00e1tico.').slice(0, 600);\nlet intent = allowedIntents.has(candidate.intent) ? candidate.intent : 'other';\nlet action = allowedActions.has(candidate.action) ? candidate.action : 'none';\nif (ownerCommand && (englishLeak || intent === 'other' || action === 'none')) {\n  const who = targetName || 'ese contacto';\n  reply = `Listo, lo preparo. Para dar de alta a ${who} necesito su n\u00famero de WhatsApp y confirmar qu\u00e9 pipeline quieres enviar. P\u00e1samelo y lo dejo listo para revisi\u00f3n antes de enviarlo.`;\n  intent = 'provide_info';\n  action = 'nurture';\n  ci.route = 'human_review';\n  ci.next_best_action = `Pedir n\u00famero de WhatsApp y pipeline para ${who}; preparar alta/env\u00edo con revisi\u00f3n humana.`;\n  ci.human_review_required = true;\n  ci.confidence = Math.max(typeof ci.confidence === 'number' ? ci.confidence : 0, 0.85);\n}\nif (englishLeak && !ownerCommand) {\n  reply = 'Lo dejo en revisi\u00f3n con Alek para responder bien en espa\u00f1ol y no ejecutar nada sensible sin confirmaci\u00f3n.';\n  intent = intent === 'smalltalk' ? 'smalltalk' : 'other';\n  action = action === 'offer_slots' ? action : 'none';\n  ci.route = ci.route || 'human_review';\n  ci.human_review_required = true;\n}\nfunction corta(v, max) {\n  const s = cleanText(v, max * 2);\n  if (s.length <= max) return s;\n  const t = s.slice(0, max);\n  const sp = t.lastIndexOf(' ');\n  return (sp > max * 0.5 ? t.slice(0, sp) : t).replace(/[,;:.\\s]+$/, '');\n}\nfunction humano(v, max) {\n  const s = corta(v, max);\n  return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';\n}\nfunction preguntaUtil(md) {\n  const s = corta(md, 90);\n  return s ? `Para no darte vueltas: \u00bfme confirmas ${s.charAt(0).toLowerCase() + s.slice(1)}?`\n           : '\u00bfQu\u00e9 parte te est\u00e1 frenando m\u00e1s ahora?';\n}\nconst contactName = String(base.contact?.name || '').toLowerCase();\nconst accountName = String(base.account?.name || '').toLowerCase();\nconst activeClient = /andr[e\u00e9]s|camiones|cliente activo|cfo|champion|beta/.test(`${contactName} ${accountName} ${lower}`);\nconst agendaPush = /\\b(agenda|agendar|reuni[o\u00f3]n|calendario|horario|cita)\\b/i.test(reply);\nconst askedAgenda = /\\b(agenda|agendar|reuni[o\u00f3]n|horario|cita|disponibilidad)\\b/i.test(lower);\nif (activeClient && agendaPush && !askedAgenda) {\n  const res1 = humano(signalClassification?.summary, 150);\n  reply = [res1 || 'Te leo', preguntaUtil(signalClassification?.missing_data)].join('. ');\n  intent = 'ask_pain';\n  action = 'advance_pain';\n  ci.route = 'diagnostico';\n  ci.next_best_action = signalClassification?.next_action || 'Responder con hallazgo, dato m\u00ednimo faltante y siguiente acci\u00f3n.';\n}\nif (activeClient && (!reply || reply.length < 30)) {\n  const res2 = humano(signalClassification?.summary, 150);\n  reply = res2 ? [res2, preguntaUtil(signalClassification?.missing_data)].join('. ')\n               : preguntaUtil(signalClassification?.missing_data);\n  intent = intent === 'smalltalk' ? 'ask_pain' : intent;\n  action = action === 'none' ? 'advance_pain' : action;\n  ci.route = ci.route === 'no_action' ? 'diagnostico' : (ci.route || 'diagnostico');\n}\nconst confidence = typeof ci.confidence === 'number' ? Math.max(0, Math.min(1, ci.confidence)) : (signalClassification?.confidence ?? 0.5);\nconst guardrails = {\n  external_send_allowed: false,\n  whatsapp_send_executed: false,\n  crm_write_executed: false,\n  transcript_returned: false,\n  rag_production_query: true,\n};\nconst auditContact = {\n  masked_contact_number: base.contact_key || maskNumber(base.contact?.contact_number || base.contact?.wa_id || base.contact?.phone),\n  name: cleanText(base.contact?.name || '', 120) || null,\n  role: cleanText(base.contact?.role || '', 120) || null,\n  espo_contact_id: base.contact?.espo_id || base.contact?.espo_contact_id || null,\n};\nif (!reply || !String(reply).trim()) {\n  const quien = cleanText(base.contact?.name || '', 40).split(' ')[0];\n  const pista = humano(signalClassification?.summary, 140);\n  reply = pista\n    ? `${quien ? quien + ', ' : ''}sobre lo que me dices: ${pista.charAt(0).toLowerCase() + pista.slice(1)}. ${preguntaUtil(signalClassification?.missing_data)}`\n    : `${quien ? quien + ', ' : ''}te leo. Dime en una linea que necesitas exactamente y te lo resuelvo o te digo quien lo tiene.`;\n}\nconst out = {\n  reply: reply.slice(0, 600),\n  intent,\n  date: /^\\d{4}-\\d{2}-\\d{2}$/.test(String(candidate.date || '')) ? String(candidate.date) : null,\n  action,\n  extracted: candidate.extracted && typeof candidate.extracted === 'object' ? candidate.extracted : {},\n  source: 'ia360-contact-intelligence-agent-draft',\n  agent_error_code: agentErrorCode,\n  account_context: base.account_context || null,\n  conversation_context: base.conversation_context || null,\n  contextual_text: base.contextual_text || base.text || '',\n  contact_intelligence: {\n    identity_status: ci.identity_status || base.identity_snapshot?.identity_status || 'unknown',\n    route: ci.route || 'human_review',\n    stage_signal: ci.stage_signal || base.stage || 'desconocido',\n    tools_used: toolsUsed,\n    confidence,\n    next_best_action: ci.next_best_action || signalClassification?.next_action || 'Auditar en WhatsApp/n8n antes de activar egress.',\n    human_review_required: ci.human_review_required !== false || Boolean(signalClassification?.owner_review_required),\n  },\n  dry_run: true,\n  requires_human_approval: true,\n  memory_context: memoryContext,\n  signal_classification: signalClassification,\n  rag_context: ragContext,\n  audit: {\n    request_id: base.request_id,\n    channel: base.channel,\n    contact: auditContact,\n    identity_snapshot: base.identity_snapshot,\n    memory_context: memoryContext,\n    signal_classification: signalClassification,\n    rag_context: ragContext,\n  },\n};\nreturn [{ json: out }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "respond_contract",
+      "name": "Respond Draft Contract",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        2112,
+        416
+      ],
+      "parameters": {
+        "options": {},
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "memory_contact",
+      "name": "Contact Conversation Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "position": [
+        464,
+        704
+      ],
+      "parameters": {
+        "sessionKey": "={{ $json.contact?.contact_number || $json.request_id }}",
+        "sessionIdType": "customKey",
+        "contextWindowLength": 8
+      },
+      "typeVersion": 1.4
+    },
+    {
+      "id": "parser_contract",
+      "name": "Structured Output Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "position": [
+        784,
+        688
+      ],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"reply\": { \"type\": \"string\" },\n    \"intent\": { \"type\": \"string\" },\n    \"date\": { \"type\": \"string\", \"description\": \"Fecha ISO si aplica; cadena vacia si no aplica. Nunca null.\" },\n    \"action\": { \"type\": \"string\" },\n    \"extracted\": { \"type\": \"object\" },\n    \"contact_intelligence\": { \"type\": \"object\" },\n    \"dry_run\": { \"type\": \"boolean\" },\n    \"requires_human_approval\": { \"type\": \"boolean\" }\n  },\n  \"required\": [\"reply\", \"intent\", \"date\", \"action\", \"extracted\", \"contact_intelligence\", \"dry_run\", \"requires_human_approval\"]\n}"
+      },
+      "typeVersion": 1.3
+    },
+    {
+      "id": "tool_identity",
+      "name": "Tool - Resolve Contact Identity (Draft)",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "position": [
+        560,
+        896
+      ],
+      "parameters": {
+        "jsCode": "const contactNumber = $fromAI('contact_number', 'Numero de WhatsApp del contacto si esta disponible', 'string');\nconst espoId = $fromAI('espo_id', 'ID EspoCRM si ya existe', 'string');\nreturn JSON.stringify({ ok: true, mode: 'draft', identity_status: espoId ? 'known' : (contactNumber ? 'candidate' : 'unknown'), contact_number_present: !!contactNumber, espo_id_present: !!espoId, note: 'No escribe datos. En la siguiente iteracion este tool consulta ForgeChat/EspoCRM.' });",
+        "description": "Draft resolver de identidad. Usalo para decidir si el contacto parece conocido, candidato o desconocido. No escribe datos."
+      },
+      "typeVersion": 1.3
+    },
+    {
+      "id": "tool_intent",
+      "name": "Tool - Classify Intent Route (Draft)",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "position": [
+        704,
+        880
+      ],
+      "parameters": {
+        "jsCode": "const cls = $('Prepare RAG Pinecone Dry Run').first().json.signal_classification || {};\nreturn JSON.stringify({ ok: true, mode: 'gpt-5.5_preclassified', classifier: 'IA360 Signal Classifier - gpt-5.5', primary_area: cls.primary_area || 'no_signal', evidence_span: cls.evidence_span || '', confidence: cls.confidence ?? 0, owner_review_required: cls.owner_review_required !== false, fallback_reason: cls.fallback_reason || null });",
+        "description": "Clasificador ligero de intencion y ruta. Usalo para validar agenda, diagnostico, nurture, optout o revision humana."
+      },
+      "typeVersion": 1.3
+    },
+    {
+      "id": "tool_rag",
+      "name": "Tool - IA360 RAG Context (Draft)",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "position": [
+        1120,
+        -672
+      ],
+      "parameters": {
+        "jsCode": "const rag = $('Prepare RAG Pinecone Dry Run').first().json.rag_context || {};\nreturn JSON.stringify({ ok: true, mode: 'chroma_hybrid_rag_live', rag_context: rag });",
+        "description": "RAG placeholder IA360. Usalo para traer contexto de marca, productos, objeciones y casos sin inventar."
+      },
+      "typeVersion": 1.3
+    },
+    {
+      "id": "note_arch",
+      "name": "Nota arquitectura",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -896,
+        -256
+      ],
+      "parameters": {
+        "color": 5,
+        "width": 620,
+        "height": 140,
+        "content": "Arquitectura objetivo: WhatsApp -> identidad -> clasificador -> AI Agent con tools/RAG -> contrato ForgeChat. Draft sin envios ni escrituras desde n8n."
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "code_lookup_ia360_memory",
+      "name": "Lookup IA360 Memory",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        -336,
+        288
+      ],
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst baseUrl = String($env.FORGECHAT_API_BASE_URL || 'https://wa.geekstudio.dev').replace(/\\/$/, '');\nconst secret = $env.IA360_DIRECTIVE_SECRET || '';\n\nasync function lookupMemory(contact) {\n  const guardrails = {\n    transcript_returned: false,\n    external_send_allowed: false,\n    crm_write_executed: false\n  };\n  if (!secret) {\n    return { ok: false, error: 'missing_IA360_DIRECTIVE_SECRET', events: [], facts: [], guardrails };\n  }\n  if (!contact?.wa_number || !contact?.contact_number) {\n    return { ok: false, error: 'missing_contact_keys', events: [], facts: [], guardrails };\n  }\n  const payload = {\n    wa_number: contact.wa_number,\n    contact_number: contact.contact_number,\n    limit: 8\n  };\n  if (this?.helpers?.httpRequest) {\n    return await this.helpers.httpRequest({\n      method: 'POST',\n      url: `${baseUrl}/api/internal/ia360-memory/lookup`,\n      headers: {\n        'content-type': 'application/json',\n        'X-IA360-Directive-Secret': secret\n      },\n      body: payload,\n      json: true\n    });\n  }\n  if (typeof fetch !== 'function') {\n    return { ok: false, error: 'http_client_unavailable', events: [], facts: [], guardrails };\n  }\n  const res = await fetch(`${baseUrl}/api/internal/ia360-memory/lookup`, {\n    method: 'POST',\n    headers: {\n      'content-type': 'application/json',\n      'X-IA360-Directive-Secret': secret\n    },\n    body: JSON.stringify(payload)\n  });\n  const data = await res.json().catch(() => ({}));\n  return { ...data, ok: Boolean(data.ok) && res.ok };\n}\n\nconst memory = await lookupMemory.call(this, j.contact || {});\nconst memoryFacts = Array.isArray(memory.facts) ? memory.facts.slice(0, 5) : [];\nconst memoryEvents = Array.isArray(memory.events) ? memory.events.slice(0, 5) : [];\nconst memorySummary = [\n  ...memoryFacts.map(f => ({\n    type: 'fact',\n    persona: f.persona || null,\n    role: f.role || null,\n    preference: f.preference || null,\n    recurring_pain: f.recurring_pain || null,\n    affected_process: f.affected_process || null,\n    missing_metric: f.missing_metric || null,\n    confidence: f.confidence || null,\n    status: f.status || null\n  })),\n  ...memoryEvents.map(e => ({\n    type: 'event',\n    area: e.area || null,\n    signal_type: e.signal_type || null,\n    summary: e.summary || null,\n    business_impact: e.business_impact || null,\n    missing_data: e.missing_data || null,\n    next_action: e.next_action || null,\n    owner_review_status: e.owner_review_status || null\n  }))\n];\n\nconst memoryContext = {\n  schema: 'ia360_memory_context_for_agent.v1',\n  ok: Boolean(memory.ok),\n  facts_count: memoryFacts.length,\n  events_count: memoryEvents.length,\n  summary: memorySummary,\n  lookup_error: memory.ok ? null : (memory.error || null),\n  guardrails: {\n    transcript_returned: false,\n    external_send_allowed: false,\n    crm_write_executed: false\n  }\n};\n\nconst agentPayload = {\n  ...j,\n  memory_context: memoryContext,\n  instruction: 'Antes de responder, usa memory_context si trae facts o events. No inventes datos. No copies transcript. Si hay se\u00f1al \u00fatil, responde con hallazgo, impacto, dato faltante y siguiente acci\u00f3n. En contact_intelligence.tools_used incluye ia360_memory_lookup cuando este contexto exista.'\n};\n\nreturn [{\n  json: {\n    ...j,\n    memory_context: memoryContext,\n    agent_input: JSON.stringify(agentPayload, null, 2)\n  }\n}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "agent_ia360_signal_classifier_contact",
+      "name": "IA360 Signal Classifier - gpt-5.5",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "position": [
+        -144,
+        -416
+      ],
+      "parameters": {
+        "text": "={{ JSON.stringify({ schema: 'ia360_signal_classifier_request.v1', source: 'contact_intelligence', request_id: $json.request_id, text: $json.contextual_text || $json.text, contact: $json.contact, account: $json.account, account_context: $json.account_context || null, conversation_context: $json.conversation_context || null, memory_context: $json.memory_context || null }, null, 2) }}",
+        "options": {
+          "maxIterations": 2,
+          "systemMessage": "Eres IA360 Signal Classifier - gpt-5.5.\nClasificas mensajes de WhatsApp para captura auditada de IA360.\n\nReglas obligatorias:\n- Devuelve solo JSON valido conforme al parser.\n- Elige una sola primary_area. Nunca devuelvas multiples areas.\n- primary_area permitidas: cartera_cobranza_portal, taller_garantia_dias_detencion, auditoria_licencias_gasto, feedback_asistente, operacion_cliente, no_signal.\n- evidence_span debe ser una cita corta o resumen literal del texto de entrada, maximo 180 caracteres, sin telefonos ni emails completos.\n- confidence es numero entre 0 y 1.\n- Si no hay evidencia suficiente, usa primary_area no_signal, confidence menor a 0.6 y owner_review_required=true.\n- Si la evidencia es ambigua o la confianza es menor a 0.72, owner_review_required=true y fallback_reason explica el motivo.\n- No guardes transcript completo. Extrae solo hallazgo, dato faltante y siguiente accion.\n\nCriterios de area:\n- cartera_cobranza_portal: cobranza, cartera, promesas de pago, portal, comentarios, fechas compromiso, seguimiento financiero.\n- taller_garantia_dias_detencion: taller, garantia, unidad detenida, dias, refaccion, bloqueo operativo, escalacion.\n- auditoria_licencias_gasto: licencias, asientos, gasto recurrente, software, permisos, uso real, ahorro.\n- feedback_asistente: correccion explicita al asistente o preferencia de respuesta.\n- operacion_cliente: otra senal operativa accionable.\n\nLa respuesta esperada debe permitir fallback humano: primary_area, evidence_span, confidence, summary, business_impact, missing_data, next_action, should_capture, should_be_fact, owner_review_required, fallback_reason.",
+          "returnIntermediateSteps": false
+        },
+        "promptType": "define",
+        "hasOutputParser": true,
+        "needsFallback": true
+      },
+      "typeVersion": 3.1,
+      "onError": "continueRegularOutput",
+      "notes": "P27: onError continueRegularOutput. Gemini devuelve a veces candidatos sin parts y el nodo crashea; sin esto se pierde TODA la respuesta y el contacto recibe el enlatado."
+    },
+    {
+      "id": "parser_ia360_signal_classifier_contact",
+      "name": "Structured Output Parser - Signal Classifier",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "position": [
+        -576,
+        -768
+      ],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"primary_area\": { \"type\": \"string\" },\n    \"signal_type\": { \"type\": \"string\" },\n    \"evidence_span\": { \"type\": \"string\" },\n    \"confidence\": { \"type\": \"number\" },\n    \"summary\": { \"type\": \"string\" },\n    \"business_impact\": { \"type\": \"string\" },\n    \"missing_data\": { \"type\": \"string\" },\n    \"next_action\": { \"type\": \"string\" },\n    \"should_capture\": { \"type\": \"boolean\" },\n    \"should_be_fact\": { \"type\": \"boolean\" },\n    \"owner_review_required\": { \"type\": \"boolean\" },\n    \"fallback_reason\": { \"type\": \"string\", \"description\": \"Motivo del fallback; cadena vacia si no aplica. Nunca null.\" }\n  },\n  \"required\": [\n    \"primary_area\",\n    \"signal_type\",\n    \"evidence_span\",\n    \"confidence\",\n    \"summary\",\n    \"business_impact\",\n    \"missing_data\",\n    \"next_action\",\n    \"should_capture\",\n    \"should_be_fact\",\n    \"owner_review_required\",\n    \"fallback_reason\"\n  ]\n}"
+      },
+      "typeVersion": 1.3
+    },
+    {
+      "id": "code_prepare_rag_pinecone_dry_run",
+      "name": "Prepare RAG Pinecone Dry Run",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        -32,
+        272
+      ],
+      "parameters": {
+        "jsCode": "const base = $('Lookup IA360 Memory').first().json;\nconst rawItem = $('IA360 Signal Classifier - gpt-5.5').first().json;\nconst gw = $('Estado Vivo del Contacto').first().json || {};\n\nfunction cleanText(value, max = 240) {\n  return String(value || '')\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email]')\n    .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[phone]')\n    .replace(/\\b(?:sk|pk|rk|org|proj)-[A-Za-z0-9_-]{16,}\\b/g, '[secret]')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\nfunction digits(value) { return String(value || '').replace(/\\D/g, ''); }\nfunction maskNumber(value) {\n  const s = digits(value);\n  return s ? `${s.slice(0, 3)}***${s.slice(-2)}` : '';\n}\nfunction slug(value, fallback = 'ia360') {\n  const out = String(value || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);\n  return out || fallback;\n}\nfunction parseClassifier(raw) {\n  let candidate = raw.output ?? raw.text ?? raw;\n  if (typeof candidate === 'string') {\n    const trimmed = candidate.trim().replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n    try { candidate = JSON.parse(trimmed); } catch (e) { candidate = {}; }\n  }\n  if (!candidate || typeof candidate !== 'object') candidate = {};\n  const allowed = new Set(['cartera_cobranza_portal', 'taller_garantia_dias_detencion', 'auditoria_licencias_gasto', 'feedback_asistente', 'operacion_cliente', 'no_signal']);\n  const primaryArea = allowed.has(candidate.primary_area) ? candidate.primary_area : 'no_signal';\n  const confidence = Math.max(0, Math.min(1, Number(candidate.confidence || 0)));\n  const ownerReviewRequired = candidate.owner_review_required !== false || confidence < 0.72 || primaryArea === 'no_signal';\n  return {\n    schema: 'ia360_signal_classifier_result.v1',\n    classifier: 'IA360 Signal Classifier - gpt-5.5',\n    model: 'gpt-5.5',\n    primary_area: primaryArea,\n    signal_type: cleanText(candidate.signal_type || (primaryArea === 'no_signal' ? 'no_signal' : 'senal_operativa'), 80),\n    evidence_span: cleanText(candidate.evidence_span || base.text || '', 180),\n    confidence,\n    summary: cleanText(candidate.summary || (primaryArea === 'no_signal' ? 'Sin senal suficiente para capturar.' : base.text), 260),\n    business_impact: cleanText(candidate.business_impact || 'Impacto pendiente de precisar con dato operativo.', 260),\n    missing_data: cleanText(candidate.missing_data || 'Dato minimo pendiente: dato actual, bloqueo, responsable o prioridad.', 220),\n    next_action: cleanText(candidate.next_action || 'Responder con hallazgo, dato minimo faltante y siguiente accion.', 220),\n    should_capture: Boolean(candidate.should_capture) && primaryArea !== 'no_signal',\n    should_be_fact: Boolean(candidate.should_be_fact),\n    owner_review_required: ownerReviewRequired,\n    fallback_reason: ownerReviewRequired ? cleanText(candidate.fallback_reason || (confidence < 0.72 ? 'low_confidence' : 'owner_review_required'), 160) : null,\n  };\n}\n\nconst classification = parseClassifier(rawItem);\nconst contact = base.contact || {};\nconst account = base.account || {};\n\n// Desambiguaci\u00f3n robusta por prefijo o sem\u00e1ntica directa si es Owner\nlet activeAccountKey = gw.active_account_key;\nif (!activeAccountKey || gw.is_owner || gw.account_key === '*') {\n  const rawText = String(base.text || '').toLowerCase();\n  if (/^arp:/i.test(base.text) || /vuelos|duffel|caro|karen|aroundaplanet|turismo|aerolinea|itinerario/i.test(rawText)) {\n    activeAccountKey = 'aroundaplanet';\n  } else if (/^cam:/i.test(base.text) || /sabadell|totvs|andres|juan carlos|plan piso|camiones|camion|taller/i.test(rawText)) {\n    activeAccountKey = 'camiones-selectos';\n  } else if (/^kfh:/i.test(base.text) || /muebles|domotica|jose ramon|konforthome|casas inteligentes/i.test(rawText)) {\n    activeAccountKey = 'konforthome';\n  } else if (/^max:/i.test(base.text) || /soporte ti|sergio|mesa de ayuda|maxdax|sucursal/i.test(rawText)) {\n    activeAccountKey = 'maxdax';\n  } else if (/^(5g|diapazo):/i.test(base.text) || /office 365|german partida|diapazo|5g|marketing/i.test(rawText)) {\n    activeAccountKey = 'diapazo';\n  } else if (/^fisc:/i.test(base.text) || /sat|cfdi|eduardo astana|fiscalia|fiscal|contabilidad|impuestos/i.test(rawText)) {\n    activeAccountKey = 'fiscalia';\n  } else if (/^zam:/i.test(base.text) || /bni|elliot|zamna/i.test(rawText)) {\n    activeAccountKey = 'zamna-dev';\n  } else {\n    activeAccountKey = gw.active_account_key || 'nexus';\n  }\n}\nif (!activeAccountKey) activeAccountKey = 'nexus';\n\nconst projectSlug = slug(activeAccountKey);\nconst contactKey = contact.espo_id || contact.espo_contact_id || maskNumber(contact.contact_number) || cleanText(contact.name, 80) || 'unknown_contact';\n\n// Consulta en vivo a ChromaDB local para recuperar hechos y superficies can\u00f3nicas\nconst collName = `acct_${activeAccountKey.replace(/-/g, '_')}`;\nlet chromaDocs = [];\nlet verifiedSurfaces = [];\n\ntry {\n  let colls = [];\n  if (this?.helpers?.httpRequest) {\n    colls = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'http://odysseus-chromadb-1:8000/api/v2/tenants/default_tenant/databases/default_database/collections',\n      json: true\n    });\n  } else if (typeof fetch === 'function') {\n    const collsRes = await fetch('http://odysseus-chromadb-1:8000/api/v2/tenants/default_tenant/databases/default_database/collections');\n    colls = await collsRes.json();\n  }\n  \n  const targetColl = Array.isArray(colls) ? colls.find(c => c.name === collName) : null;\n  if (targetColl) {\n    let docsData = {};\n    if (this?.helpers?.httpRequest) {\n      docsData = await this.helpers.httpRequest({\n        method: 'POST',\n        url: `http://odysseus-chromadb-1:8000/api/v2/tenants/default_tenant/databases/default_database/collections/${targetColl.id}/get`,\n        body: { limit: 60, include: ['documents', 'metadatas'] },\n        json: true\n      });\n    } else if (typeof fetch === 'function') {\n      const docsRes = await fetch(`http://odysseus-chromadb-1:8000/api/v2/tenants/default_tenant/databases/default_database/collections/${targetColl.id}/get`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ limit: 60, include: ['documents', 'metadatas'] })\n      });\n      docsData = await docsRes.json();\n    }\n    \n    if (docsData && Array.isArray(docsData.documents)) {\n      chromaDocs = docsData.documents.map((doc, idx) => ({\n        id: docsData.ids[idx],\n        text: doc,\n        metadata: docsData.metadatas ? docsData.metadatas[idx] : {}\n      }));\n      verifiedSurfaces = chromaDocs\n        .filter(d => d.metadata && d.metadata.type === 'surface')\n        .map(d => ({\n          surface_key: d.metadata.surface_key,\n          canonical_url: `${d.metadata.canonical_origin || ''}${d.metadata.path_prefix || ''}`,\n          project_key: d.metadata.project_key,\n          auth_mode: d.metadata.auth_mode\n        }));\n    }\n  }\n} catch (e) {\n  // Chroma fail-safe\n}\n\nconst ragContext = {\n  schema: 'ia360_hybrid_rag.v2',\n  engine: 'chroma_local + ollama_nomic_embed',\n  account_key: activeAccountKey,\n  collection: collName,\n  result_count: chromaDocs.length,\n  snippets: chromaDocs.map(d => ({ id: d.id, text: d.text, metadata: d.metadata })),\n  verified_surfaces: verifiedSurfaces,\n  guardrails: {\n    no_cross_contact_context: true,\n    isolated_by_collection: true,\n    fail_closed_urls: true\n  }\n};\n\nconst vivos = (gw.estado_vivo && Array.isArray(gw.estado_vivo.issues)) ? gw.estado_vivo.issues : [];\nconst planeLive = {\n  schema: 'ia360_plane_estado_vivo.v1',\n  leido_en_vivo: true,\n  nunca_persistido: true,\n  scope_ok: gw.scope_ok === true,\n  account_key: activeAccountKey,\n  proyectos_permitidos: Array.isArray(gw.permitted_projects) ? gw.permitted_projects : [],\n  active_project_id: gw.active_project_id || null,\n  active_project_identifier: gw.active_project_identifier || null,\n  issues_count: vivos.length,\n  issues: vivos.slice(0, 25).map(w => ({\n    referencia: w.sequence_id ? String(w.sequence_id) : null,\n    nombre: w.nombre,\n    prioridad: w.priority || null,\n  })),\n  fuente: 'Plane REST al momento de contestar',\n};\n\nconst agentPayload = {\n  ...base,\n  signal_classification: classification,\n  rag_context: ragContext,\n  plane_live: planeLive,\n  active_project: {\n    account_key: activeAccountKey,\n    plane_project_id: gw.active_project_id || null,\n    plane_identifier: gw.active_project_identifier || null\n  },\n  instruction: [\n    'Usa signal_classification, rag_context y plane_live.',\n    'REGLA INVIOLABLE DE SUPERFICIES Y ENLACES:',\n    '1. SOLO puedes mencionar URLs que figuren expl\u00edcitamente en `verified_surfaces` o en los hechos verificados de `rag_context`.',\n    '2. NUNCA inventes o asumas dominios .com (ej. aroundaplanet.com, camiones.com, konforthome.com sin verificaci\u00f3n).',\n    '3. Si el usuario pide un enlace y no existe un enlace verificado en tu contexto, responde: \"No tengo un enlace verificado en este momento; lo confirmo con Alek y te lo enviamos.\"',\n    'plane_live trae los pendientes REALES de este contacto leidos de Plane en este instante: son tu material concreto.',\n    'Si el mensaje del contacto se relaciona con alguno, NOMBRALO y di como va, en lenguaje humano.',\n    'PROHIBIDO responder solo con cortesia sin aportar nada.',\n    'Si de verdad no hay nada relacionado, pregunta UNA cosa concreta y util. Nunca rellenes.',\n    'No insistas en agenda salvo que el contacto la pida.',\n  ].join(' '),\n};\n\nconst auditRow = {\n  request_id: base.request_id,\n  workflow: 'IA360 Contact Intelligence Agent - Draft',\n  contact_key: contactKey,\n  account_key: activeAccountKey,\n  project_slug: projectSlug,\n  query_text: cleanText(classification.summary || base.text || '', 220),\n  filters_json: JSON.stringify({ account_key: activeAccountKey, collection: collName }),\n  filters_complete: true,\n  dry_run: false,\n  query_executed: true,\n  result_count: chromaDocs.length,\n  fallback_reason: null,\n  guardrails_json: JSON.stringify(ragContext.guardrails),\n  status: 'hybrid_rag_served',\n};\n\nreturn [{\n  json: {\n    ...base,\n    project_slug: projectSlug,\n    account_key: activeAccountKey,\n    contact_key: contactKey,\n    signal_classification: classification,\n    rag_context: ragContext,\n    account_context: {\n      account_key: activeAccountKey,\n      permitted_projects: gw.permitted_projects || []\n    },\n    agent_input: JSON.stringify(agentPayload, null, 2),\n    audit_rows: {\n      rag_query_audit: auditRow,\n    },\n  },\n}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "dt_insert_rag_query_audit_contact",
+      "name": "Insert RAG Query Audit - Contact",
+      "type": "n8n-nodes-base.dataTable",
+      "position": [
+        304,
+        288
+      ],
+      "parameters": {
+        "columns": {
+          "value": {
+            "status": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.status }}",
+            "dry_run": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.dry_run }}",
+            "workflow": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.workflow }}",
+            "query_text": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.query_text }}",
+            "request_id": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.request_id }}",
+            "account_key": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.account_key }}",
+            "contact_key": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.contact_key }}",
+            "filters_json": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.filters_json }}",
+            "project_slug": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.project_slug }}",
+            "result_count": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.result_count }}",
+            "query_executed": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.query_executed }}",
+            "fallback_reason": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.fallback_reason }}",
+            "guardrails_json": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.guardrails_json }}",
+            "filters_complete": "={{ $('Prepare RAG Pinecone Dry Run').first().json.audit_rows.rag_query_audit.filters_complete }}"
+          },
+          "schema": [
+            {
+              "id": "request_id",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "request_id",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "workflow",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "workflow",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_key",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "contact_key",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "account_key",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "account_key",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "project_slug",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "project_slug",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "query_text",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "query_text",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "filters_json",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "filters_json",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "filters_complete",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "filters_complete",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dry_run",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "dry_run",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "query_executed",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "query_executed",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "result_count",
+              "type": "number",
+              "display": true,
+              "required": false,
+              "displayName": "result_count",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fallback_reason",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "fallback_reason",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "guardrails_json",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "guardrails_json",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "mappingMode": "defineBelow"
+        },
+        "options": {},
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "IA360RagQueryAudit01"
+        }
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "dt_insert_capture_audit_contact",
+      "name": "Insert Capture Audit - Contact",
+      "type": "n8n-nodes-base.dataTable",
+      "position": [
+        1120,
+        608
+      ],
+      "parameters": {
+        "columns": {
+          "value": {
+            "source": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.source }}",
+            "summary": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.summary }}",
+            "workflow": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.workflow }}",
+            "confidence": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.confidence }}",
+            "request_id": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.request_id }}",
+            "contact_key": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.contact_key }}",
+            "next_action": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.next_action }}",
+            "signal_type": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.signal_type }}",
+            "account_name": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.account_name }}",
+            "primary_area": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.primary_area }}",
+            "project_slug": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.project_slug }}",
+            "evidence_span": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.evidence_span }}",
+            "capture_status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.capture_status }}",
+            "crm_sync_status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.crm_sync_status }}",
+            "guardrails_json": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.guardrails_json }}",
+            "rag_index_status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.rag_index_status }}",
+            "owner_review_status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.capture_audit.owner_review_status }}"
+          },
+          "schema": [
+            {
+              "id": "request_id",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "request_id",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "source",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "workflow",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "workflow",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_key",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "contact_key",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "account_name",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "account_name",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "project_slug",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "project_slug",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "primary_area",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "primary_area",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "signal_type",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "signal_type",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_span",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "evidence_span",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confidence",
+              "type": "number",
+              "display": true,
+              "required": false,
+              "displayName": "confidence",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "capture_status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "capture_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "owner_review_status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "owner_review_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "crm_sync_status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "crm_sync_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "rag_index_status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "rag_index_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "guardrails_json",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "guardrails_json",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "summary",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "summary",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "next_action",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "next_action",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "mappingMode": "defineBelow"
+        },
+        "options": {},
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "IA360CaptureAudit01"
+        }
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "dt_insert_owner_review_contact",
+      "name": "Insert Owner Review - Contact",
+      "type": "n8n-nodes-base.dataTable",
+      "position": [
+        1328,
+        608
+      ],
+      "parameters": {
+        "columns": {
+          "value": {
+            "source": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.source }}",
+            "status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.status }}",
+            "confidence": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.confidence }}",
+            "request_id": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.request_id }}",
+            "assigned_to": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.assigned_to }}",
+            "contact_key": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.contact_key }}",
+            "account_name": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.account_name }}",
+            "primary_area": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.primary_area }}",
+            "project_slug": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.project_slug }}",
+            "evidence_span": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.evidence_span }}",
+            "review_reason": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.review_reason }}",
+            "proposed_summary": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.proposed_summary }}",
+            "proposed_next_action": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.proposed_next_action }}",
+            "copy_approved_by_alek": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.copy_approved_by_alek }}",
+            "created_from_workflow": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.created_from_workflow }}",
+            "human_approval_required": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.owner_review.human_approval_required }}"
+          },
+          "schema": [
+            {
+              "id": "request_id",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "request_id",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "source",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_key",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "contact_key",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "account_name",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "account_name",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "project_slug",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "project_slug",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "review_reason",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "review_reason",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "primary_area",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "primary_area",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_span",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "evidence_span",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confidence",
+              "type": "number",
+              "display": true,
+              "required": false,
+              "displayName": "confidence",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "proposed_summary",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "proposed_summary",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "proposed_next_action",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "proposed_next_action",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "assigned_to",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "assigned_to",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "human_approval_required",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "human_approval_required",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "copy_approved_by_alek",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "copy_approved_by_alek",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_from_workflow",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "created_from_workflow",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "mappingMode": "defineBelow"
+        },
+        "options": {},
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "IA360OwnerReview01"
+        }
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "dt_insert_crm_sync_audit_contact",
+      "name": "Insert CRM Sync Audit - Contact",
+      "type": "n8n-nodes-base.dataTable",
+      "position": [
+        1616,
+        608
+      ],
+      "parameters": {
+        "columns": {
+          "value": {
+            "dry_run": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.dry_run }}",
+            "workflow": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.workflow }}",
+            "operation": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.operation }}",
+            "request_id": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.request_id }}",
+            "contact_key": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.contact_key }}",
+            "fields_json": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.fields_json }}",
+            "sync_status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.sync_status }}",
+            "note_preview": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.note_preview }}",
+            "write_executed": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.write_executed }}",
+            "approval_status": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.approval_status }}",
+            "espo_contact_id": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.espo_contact_id }}",
+            "transcript_included": "={{ $('Normalize ForgeChat Contract').first().json.audit_rows.crm_sync_audit.transcript_included }}"
+          },
+          "schema": [
+            {
+              "id": "request_id",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "request_id",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "workflow",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "workflow",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_key",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "contact_key",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "espo_contact_id",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "espo_contact_id",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "operation",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "operation",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sync_status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "sync_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dry_run",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "dry_run",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "write_executed",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "write_executed",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "transcript_included",
+              "type": "boolean",
+              "display": true,
+              "required": false,
+              "displayName": "transcript_included",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fields_json",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "fields_json",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "note_preview",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "note_preview",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "approval_status",
+              "type": "string",
+              "display": true,
+              "required": false,
+              "displayName": "approval_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "mappingMode": "defineBelow"
+        },
+        "options": {},
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "IA360CrmSyncAudit01"
+        }
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "code_restore_contact_response",
+      "name": "Restore Contact Response",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1888,
+        624
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $('Normalize ForgeChat Contract').first().json }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "6a43c9d9-0ee4-4a51-a84a-0be9a951f244",
+      "name": "Gemini Fallback Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "position": [
+        560,
+        800
+      ],
+      "parameters": {
+        "options": {
+          "maxOutputTokens": 2048
+        },
+        "modelName": "models/gemini-2.5-flash"
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "LnUf9MfGNPumBtKx",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "4bf4425d-9628-4fc0-b0ea-32911730b7e1",
+      "name": "Estado Vivo del Contacto",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        1180,
+        460
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "4IJC78aFkI5ihNZD"
+        },
+        "mode": "once",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "contact_number": "={{ $('Lookup IA360 Memory').first().json.contact.contact_number }}",
+            "wa_number": "={{ $('Lookup IA360 Memory').first().json.contact.wa_number }}",
+            "text": "={{ $('Lookup IA360 Memory').first().json.text }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "contact_number",
+              "displayName": "contact_number",
+              "required": false,
+              "type": "string",
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wa_number",
+              "displayName": "wa_number",
+              "required": false,
+              "type": "string",
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "text",
+              "displayName": "text",
+              "required": false,
+              "type": "string",
+              "display": true,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "notes": "P27: trae el estado VIVO de Plane acotado a los proyectos permitidos de este contacto (gateway P7/P17). Sustituye al rag_context en dry-run, que nunca consultaba nada."
+    },
+    {
+      "id": "48af6906-a754-44bf-925d-c99b4e931f56",
+      "name": "Gemini Primario",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -160,
+        420
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.7-flash",
+        "options": {
+          "maxOutputTokens": 2048
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "LnUf9MfGNPumBtKx",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "id": "eede972a-6455-40e8-8658-c0745e39e9ac",
+      "name": "buscar_pendientes_en_plane",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        460
+      ],
+      "parameters": {
+        "description": "Busca en los pendientes VIVOS de Plane del contacto. \u00dasala cuando el contacto pregunte por el estado de algo concreto. Devuelve hasta 5 resultados con referencia, nombre y prioridad. Nunca inventes n\u00fameros de pendiente: s\u00f3lo cita los que devuelva esta herramienta.",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "FzH7hB8zESA5ltD7"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "contact_number": "={{ $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body.contact_number || $json.contact_number }}",
+            "consulta": "={{ $fromAI('consulta','Palabras clave de lo que el contacto est\u00e1 preguntando','string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "contact_number",
+              "displayName": "contact_number",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "consulta",
+              "displayName": "consulta",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "d6874963-5807-4756-8324-4283d52b0541",
+      "name": "consultar_disponibilidad",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        400,
+        460
+      ],
+      "parameters": {
+        "description": "Consulta los huecos LIBRES de una hora en la agenda real de Alek para una fecha concreta. Es SOLO LECTURA: usala libremente antes de proponer cualquier horario. Devuelve los huecos libres en hora del centro de Mexico y, si el dia no tiene ningun evento, lo dice explicitamente con dia_libre=true. NUNCA inventes horarios: los unicos horarios que puedes ofrecer son los que devuelva esta herramienta.",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "LCFkBV47IEkjh9ss"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "fecha": "={{ $fromAI('fecha','Fecha a consultar en formato YYYY-MM-DD, en hora del centro de Mexico','string') }}",
+            "hora_inicio": "={{ $fromAI('hora_inicio','Hora de inicio del horario laboral, solo el numero de hora (por ejemplo 9). Si no la sabes, manda 9','string') }}",
+            "hora_fin": "={{ $fromAI('hora_fin','Hora de fin del horario laboral, solo el numero de hora (por ejemplo 18). Si no la sabes, manda 18','string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "fecha",
+              "displayName": "fecha",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_inicio",
+              "displayName": "hora_inicio",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_fin",
+              "displayName": "hora_fin",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "notes": "P65: lectura del calendario real de Alek. No escribe nada."
+    },
+    {
+      "id": "8a40c4ae-be14-406b-a6f3-7eae0f1a3bc4",
+      "name": "proponer_reunion",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        580,
+        460
+      ],
+      "parameters": {
+        "description": "Agenda una cita de verdad: crea el evento en el Google Calendar de Alek y la reunion de Zoom, y registra el enlace del contacto. ESCRIBE EN EL CALENDARIO REAL. NO la ejecutes por iniciativa propia ni porque el contacto lo pida: primero se le manda la tarjeta de confirmacion a Alek y solo cuando Alek la confirme se llama con confirmado_por_owner=true. Sin esa confirmacion la herramienta falla a proposito. El horario debe salir de consultar_disponibilidad, en ISO 8601 UTC.",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "sjrkjf7IcM7ski0n"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "inicio_iso": "={{ $fromAI('inicio_iso','Inicio de la cita en ISO 8601 UTC, por ejemplo 2026-08-22T15:00:00.000Z','string') }}",
+            "fin_iso": "={{ $fromAI('fin_iso','Fin de la cita en ISO 8601 UTC','string') }}",
+            "titulo": "={{ $fromAI('titulo','Titulo corto del evento, por ejemplo: Sesion presencial Konforthome','string') }}",
+            "confirmado_por_owner": "={{ $fromAI('confirmado_por_owner','Pon true SOLO si Alek ya confirmo esta cita explicitamente en este hilo. En cualquier otro caso pon false','string') }}",
+            "nombre_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact_name || $('Webhook WhatsApp Contact Intelligence').item.json.body.contact_name || 'Lead IA360' }}",
+            "numero_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body.contact_number || $json.contact_number }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "inicio_iso",
+              "displayName": "inicio_iso",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fin_iso",
+              "displayName": "fin_iso",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_contacto",
+              "displayName": "nombre_contacto",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_contacto",
+              "displayName": "numero_contacto",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "titulo",
+              "displayName": "titulo",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confirmado_por_owner",
+              "displayName": "confirmado_por_owner",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "notes": "P65: ESCRIBE en el calendario real de Alek y crea Zoom. Exige confirmado_por_owner=true."
+    },
+    {
+      "id": "878f7a41-f949-42bc-be84-eea410f0cdca",
+      "name": "cancelar_reunion",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        460
+      ],
+      "parameters": {
+        "description": "Cancela una cita ya agendada: borra el evento del Google Calendar de Alek, cancela la reunion de Zoom y retira el enlace del contacto. BORRA DEL CALENDARIO REAL. NO la ejecutes por iniciativa propia: primero tarjeta de confirmacion a Alek y solo con su confirmacion se llama con confirmado_por_owner=true. Necesita el evento_id de la cita.",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "F1sj5tcJVa9R3Q9Z"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "evento_id": "={{ $fromAI('evento_id','Identificador del evento en Google Calendar que se va a cancelar','string') }}",
+            "zoom_id": "={{ $fromAI('zoom_id','Identificador de la reunion de Zoom, si se conoce; si no, cadena vacia','string') }}",
+            "confirmado_por_owner": "={{ $fromAI('confirmado_por_owner','Pon true SOLO si Alek ya confirmo esta cancelacion explicitamente en este hilo. En cualquier otro caso pon false','string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "evento_id",
+              "displayName": "evento_id",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zoom_id",
+              "displayName": "zoom_id",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confirmado_por_owner",
+              "displayName": "confirmado_por_owner",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "notes": "P65: BORRA del calendario real de Alek. Exige confirmado_por_owner=true."
+    },
+    {
+      "id": "faa93b7b-c46d-4eee-a597-fa43c0b03355",
+      "name": "citas_del_contacto",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        620
+      ],
+      "parameters": {
+        "description": "Devuelve las citas YA AGENDADAS de este contacto (dia, hora de inicio y fin en hora del centro de Mexico, titulo, enlace y evento_id). Es SOLO LECTURA. Usala SIEMPRE que el contacto pregunte por una cita ya acordada: 'a que hora quedamos', 'sigue en pie', 'cuando nos vemos', o antes de proponer o cancelar cualquier cosa. Si devuelve tiene_citas=false, ese contacto no tiene ninguna cita registrada.",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "i4IapJoxLObQTPW1"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "numero_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body.contact_number || $json.contact_number }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "numero_contacto",
+              "displayName": "numero_contacto",
+              "type": "string",
+              "required": false,
+              "display": true,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "notes": "P65: lectura de ia360_meeting_links. Es la fuente de la verdad de lo ya acordado."
+    }
+  ],
+  "connections": {
+    "Webhook WhatsApp Contact Intelligence": {
+      "main": [
+        [
+          {
+            "node": "Normalize WhatsApp Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize WhatsApp Context": {
+      "main": [
+        [
+          {
+            "node": "Identity Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identity Snapshot": {
+      "main": [
+        [
+          {
+            "node": "Lookup IA360 Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA360 Contact Intelligence Agent": {
+      "main": [
+        [
+          {
+            "node": "Normalize ForgeChat Contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize ForgeChat Contract": {
+      "main": [
+        [
+          {
+            "node": "Insert Capture Audit - Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contact Conversation Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tool - Resolve Contact Identity (Draft)": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tool - Classify Intent Route (Draft)": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tool - IA360 RAG Context (Draft)": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup IA360 Memory": {
+      "main": [
+        [
+          {
+            "node": "IA360 Signal Classifier - gpt-5.5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare RAG Pinecone Dry Run": {
+      "main": [
+        [
+          {
+            "node": "Insert RAG Query Audit - Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert RAG Query Audit - Contact": {
+      "main": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Capture Audit - Contact": {
+      "main": [
+        [
+          {
+            "node": "Insert Owner Review - Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Owner Review - Contact": {
+      "main": [
+        [
+          {
+            "node": "Insert CRM Sync Audit - Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert CRM Sync Audit - Contact": {
+      "main": [
+        [
+          {
+            "node": "Restore Contact Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Contact Response": {
+      "main": [
+        [
+          {
+            "node": "Respond Draft Contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser - Signal Classifier": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "IA360 Signal Classifier - gpt-5.5",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA360 Signal Classifier - gpt-5.5": {
+      "main": [
+        [
+          {
+            "node": "Estado Vivo del Contacto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Estado Vivo del Contacto": {
+      "main": [
+        [
+          {
+            "node": "Prepare RAG Pinecone Dry Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Primario": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "IA360 Signal Classifier - gpt-5.5",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Fallback Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_languageModel",
+            "index": 1
+          },
+          {
+            "node": "IA360 Signal Classifier - gpt-5.5",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "buscar_pendientes_en_plane": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "consultar_disponibilidad": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "proponer_reunion": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "cancelar_reunion": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "citas_del_contacto": {
+      "ai_tool": [
+        [
+          {
+            "node": "IA360 Contact Intelligence Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "binaryMode": "separate",
+    "errorWorkflow": "aXJ4yskqJhxgX1B1",
+    "availableInMCP": true,
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}

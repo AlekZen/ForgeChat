@@ -1,0 +1,199 @@
+{
+  "id": "F1sj5tcJVa9R3Q9Z",
+  "versionId": "ce84d4c4-e870-4742-9579-aab9e876bd81",
+  "name": "IA360 Agenda - Cancelar (Tool)",
+  "active": true,
+  "activeVersionId": "ce84d4c4-e870-4742-9579-aab9e876bd81",
+  "nodes": [
+    {
+      "id": "4faa5b06-795a-4621-afe3-488ae4351e38",
+      "name": "Entrada",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "evento_id",
+              "type": "string"
+            },
+            {
+              "name": "zoom_id",
+              "type": "string"
+            },
+            {
+              "name": "confirmado_por_owner",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "28607c24-2096-4528-890a-2f23871e8ab0",
+      "name": "Preparar Cancelacion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json || {};\nif (raw.body) {\n  const expected = $env.N8N_CALENDAR_TOKEN;\n  const auth = raw.headers?.authorization || raw.headers?.Authorization || '';\n  if (!expected || auth !== `Bearer ${expected}`) throw new Error('AUTH_FAILED: agenda local requiere bearer valido del VPS.');\n}\nconst inp = raw.body || raw;\nconst confirmado = String(inp.confirmado_por_owner || '').toLowerCase() === 'true';\nif (!confirmado) throw new Error('CONFIRMACION_REQUERIDA: cancelar borra el evento del calendario real de Alek. Manda la tarjeta al owner y vuelve con confirmado_por_owner=true.');\nconst eventoId = String(inp.evento_id || '').trim();\nif (!eventoId) throw new Error('FALTA_EVENTO: evento_id es obligatorio. Sacalo de ia360_meeting_links o de la respuesta de la reserva.');\nconst zoomId = String(inp.zoom_id || '').trim();\nif (!zoomId) throw new Error('FALTA_ZOOM: zoom_id es obligatorio para cancelar una cita Calendar + Zoom sin dejar la reunion viva.');\nreturn [{ json: { calendarEventId: eventoId, zoomMeetingId: zoomId } }];"
+      }
+    },
+    {
+      "id": "ca9c42a2-6e5d-4c90-8ad7-2a993a7b5ae6",
+      "name": "Cancelar Calendar y Zoom",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:5678/webhook/ia360-calendar-cancel",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "b0f6a045-24c7-4149-ad06-30bf2b5f5aaa",
+      "name": "Borrar Enlace de la Cita",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM coexistence.ia360_meeting_links WHERE event_id = $1 AND $2::int BETWEEN 200 AND 299 RETURNING token",
+        "options": {
+          "queryReplacement": "={{ $(\"Preparar Cancelacion\").first().json.calendarEventId }},{{ $(\"Cancelar Calendar y Zoom\").first().json.statusCode || 0 }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "Iv27o2JYkuc2ZiEz",
+          "name": "ForgeChat Postgres WRITER (deals)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "045e947d-6d5c-4735-acf3-33af447cd80f",
+      "name": "Responder Cancelacion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const prep = $('Preparar Cancelacion').first().json;\nconst respuesta = $('Cancelar Calendar y Zoom').first().json || {};\nconst codigo = Number(respuesta.statusCode || 0);\nconst borrado = $input.first() ? ($input.first().json || {}) : {};\nconst ok = codigo >= 200 && codigo < 300;\nreturn [{ json: { ok, estado: ok ? 'cancelada' : 'no_cancelada', evento_id: prep.calendarEventId, enlace_retirado: Boolean(borrado.token), codigo_http: codigo, resumen: ok ? 'Cita cancelada en Google Calendar y en Zoom; el enlace del contacto queda retirado.' : 'La cancelacion devolvio HTTP ' + codigo + '. No reintentes en automatico: reporta el codigo a Alek.' } }];"
+      }
+    },
+    {
+      "id": "7750d395-ca88-4cbd-86e1-4766fe45653f",
+      "name": "Webhook Cancelacion Owner",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ia360-owner-agenda-cancel",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "7fec2d8d-2dad-494f-bcb8-ff6d5de03df0"
+    }
+  ],
+  "connections": {
+    "Entrada": {
+      "main": [
+        [
+          {
+            "node": "Preparar Cancelacion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Cancelacion": {
+      "main": [
+        [
+          {
+            "node": "Cancelar Calendar y Zoom",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cancelar Calendar y Zoom": {
+      "main": [
+        [
+          {
+            "node": "Borrar Enlace de la Cita",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Borrar Enlace de la Cita": {
+      "main": [
+        [
+          {
+            "node": "Responder Cancelacion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Cancelacion Owner": {
+      "main": [
+        [
+          {
+            "node": "Preparar Cancelacion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "errorWorkflow": "aXJ4yskqJhxgX1B1",
+    "availableInMCP": true,
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}

@@ -1,0 +1,269 @@
+{
+  "id": "sjrkjf7IcM7ski0n",
+  "versionId": "899ca4a8-a61e-4437-81eb-4a87c1015cce",
+  "name": "IA360 Agenda - Reservar (Tool)",
+  "active": true,
+  "activeVersionId": "899ca4a8-a61e-4437-81eb-4a87c1015cce",
+  "nodes": [
+    {
+      "id": "c665bd1f-af6d-41ab-a6c0-8912b026321b",
+      "name": "Entrada",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "inicio_iso",
+              "type": "string"
+            },
+            {
+              "name": "fin_iso",
+              "type": "string"
+            },
+            {
+              "name": "nombre_contacto",
+              "type": "string"
+            },
+            {
+              "name": "numero_contacto",
+              "type": "string"
+            },
+            {
+              "name": "titulo",
+              "type": "string"
+            },
+            {
+              "name": "confirmado_por_owner",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "be971439-2b84-4f5f-a812-edaf154925a3",
+      "name": "Preparar Reserva",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json || {};\nif (raw.body) {\n  const expected = $env.N8N_CALENDAR_TOKEN;\n  const auth = raw.headers?.authorization || raw.headers?.Authorization || '';\n  if (!expected || auth !== `Bearer ${expected}`) throw new Error('AUTH_FAILED: agenda local requiere bearer valido del VPS.');\n}\nconst inp = raw.body || raw;\nconst confirmado = String(inp.confirmado_por_owner || '').toLowerCase() === 'true';\nif (!confirmado) throw new Error('CONFIRMACION_REQUERIDA: agendar escribe en el calendario real de Alek. Manda la tarjeta al owner y vuelve con confirmado_por_owner=true.');\nconst inicio = String(inp.inicio_iso || '').trim();\nconst fin = String(inp.fin_iso || '').trim();\nif (!inicio || !fin) throw new Error('FALTAN_HORARIOS: inicio_iso y fin_iso son obligatorios, en ISO 8601 UTC.');\nif (Number.isNaN(Date.parse(inicio)) || Number.isNaN(Date.parse(fin))) throw new Error('HORARIO_INVALIDO: usa ISO 8601, por ejemplo 2026-08-22T15:00:00.000Z');\nif (Date.parse(fin) <= Date.parse(inicio)) throw new Error('RANGO_INVALIDO: el fin va despues del inicio.');\nconst alfabeto = 'abcdefghijkmnpqrstuvwxyz23456789';\nlet token = '';\nfor (let i = 0; i < 20; i += 1) token += alfabeto[Math.floor(Math.random() * alfabeto.length)];\nconst nombre = String(inp.nombre_contacto || 'Lead IA360').trim();\nconst numero = String(inp.numero_contacto || '').replace(/[^0-9]/g, '');\nconst titulo = String(inp.titulo || '').trim() || ('Reunion IA360 - ' + nombre);\nreturn [{ json: { token, start: inicio, end: fin, summary: titulo, contact: { contactName: nombre, contactNumber: numero }, contactName: nombre, contactNumber: numero } }];"
+      }
+    },
+    {
+      "id": "91d45e45-05e9-4f93-9d09-7ad56df2daf6",
+      "name": "Reservar Calendar y Zoom",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:5678/webhook/ia360-calendar-book",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ start: $json.start, end: $json.end, summary: $json.summary, contact: $json.contact }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "57a1cc53-c454-4194-8d21-77a389557363",
+      "name": "Se Creo el Evento",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.calendarEventId }}",
+              "operator": {
+                "type": "string",
+                "operation": "exists"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "cb630184-f74e-44b5-8c02-7a41346ef884",
+      "name": "Registrar Enlace de la Cita",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        880,
+        -120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO coexistence.ia360_meeting_links (token, event_id, contact_number, kind, start_utc, end_utc, summary, zoom_join_url, zoom_meeting_id, expires_at) VALUES ($1, $2, $3, 'cal', $4::timestamptz, $5::timestamptz, $6, NULLIF($7, ''), NULLIF($8, '')::bigint, $5::timestamptz + interval '30 days') ON CONFLICT (token) DO NOTHING RETURNING token, event_id, start_utc, end_utc, zoom_meeting_id",
+        "options": {
+          "queryReplacement": "={{ $(\"Preparar Reserva\").first().json.token }},{{ $json.calendarEventId }},{{ $(\"Preparar Reserva\").first().json.contactNumber }},{{ $(\"Preparar Reserva\").first().json.start }},{{ $(\"Preparar Reserva\").first().json.end }},{{ $(\"Preparar Reserva\").first().json.summary }},{{ $json.zoomJoinUrl || \"\" }},{{ $json.zoomMeetingId || \"\" }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "Iv27o2JYkuc2ZiEz",
+          "name": "ForgeChat Postgres WRITER (deals)"
+        }
+      }
+    },
+    {
+      "id": "767d40e3-d5d2-4673-b68c-024281ddefcb",
+      "name": "Responder Reserva",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -120
+      ],
+      "parameters": {
+        "jsCode": "const prep = $('Preparar Reserva').first().json;\nconst reserva = $('Reservar Calendar y Zoom').first().json || {};\nconst tz = 'America/Mexico_City';\nconst inicio = new Intl.DateTimeFormat('es-MX', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' }).format(new Date(prep.start));\nreturn [{ json: { ok: true, estado: 'agendada', token: prep.token, enlace_estable: 'https://wa.geekstudio.dev/api/r/' + prep.token, evento_id: reserva.calendarEventId || null, zoom: reserva.zoomJoinUrl || null, inicio_utc: prep.start, fin_utc: prep.end, inicio_local: inicio, titulo: prep.summary, resumen: 'Cita agendada: ' + prep.summary + ' \u2014 ' + inicio + ' (hora del centro de Mexico).' } }];"
+      }
+    },
+    {
+      "id": "7a96fb73-5df6-4a6c-88a2-b714efb47e8c",
+      "name": "Responder Fallo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        120
+      ],
+      "parameters": {
+        "jsCode": "const raw = $input.first() ? ($input.first().json || {}) : {};\nconst detalle = raw.message || raw.error || JSON.stringify(raw).slice(0, 300);\nreturn [{ json: { ok: false, estado: 'no_agendada', motivo: detalle || 'El webhook de reserva no devolvio un evento de Calendar.', que_hacer: 'No reintentes en automatico: reporta el error textual a Alek. Si el hueco estaba ocupado el mensaje dira slot_busy.' } }];"
+      }
+    },
+    {
+      "id": "ab20891e-3082-48e0-8a6e-70f8ab05eab1",
+      "name": "Webhook Reserva Owner",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ia360-owner-agenda-book",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "9dd6e4e3-8250-41b7-935f-c4b1cbe2324e"
+    }
+  ],
+  "connections": {
+    "Entrada": {
+      "main": [
+        [
+          {
+            "node": "Preparar Reserva",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Reserva": {
+      "main": [
+        [
+          {
+            "node": "Reservar Calendar y Zoom",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reservar Calendar y Zoom": {
+      "main": [
+        [
+          {
+            "node": "Se Creo el Evento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Se Creo el Evento": {
+      "main": [
+        [
+          {
+            "node": "Registrar Enlace de la Cita",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder Fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registrar Enlace de la Cita": {
+      "main": [
+        [
+          {
+            "node": "Responder Reserva",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Reserva Owner": {
+      "main": [
+        [
+          {
+            "node": "Preparar Reserva",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "errorWorkflow": "aXJ4yskqJhxgX1B1",
+    "availableInMCP": true,
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}

@@ -1,0 +1,393 @@
+{
+  "id": "4IJC78aFkI5ihNZD",
+  "versionId": "f70dc217-3da7-4dd3-9a3b-3e1659e37927",
+  "name": "ia360-context-gateway",
+  "active": true,
+  "activeVersionId": "f70dc217-3da7-4dd3-9a3b-3e1659e37927",
+  "nodes": [
+    {
+      "id": "86a86582-e8ed-4532-b1b1-d64e78069df7",
+      "name": "When Called - Context Gateway",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "contact_number",
+              "type": "string"
+            },
+            {
+              "name": "wa_number",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "31a9f0f3-8aea-4d16-bb9c-741b741ba4a7",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const input = $input.first().json;\nconst digits = (v) => String(v || '').replace(/\\D/g, '');\nconst contactNumber = digits(input.contact_number || input.from || input.wa_number || input.phone);\nconst waNumber = digits(input.wa_number || input.business_number || input.account_wa_number || input.display_phone_number);\nconst text = String(input.text || input.message || input.body || '').slice(0, 1200);\n\nreturn [{ json: {\n  contact_number: contactNumber || null,\n  wa_number: waNumber || null,\n  text: text,\n  source: input.source || 'ia360_context_gateway'\n} }];"
+      }
+    },
+    {
+      "id": "41b20756-2031-497c-a407-dfdbb1605e3a",
+      "name": "Resolve Scope",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT DISTINCT cs.account_key, cs.rol, ap.plane_workspace, ap.plane_identifier, ap.plane_project_id, ap.es_default\nFROM coexistence.ia360_contact_scope cs\nJOIN coexistence.ia360_account_projects ap\n  ON ap.activo AND (ap.account_key = cs.account_key OR cs.rol = 'owner')\nWHERE cs.contact_number = $1 AND cs.activo;",
+        "options": {
+          "queryReplacement": "={{ $json.contact_number }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "ia360forgechatRO01",
+          "name": "ForgeChat Postgres RO (coexistence)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "e0559553-bd1a-42a1-890c-1f4030657730",
+      "name": "Build Scope Bundle",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const norm = $('Normalize Input').first().json;\nconst rows = $('Resolve Scope').all().map(i => i.json).filter(r => r && r.account_key);\nconst scope_ok = rows.length > 0;\nlet account_key = '';\nlet rol = '';\nlet permitted_projects = [];\nlet es_default_project_id = null;\nlet active_account_key = 'nexus';\nlet active_project_id = null;\nlet active_project_identifier = 'INFRA';\n\nif (scope_ok) {\n  rol = rows[0].rol;\n  account_key = (rol === 'owner') ? '*' : rows[0].account_key;\n  permitted_projects = [...new Set(rows.map(r => r.plane_project_id).filter(Boolean))];\n  const def = rows.find(r => r.es_default === true);\n  es_default_project_id = def ? def.plane_project_id : (permitted_projects[0] || null);\n\n  if (rol === 'owner') {\n    const rawText = (norm.text || '').toLowerCase();\n    \n    if (/^arp:/i.test(norm.text) || /vuelos|duffel|caro|karen|aroundaplanet|turismo|aerolinea|itinerario/i.test(rawText)) {\n      active_account_key = 'aroundaplanet';\n      active_project_identifier = 'ARP';\n    } else if (/^cam:/i.test(norm.text) || /sabadell|totvs|andres|juan carlos|plan piso|camiones|camion|taller/i.test(rawText)) {\n      active_account_key = 'camiones-selectos';\n      active_project_identifier = 'CAM';\n    } else if (/^kfh:/i.test(norm.text) || /muebles|domotica|jose ramon|konforthome|casas inteligentes/i.test(rawText)) {\n      active_account_key = 'konforthome';\n      active_project_identifier = 'KFH';\n    } else if (/^max:/i.test(norm.text) || /soporte ti|sergio|mesa de ayuda|maxdax|sucursal/i.test(rawText)) {\n      active_account_key = 'maxdax';\n      active_project_identifier = 'MAX';\n    } else if (/^(5g|diapazo):/i.test(norm.text) || /office 365|german partida|diapazo|5g|marketing/i.test(rawText)) {\n      active_account_key = 'diapazo';\n      active_project_identifier = '5G';\n    } else if (/^fisc:/i.test(norm.text) || /sat|cfdi|eduardo astana|fiscalia|fiscal|contabilidad|impuestos/i.test(rawText)) {\n      active_account_key = 'fiscalia';\n      active_project_identifier = 'FISC';\n    } else if (/^zam:/i.test(norm.text) || /bni|elliot|zamna/i.test(rawText)) {\n      active_account_key = 'zamna-dev';\n      active_project_identifier = 'ZAM';\n    } else {\n      active_account_key = 'nexus';\n      active_project_identifier = 'INFRA';\n    }\n\n    const matchedRow = rows.find(r => r.account_key === active_account_key || r.plane_identifier === active_project_identifier);\n    active_project_id = matchedRow ? matchedRow.plane_project_id : es_default_project_id;\n  } else {\n    active_account_key = rows[0].account_key;\n    active_project_id = rows[0].plane_project_id || null;\n    active_project_identifier = rows[0].plane_identifier || null;\n  }\n}\n\nreturn [{ json: {\n  schema: 'ia360_context_gateway.v1',\n  scope_ok,\n  contact_number: norm.contact_number,\n  wa_number: norm.wa_number,\n  text: norm.text,\n  account_key,\n  active_account_key,\n  active_project_id,\n  active_project_identifier,\n  rol,\n  is_owner: rol === 'owner',\n  permitted_projects,\n  es_default_project_id,\n  blocked_reason: scope_ok ? null : 'no_scope_resolved',\n  provenance: {\n    resolved_by: 'ia360-context-gateway',\n    key_source: 'coexistence.ia360_contact_scope',\n    key_never_from_model: true,\n    resolved_at: new Date().toISOString()\n  }\n} }];"
+      }
+    },
+    {
+      "id": "c6d0123f-4fe7-4f0f-9c56-07d475bd3792",
+      "name": "IF scope ok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.account_key }}",
+              "operator": {
+                "operation": "notEmpty",
+                "type": "string"
+              },
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "98e435c4-57a3-4119-ada1-443f219267c4",
+      "name": "Audit Blocked",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        200
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "IA360RagQueryAudit01"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "workflow": "ia360-context-gateway",
+            "contact_key": "={{ $('Build Scope Bundle').first().json.contact_number ? '...' + $('Build Scope Bundle').first().json.contact_number.slice(-4) : '' }}",
+            "account_key": "",
+            "status": "blocked",
+            "fallback_reason": "no_scope_resolved",
+            "guardrails_json": "={{ JSON.stringify($('Build Scope Bundle').first().json.provenance) }}"
+          },
+          "schema": [
+            {
+              "id": "workflow",
+              "displayName": "workflow",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_key",
+              "displayName": "contact_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "account_key",
+              "displayName": "account_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fallback_reason",
+              "displayName": "fallback_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "guardrails_json",
+              "displayName": "guardrails_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3bab6d5c-acd7-4fdd-bd65-81b524f9badc",
+      "name": "Build Blocked Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const b = $('Build Scope Bundle').first().json;\nreturn [{ json: {\n  schema: 'ia360_context_gateway.v1',\n  scope_ok: false,\n  contact_number: b.contact_number,\n  wa_number: b.wa_number,\n  account_key: '',\n  rol: '',\n  is_owner: false,\n  permitted_projects: [],\n  es_default_project_id: null,\n  blocked_reason: 'no_scope_resolved',\n  provenance: b.provenance\n} }];"
+      }
+    },
+    {
+      "id": "1baef042-c349-4f7b-806c-0af19228549f",
+      "name": "Build Allowed Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const b = $('Build Scope Bundle').first().json;\nconst permitidos = new Set(b.permitted_projects || []);\n\nconst vivos = [];\nlet proyectos_leidos = 0;\nlet fallos = 0;\nfor (const item of $('Leer Estado Vivo en Plane').all()) {\n  const j = item.json || {};\n  const res = Array.isArray(j.results) ? j.results : null;\n  if (!res) { fallos++; continue; }\n  proyectos_leidos++;\n  for (const w of res) {\n    if (w.project && permitidos.size && !permitidos.has(w.project)) continue;\n    vivos.push({\n      plane_issue_id: w.id,\n      plane_project_id: w.project,\n      nombre: w.name,\n      state_id: w.state,\n      priority: w.priority,\n      sequence_id: w.sequence_id\n    });\n  }\n}\n\nreturn [{ json: Object.assign({}, b, {\n  estado_vivo: {\n    fuente: 'Plane REST, leido al momento de contestar',\n    nunca_persistido: true,\n    proyectos_leidos,\n    proyectos_con_fallo: fallos,\n    issues: vivos,\n    issues_count: vivos.length,\n    acotado_a: Array.from(permitidos),\n    leido_en: new Date().toISOString()\n  }\n}) }];"
+      }
+    },
+    {
+      "id": "ef45b501-e4b8-49df-ac07-311d0a4e6075",
+      "name": "Explotar Proyectos Permitidos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        -320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// P17: un item por proyecto PERMITIDO. Los ids salen del SQL del gateway,\n// nunca del texto del mensaje ni del modelo: no hay nada que inyectar.\nconst b = $('Build Scope Bundle').first().json;\nconst rows = $('Resolve Scope').all().map(i => i.json).filter(r => r && r.plane_project_id);\nconst vistos = new Set();\nconst out = [];\nfor (const r of rows) {\n  if (vistos.has(r.plane_project_id)) continue;\n  vistos.add(r.plane_project_id);\n  out.push({ json: {\n    plane_workspace: r.plane_workspace,\n    plane_project_id: r.plane_project_id,\n    plane_identifier: r.plane_identifier,\n    account_key: b.account_key\n  }});\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "e72d06e6-88bb-4277-873f-dd4f98eba658",
+      "name": "Leer Estado Vivo en Plane",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        -320
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://plane.geekstudio.dev/api/v1/workspaces/{{ $json.plane_workspace }}/projects/{{ $json.plane_project_id }}/work-items/?per_page=100",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.PLANE_API_TOKEN }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "notes": "P17: lectura VIVA. La memoria guarda solo plane_issue_id; el estado se pregunta a Plane al contestar."
+    }
+  ],
+  "connections": {
+    "When Called - Context Gateway": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Resolve Scope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Scope": {
+      "main": [
+        [
+          {
+            "node": "Build Scope Bundle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Scope Bundle": {
+      "main": [
+        [
+          {
+            "node": "IF scope ok?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF scope ok?": {
+      "main": [
+        [
+          {
+            "node": "Explotar Proyectos Permitidos",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Blocked": {
+      "main": [
+        [
+          {
+            "node": "Build Blocked Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explotar Proyectos Permitidos": {
+      "main": [
+        [
+          {
+            "node": "Leer Estado Vivo en Plane",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer Estado Vivo en Plane": {
+      "main": [
+        [
+          {
+            "node": "Build Allowed Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "errorWorkflow": "aXJ4yskqJhxgX1B1",
+    "availableInMCP": true,
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}

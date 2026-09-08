@@ -1,0 +1,74 @@
+{
+  "schema_version": "musio_workflow_cutover.v2",
+  "generated_at": "2026-09-08T23:00:00Z",
+  "worktree": "/home/alek/dev/forgechat-musio-20260908",
+  "baseline_commit": "6cfbc02",
+  "active_baselines": {
+    "IA360ContactIntelDraft20260605": "8fe2d301-e59f-4cb7-8cb3-80e1476484a6",
+    "sjrkjf7IcM7ski0n": "899ca4a8-a61e-4437-81eb-4a87c1015cce",
+    "F1sj5tcJVa9R3Q9Z": "ce84d4c4-e870-4742-9579-aab9e876bd81",
+    "IA360CalendarBook20260602": "1f76af68-3858-41c4-83d5-913fed902902",
+    "rV1z5sUdNEzCQ1tk": "01ac3120-83c2-4d6f-84b7-317d2d667d26",
+    "LCFkBV47IEkjh9ss": "23c6d302-389c-4fa1-9ffc-6d9e55f27bc2",
+    "i4IapJoxLObQTPW1": "06b2eb7e-0fa9-47b8-9bbb-90dc406a14ed",
+    "4IJC78aFkI5ihNZD": "f70dc217-3da7-4dd3-9a3b-3e1659e37927"
+  },
+  "preserved_drafts": {
+    "IA360ContactIntelDraft20260605": "4cacd72f-6788-4585-8d39-d3c03e5bb84a"
+  },
+  "candidates": {
+    "IA360ContactIntelDraft20260605": {
+      "file": "candidates/IA360ContactIntelDraft20260605.candidate.json",
+      "derived_from_version": "8fe2d301-e59f-4cb7-8cb3-80e1476484a6",
+      "changes": [
+        "proponer_reunion: removed fromAI(confirmado_por_owner); anchored nested server context (contact.contact_number, contact.name, contact.wa_number, request_id, dry_run)",
+        "cancelar_reunion: removed fromAI(confirmado_por_owner); removed supplied zoom_id; anchored nested server context",
+        "citas_del_contacto & buscar_pendientes_en_plane: anchored to contact.contact_number",
+        "Structured Output Parser: added response_audience enum (owner, contact)",
+        "Normalize WhatsApp Context: truthful dynamic dry_run and structured owner_assistance extraction",
+        "Prepare RAG Pinecone Dry Run: added owner_assistance prompt directive and response_audience instructions",
+        "Normalize ForgeChat Contract: dynamic dry_run, response_audience, input_mode, failure_id, owner_assistance propagation"
+      ]
+    },
+    "sjrkjf7IcM7ski0n": {
+      "file": "candidates/sjrkjf7IcM7ski0n.candidate.json",
+      "derived_from_version": "899ca4a8-a61e-4437-81eb-4a87c1015cce",
+      "changes": [
+        "executeWorkflowTrigger (Entrada): routes exclusively to backend propose endpoint (/internal/ia360-agenda/propose); zero direct writes",
+        "Webhook Reserva Owner (ia360-owner-agenda-book): requires Bearer N8N_CALENDAR_TOKEN; validates operation_id and confirmado_por_owner",
+        "Reservar Calendar y Zoom: propagates Bearer N8N_CALENDAR_TOKEN to raw writer",
+        "Registrar Enlace de la Cita: Postgres INSERT with RETURNING token, event_id, explicit non-null summary query replacement",
+        "Responder Reserva: verifies provider event creation and DB persistence returning verified:true and state:agendada"
+      ]
+    },
+    "F1sj5tcJVa9R3Q9Z": {
+      "file": "candidates/F1sj5tcJVa9R3Q9Z.candidate.json",
+      "derived_from_version": "ce84d4c4-e870-4742-9579-aab9e876bd81",
+      "changes": [
+        "executeWorkflowTrigger (Entrada): routes exclusively to backend propose endpoint (/internal/ia360-agenda/propose) with kind=cancel; zero direct writes",
+        "Webhook Cancelacion Owner (ia360-owner-agenda-cancel): requires Bearer N8N_CALENDAR_TOKEN; validates operation_id and confirmado_por_owner",
+        "Cancelar Calendar y Zoom: propagates Bearer N8N_CALENDAR_TOKEN to raw writer",
+        "Borrar Enlace de la Cita: Postgres DELETE with RETURNING token, event_id",
+        "Responder Cancelacion: dual verification requiring provider rawVerified===true AND DB deletion returning verified:true and state:cancelada"
+      ]
+    },
+    "IA360CalendarBook20260602": {
+      "file": "candidates/IA360CalendarBook20260602.candidate.json",
+      "derived_from_version": "1f76af68-3858-41c4-83d5-913fed902902",
+      "changes": [
+        "Normalize Booking: validates Bearer N8N_CALENDAR_TOKEN at HTTP entry",
+        "Verify Calendar Event Exists: canonical Google Calendar GET readback verifying created event",
+        "Build Booking Response: validates readbackEv.id without silent fallback, checks slot/title match, Zoom verification, includes summary"
+      ]
+    },
+    "rV1z5sUdNEzCQ1tk": {
+      "file": "candidates/rV1z5sUdNEzCQ1tk.candidate.json",
+      "derived_from_version": "01ac3120-83c2-4d6f-84b7-317d2d667d26",
+      "changes": [
+        "Normalize Cancel: validates Bearer N8N_CALENDAR_TOKEN at HTTP entry",
+        "Verify Event Absence in Calendar: HTTP GET post-delete verifying 404/410/cancelled absence",
+        "Build Cancel Response: emits verified:true upon absence verification"
+      ]
+    }
+  }
+}

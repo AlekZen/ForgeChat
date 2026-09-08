@@ -1,0 +1,167 @@
+{
+  "id": "LCFkBV47IEkjh9ss",
+  "versionId": "23c6d302-389c-4fa1-9ffc-6d9e55f27bc2",
+  "name": "IA360 Agenda - Disponibilidad (Tool)",
+  "active": true,
+  "activeVersionId": "23c6d302-389c-4fa1-9ffc-6d9e55f27bc2",
+  "nodes": [
+    {
+      "id": "f3f1bbd1-daff-4473-9464-01edbd48d81f",
+      "name": "Entrada",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "fecha",
+              "type": "string"
+            },
+            {
+              "name": "hora_inicio",
+              "type": "string"
+            },
+            {
+              "name": "hora_fin",
+              "type": "string"
+            },
+            {
+              "name": "duracion_minutos",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "9d9b6418-46ae-4b02-a39b-c3cc8ec8a316",
+      "name": "Preparar Consulta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json || {};\nif (raw.body) {\n  const expected = $env.N8N_CALENDAR_TOKEN;\n  const auth = raw.headers?.authorization || raw.headers?.Authorization || '';\n  if (!expected || auth !== `Bearer ${expected}`) throw new Error('AUTH_FAILED: agenda local requiere bearer valido del VPS.');\n}\nconst inp = raw.body || raw;\nconst hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());\nconst fecha = String(inp.fecha || '').trim() || hoy;\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(fecha)) throw new Error('FECHA_INVALIDA: usa YYYY-MM-DD, recibi ' + fecha);\nconst horaInicio = Number(inp.hora_inicio ?? 9);\nconst horaFin = Number(inp.hora_fin ?? 18);\nconst duracion = Number(inp.duracion_minutos ?? 60);\nif (!Number.isInteger(horaInicio) || !Number.isInteger(horaFin) || horaInicio < 0 || horaFin > 24 || horaFin <= horaInicio) throw new Error('HORARIO_INVALIDO: hora_inicio y hora_fin deben delimitar una ventana valida.');\nif (!Number.isInteger(duracion) || duracion < 5 || duracion > 480) throw new Error('DURACION_INVALIDA: usa minutos enteros entre 5 y 480.');\nreturn [{ json: { date: fecha, workStartHour: horaInicio, workEndHour: horaFin, slotMinutes: duracion } }];"
+      }
+    },
+    {
+      "id": "9bad9878-f805-4f96-8327-98a4516aec93",
+      "name": "Consultar Calendario",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:5678/webhook/ia360-calendar-availability",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "1c0ba66f-5f21-439f-ba9f-76bac271cfee",
+      "name": "Responder Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const meta = $('Preparar Consulta').first().json;\nconst raw = $input.first() ? ($input.first().json || {}) : {};\nif (raw.ok !== true) throw new Error('DISPONIBILIDAD_NO_VERIFICABLE: Calendar no devolvio un contrato ok; no asumas que el dia esta libre.');\nconst slots = Array.isArray(raw.slots) ? raw.slots : [];\nconst busyRaw = Array.isArray(raw.busy) ? raw.busy : [];\nconst tz = 'America/Mexico_City';\nfunction hhmm(iso) { return new Intl.DateTimeFormat('es-MX', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso)); }\nconst libres = slots.map((s) => ({ inicio: s.start, fin: s.end, etiqueta: hhmm(s.start) + '-' + hhmm(s.end) }));\nconst ocupado = busyRaw.map((b) => hhmm(b.start) + '-' + hhmm(b.end));\nconst diaLibre = busyRaw.length === 0;\nconst ventana = meta.workStartHour + ':00-' + meta.workEndHour + ':00';\nlet resumen;\nif (diaLibre) resumen = 'El ' + meta.date + ' no tiene eventos que bloqueen la agenda dentro de ' + ventana + ' (hora del centro de Mexico).';\nelse if (libres.length === 0) resumen = 'El ' + meta.date + ' no queda ningun hueco de ' + meta.slotMinutes + ' minutos dentro de ' + ventana + '.';\nelse resumen = 'Huecos de ' + meta.slotMinutes + ' minutos libres el ' + meta.date + ' (hora del centro de Mexico): ' + libres.map((l) => l.etiqueta).join(', ') + '.';\nreturn [{ json: { ok: true, fecha: meta.date, dia_libre: diaLibre, duracion_minutos: meta.slotMinutes, horario_laboral: ventana, libres, ocupado, resumen } }];"
+      }
+    },
+    {
+      "id": "92831fcb-358b-45fd-935e-4fbf9f12fe81",
+      "name": "Webhook Disponibilidad Owner",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ia360-owner-agenda-availability",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "24c7ea1e-2e0b-4629-a8b6-9602c54875d4"
+    }
+  ],
+  "connections": {
+    "Entrada": {
+      "main": [
+        [
+          {
+            "node": "Preparar Consulta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Consulta": {
+      "main": [
+        [
+          {
+            "node": "Consultar Calendario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consultar Calendario": {
+      "main": [
+        [
+          {
+            "node": "Responder Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Disponibilidad Owner": {
+      "main": [
+        [
+          {
+            "node": "Preparar Consulta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "errorWorkflow": "aXJ4yskqJhxgX1B1",
+    "availableInMCP": true,
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}
