@@ -18,6 +18,13 @@
 //    ok/verified global es true SÓLO si TODOS los recursos solicitados resultaron 'verified'.
 // 7. Parcial conserva cada resultado/ID durable sin reintento ciego ni borrar la contraparte no cancelada.
 // 8. Los comentarios del owner en tarjetas de fallo se pasan al agente en modo 'owner_assistance'.
+// 9. Validación determinista de horario laboral (RFC-058):
+//    - Zona horaria: America/Mexico_City.
+//    - Rango operativo: 08:00 a 20:00 hora local (mismo día local, start >= 08:00:00.000, end <= 20:00:00.000, end > start).
+//    - Precisión estricta a nivel milisegundo en la comparación temporal.
+//    - Error canónico: AGENDA_OUTSIDE_BUSINESS_HOURS (sin PII).
+//    - Validación antes de crear propuesta y revalidación justo antes de llamar al writer.
+//    - Cancelación permitida fuera de horario para liberar eventos.
 'use strict';
 
 const crypto = require('crypto');
@@ -36,6 +43,12 @@ const PROPOSAL_STATES = [
 const VALID_RESOURCES = ['calendar', 'zoom'];
 const IA360_OWNER_NUMBER = process.env.IA360_OWNER_NUMBER || '5213322638033';
 const CALENDAR_ADVISORY_LOCK_ID = 36082026; // ID global estable para operaciones de calendario
+
+const AGENDA_TIMEZONE = 'America/Mexico_City';
+const BUSINESS_HOURS_START_HOUR = 8;
+const BUSINESS_HOURS_END_HOUR = 20;
+const BUSINESS_HOURS_START_STR = '08:00';
+const BUSINESS_HOURS_END_STR = '20:00';
 
 const N8N_IA360_OWNER_BOOK_WEBHOOK_URL = process.env.N8N_IA360_OWNER_BOOK_WEBHOOK_URL || 'http://n8n:5678/webhook/ia360-owner-agenda-book';
 const N8N_IA360_OWNER_CANCEL_WEBHOOK_URL = process.env.N8N_IA360_OWNER_CANCEL_WEBHOOK_URL || 'http://n8n:5678/webhook/ia360-owner-agenda-cancel';
@@ -59,7 +72,7 @@ function formatDateCdMx(isoRaw) {
     const d = new Date(isoRaw);
     if (isNaN(d.getTime())) return 'la fecha agendada';
     return new Intl.DateTimeFormat('es-MX', {
-      timeZone: 'America/Mexico_City',
+      timeZone: AGENDA_TIMEZONE,
       dateStyle: 'medium',
       timeStyle: 'short',
     }).format(d);
@@ -74,12 +87,127 @@ function formatTimeCdMx(isoRaw) {
     const d = new Date(isoRaw);
     if (isNaN(d.getTime())) return '';
     return new Intl.DateTimeFormat('es-MX', {
-      timeZone: 'America/Mexico_City',
+      timeZone: AGENDA_TIMEZONE,
       timeStyle: 'short',
     }).format(d);
   } catch (_) {
     return '';
   }
+}
+
+/**
+ * Extrae los componentes de fecha/hora en la zona horaria especificada usando Intl.DateTimeFormat nativo
+ * e incluye los milisegundos con precisión temporal exacta.
+ *
+ * @param {Date} date
+ * @param {string} [timeZone='America/Mexico_City']
+ * @returns {{ year: number, month: number, day: number, hour: number, minute: number, second: number, millisecond: number }}
+ */
+function getZonedParts(date, timeZone = AGENDA_TIMEZONE) {
+  const dtf = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const p = Object.fromEntries(
+    dtf.formatToParts(date).filter(x => x.type !== 'literal').map(x => [x.type, x.value])
+  );
+  return {
+    year: +p.year,
+    month: +p.month,
+    day: +p.day,
+    hour: +p.hour,
+    minute: +p.minute,
+    second: +p.second,
+    millisecond: date.getMilliseconds(),
+  };
+}
+
+/**
+ * Valida que una reunión esté dentro del horario operativo comercial en la zona horaria indicada.
+ * Reglas de negocio (2026-09-08):
+ * - Zona horaria: America/Mexico_City (explícita).
+ * - Start >= 08:00:00.000 local, End <= 20:00:00.000 local, End > Start.
+ * - Comparación temporal estricta a nivel milisegundo (ej: 20:00:00.001 es rechazado).
+ * - Mismo día local (start y end ocurren en la misma fecha del calendario local).
+ * - Preferencia 10:00-16:00 para recomendaciones, sin rechazar 08:00-10:00 ni 16:00-20:00.
+ * - Sin excepciones por prueba, admin o confirmación tardía.
+ * - No PII en la salida de error (código de error estable AGENDA_OUTSIDE_BUSINESS_HOURS).
+ *
+ * @param {Date | string} startInput
+ * @param {Date | string} endInput
+ * @param {string} [timeZone='America/Mexico_City']
+ * @returns {{ ok: boolean, error?: string, timeZone: string, businessHours: { start: string, end: string }, startLocal?: string, endLocal?: string, isSameDay?: boolean }}
+ */
+function validateBusinessHours(startInput, endInput, timeZone = AGENDA_TIMEZONE) {
+  if (!startInput || !endInput) {
+    return {
+      ok: false,
+      error: 'invalid_iso_date',
+      timeZone,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+    };
+  }
+  const start = startInput instanceof Date ? startInput : new Date(startInput);
+  const end = endInput instanceof Date ? endInput : new Date(endInput);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return {
+      ok: false,
+      error: 'invalid_iso_date',
+      timeZone,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+    };
+  }
+
+  const startParts = getZonedParts(start, timeZone);
+  const endParts = getZonedParts(end, timeZone);
+
+  const isSameDay = startParts.year === endParts.year &&
+                    startParts.month === endParts.month &&
+                    startParts.day === endParts.day;
+
+  const startMsFromMidnight =
+    startParts.hour * 3600000 +
+    startParts.minute * 60000 +
+    startParts.second * 1000 +
+    startParts.millisecond;
+
+  const endMsFromMidnight =
+    endParts.hour * 3600000 +
+    endParts.minute * 60000 +
+    endParts.second * 1000 +
+    endParts.millisecond;
+
+  const minMs = BUSINESS_HOURS_START_HOUR * 3600000; // 08:00:00.000 -> 28,800,000 ms
+  const maxMs = BUSINESS_HOURS_END_HOUR * 3600000;   // 20:00:00.000 -> 72,000,000 ms
+
+  const startLocal = `${String(startParts.hour).padStart(2, '0')}:${String(startParts.minute).padStart(2, '0')}`;
+  const endLocal = `${String(endParts.hour).padStart(2, '0')}:${String(endParts.minute).padStart(2, '0')}`;
+
+  if (!isSameDay || startMsFromMidnight < minMs || endMsFromMidnight > maxMs || end.getTime() <= start.getTime()) {
+    return {
+      ok: false,
+      error: 'AGENDA_OUTSIDE_BUSINESS_HOURS',
+      timeZone,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+      isSameDay,
+      startLocal,
+      endLocal,
+    };
+  }
+
+  return {
+    ok: true,
+    timeZone,
+    businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+    startLocal,
+    endLocal,
+  };
 }
 
 /**
@@ -191,6 +319,12 @@ function validateProposalInput(input = {}, { allowPastDates = false } = {}) {
         const durationMs = end.getTime() - start.getTime();
         if (durationMs < 15 * 60 * 1000) errors.push('duration_too_short');
         if (durationMs > 24 * 60 * 60 * 1000) errors.push('duration_too_long');
+
+        const bhCheck = validateBusinessHours(start, end, AGENDA_TIMEZONE);
+        if (!bhCheck.ok) {
+          errors.push(bhCheck.error);
+        }
+
         startUtc = start.toISOString();
         endUtc = end.toISOString();
       }
@@ -428,6 +562,10 @@ async function proposeAgendaAction({
     return {
       ok: false,
       state: 'blocked',
+      error: validation.errors[0],
+      errors: validation.errors,
+      timeZone: AGENDA_TIMEZONE,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
       message: `Validación de propuesta fallida: ${validation.errors.join(', ')}`,
     };
   }
@@ -656,6 +794,19 @@ async function executeBookWriter({
   token = process.env.N8N_CALENDAR_TOKEN || '',
   url = N8N_IA360_OWNER_BOOK_WEBHOOK_URL,
 }) {
+  const bhCheck = validateBusinessHours(proposal?.start_utc, proposal?.end_utc, AGENDA_TIMEZONE);
+  if (!bhCheck.ok) {
+    return {
+      ok: false,
+      verified: false,
+      uncertain: false,
+      error: bhCheck.error,
+      timeZone: bhCheck.timeZone,
+      businessHours: bhCheck.businessHours,
+      message: 'El horario solicitado está fuera de la ventana operativa (08:00 a 20:00 hora America/Mexico_City)',
+    };
+  }
+
   if (!token || !String(token).trim()) {
     return {
       ok: false,
@@ -1168,6 +1319,34 @@ async function handleOwnerAgendaDecision({
 
     // 3. Ejecutar escritor
     if (activeProposal.kind === 'book') {
+      // Revalidación determinista de horario laboral justo antes del writer para propuestas viejas/residuales
+      const bhCheck = validateBusinessHours(activeProposal.start_utc, activeProposal.end_utc, AGENDA_TIMEZONE);
+      if (!bhCheck.ok) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals
+              SET estado = 'failed', error_message = $2, detalle_json = $3::jsonb, resuelto_at = now()
+            WHERE id = $1`,
+          [
+            proposalId,
+            bhCheck.error,
+            JSON.stringify({
+              error: bhCheck.error,
+              timeZone: bhCheck.timeZone,
+              businessHours: bhCheck.businessHours,
+              start_local: bhCheck.startLocal,
+              end_local: bhCheck.endLocal,
+            }),
+          ]
+        );
+        await sendOwnerDirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_agenda_book_outside_hours',
+          body: `No se pudo agendar la cita con ${resolvedName}: el horario (${bhCheck.startLocal || 'fuera de rango'}) está fuera de la ventana operativa permitida (08:00 a 20:00 hora Ciudad de México).`,
+        });
+        return true;
+      }
+
       const writerRes = await executeBookWriter({
         proposal: activeProposal,
         contactName: resolvedName,
@@ -1593,6 +1772,9 @@ module.exports = {
   VALID_RESOURCES,
   IA360_OWNER_NUMBER,
   CALENDAR_ADVISORY_LOCK_ID,
+  AGENDA_TIMEZONE,
+  BUSINESS_HOURS_START_STR,
+  BUSINESS_HOURS_END_STR,
   N8N_IA360_OWNER_BOOK_WEBHOOK_URL,
   N8N_IA360_OWNER_CANCEL_WEBHOOK_URL,
   canonicalizeResources,
@@ -1601,6 +1783,8 @@ module.exports = {
   maskNumber,
   formatDateCdMx,
   formatTimeCdMx,
+  getZonedParts,
+  validateBusinessHours,
   computePayloadHash,
   validateProposalInput,
   buildProposalButtons,

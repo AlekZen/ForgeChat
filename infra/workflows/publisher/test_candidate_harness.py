@@ -215,6 +215,71 @@ def test_harness():
     assert out_fallo["resources"] == ["calendar", "zoom"]
     print("  [PASS] sjrkjf7IcM7ski0n -> Responder Fallo: Formato de fallo ok:false, verified:false.")
 
+    # 1H. Preparar Propuesta Reserva: Validación determinista de horario laboral con precisión de milisegundos
+    # Límite inferior exacto 08:00:00.000 local MX (14:00:00.000Z) -> PASS
+    res_prop_start_exact = run_node_js(code_prep_prop, [{"json": {
+        "inicio_iso": "2026-08-25T14:00:00.000Z",
+        "fin_iso": "2026-08-25T15:00:00.000Z",
+        "numero_contacto": "5213321594582",
+        "resources": ["calendar"]
+    }}])
+    assert res_prop_start_exact["success"] is True
+    print("  [PASS] sjrkjf7IcM7ski0n -> Preparar Propuesta Reserva: Límite exacto 08:00:00.000 local MX aceptado.")
+
+    # Límite superior exacto 20:00:00.000 local MX (fin 02:00:00.000Z día siguiente) -> PASS
+    res_prop_end_exact = run_node_js(code_prep_prop, [{"json": {
+        "inicio_iso": "2026-08-26T01:00:00.000Z",
+        "fin_iso": "2026-08-26T02:00:00.000Z",
+        "numero_contacto": "5213321594582",
+        "resources": ["zoom"]
+    }}])
+    assert res_prop_end_exact["success"] is True
+    print("  [PASS] sjrkjf7IcM7ski0n -> Preparar Propuesta Reserva: Límite exacto 20:00:00.000 local MX aceptado.")
+
+    # Negativo: +1ms sobre 20:00 (20:00:00.001 local MX = 02:00:00.001Z) -> MUST FAIL con AGENDA_OUTSIDE_BUSINESS_HOURS
+    res_prop_end_plus_1ms = run_node_js(code_prep_prop, [{"json": {
+        "inicio_iso": "2026-08-26T01:00:00.000Z",
+        "fin_iso": "2026-08-26T02:00:00.001Z",
+        "numero_contacto": "5213321594582",
+        "resources": ["zoom"]
+    }}])
+    assert res_prop_end_plus_1ms["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_prop_end_plus_1ms["error"]
+    print("  [PASS] sjrkjf7IcM7ski0n -> Preparar Propuesta Reserva: Rechaza 20:00:00.001 (+1ms) con AGENDA_OUTSIDE_BUSINESS_HOURS.")
+
+    # Negativo: -1ms antes de 08:00 (07:59:59.999 local MX = 13:59:59.999Z) -> MUST FAIL con AGENDA_OUTSIDE_BUSINESS_HOURS
+    res_prop_start_minus_1ms = run_node_js(code_prep_prop, [{"json": {
+        "inicio_iso": "2026-08-25T13:59:59.999Z",
+        "fin_iso": "2026-08-25T15:00:00.000Z",
+        "numero_contacto": "5213321594582",
+        "resources": ["calendar"]
+    }}])
+    assert res_prop_start_minus_1ms["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_prop_start_minus_1ms["error"]
+    print("  [PASS] sjrkjf7IcM7ski0n -> Preparar Propuesta Reserva: Rechaza 07:59:59.999 (-1ms) con AGENDA_OUTSIDE_BUSINESS_HOURS.")
+
+    # Negativo: Cruce de día local (19:00 MX a 09:00 MX día siguiente)
+    res_prop_cross = run_node_js(code_prep_prop, [{"json": {
+        "inicio_iso": "2026-08-26T01:00:00Z",
+        "fin_iso": "2026-08-26T15:00:00Z",
+        "numero_contacto": "5213321594582",
+        "resources": ["calendar", "zoom"]
+    }}])
+    assert res_prop_cross["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_prop_cross["error"]
+    print("  [PASS] sjrkjf7IcM7ski0n -> Preparar Propuesta Reserva: Rechaza evento con cruce de día local (AGENDA_OUTSIDE_BUSINESS_HOURS).")
+
+    # 1I. Preparar Reserva: Revalidación determinista al confirmar propuestas (sin evasión por confirmación owner)
+    res_res_outside = run_node_js(code_prep_res, [{"json": {
+        "headers": {"authorization": "Bearer secret_token_123"},
+        "body": {
+            "confirmado_por_owner": "true",
+            "resources": ["calendar"],
+            "inicio_iso": "2026-08-25T05:00:00Z",  # 23:00 local día anterior (fuera de horario)
+            "fin_iso": "2026-08-25T06:00:00Z",
+            "numero_contacto": "5213321594582"
+        }
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_token_123"})
+    assert res_res_outside["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_res_outside["error"]
+    print("  [PASS] sjrkjf7IcM7ski0n -> Preparar Reserva: Revalidación rechaza horario fuera de 08:00–20:00 aún con confirmado_por_owner:true.")
+
     # -------------------------------------------------------------------------
     # 2. TEST F1sj5tcJVa9R3Q9Z (Wrapper Cancelar)
     # -------------------------------------------------------------------------
@@ -359,6 +424,20 @@ def test_harness():
     assert out_fallo_can["resources"] == ["calendar", "zoom"]
     print("  [PASS] F1sj5tcJVa9R3Q9Z -> Responder Fallo Cancelacion: Formato de fallo ok:false, verified:false.")
 
+    # 2H. Cancelación sin restricción horaria: Permite retirar evento fuera de horario
+    code_prep_raw_can = nodes_can["Preparar Cancelacion"]["parameters"]["jsCode"]
+    res_can_unrestricted = run_node_js(code_prep_raw_can, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {
+            "confirmado_por_owner": "true",
+            "resources": ["calendar", "zoom"],
+            "evento_id": "ev-outside-123",
+            "zoom_id": "zm-outside-456"
+        }
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_can_unrestricted["success"] is True
+    print("  [PASS] F1sj5tcJVa9R3Q9Z -> Preparar Cancelacion: Sin restricción horaria, permite retirar eventos en cualquier horario.")
+
     # -------------------------------------------------------------------------
     # 3. TEST IA360CalendarBook20260602 (Raw Book Writer)
     # -------------------------------------------------------------------------
@@ -416,8 +495,6 @@ def test_harness():
     print("  [PASS] IA360CalendarBook20260602 -> Assert Slot Free: Detecta slot libre (slotFree:true) y slot ocupado (slotFree:false, calendarError:slot_busy) sin throw.")
 
     # 3C. Build Booking Response: Positivos reconciliados con shapes GET reales
-    # Combinación 1: Calendar Only exitoso (Create + GET verify con status confirmed)
-    # Mocks únicamente de los nodos ejecutados en Calendar-only (Zoom NO ejecutado)
     res_cal_only = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar"],
@@ -450,8 +527,6 @@ def test_harness():
     assert out_cal_only["calendarEventId"] == "ev-cal-001"
     print("  [PASS] IA360CalendarBook20260602 -> Build Booking Response: Calendar-only verified:true con shape GET real.")
 
-    # Combinación 2: Zoom Only exitoso (Create + GET verify statusCode 200, id, duration, topic)
-    # Mocks únicamente de los nodos ejecutados en Zoom-only (Calendar NO ejecutado)
     res_zoom_only = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["zoom"],
@@ -486,7 +561,6 @@ def test_harness():
     assert out_zoom_only["zoomMeetingId"] == "987654321"
     print("  [PASS] IA360CalendarBook20260602 -> Build Booking Response: Zoom-only verified:true con shape GET real.")
 
-    # Combinación 3: Ambos exitosos
     res_both_ok = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar", "zoom"],
@@ -531,7 +605,6 @@ def test_harness():
     print("  [PASS] IA360CalendarBook20260602 -> Build Booking Response: Ambos verified:true.")
 
     # 3D. Falla Parcial y Detección de Ocupado
-    # Falla Parcial Dirección 1: Calendar OK + Zoom Falla API (Zoom verify nunca se ejecutó)
     res_part_zoom_fail = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar", "zoom"],
@@ -564,7 +637,6 @@ def test_harness():
     assert out_part1["components"]["zoom"]["state"] == "failed"
     print("  [PASS] IA360CalendarBook20260602 -> Falla Parcial (Cal OK + Zoom Fail): verified:false, Calendar retenido durablemente.")
 
-    # Falla Parcial Dirección 2: Zoom OK + Calendar Falla API (Calendar verify nunca se ejecutó)
     res_part_cal_fail = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar", "zoom"],
@@ -600,7 +672,6 @@ def test_harness():
     assert out_part2["components"]["calendar"]["state"] == "failed"
     print("  [PASS] IA360CalendarBook20260602 -> Falla Parcial (Zoom OK + Cal Fail): verified:false, Zoom retenido durablemente.")
 
-    # Falla Parcial por Slot Busy: Zoom creado y verificado + Calendar bloqueado por slot_busy sin perder Zoom ID
     res_slot_busy_partial = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar", "zoom"],
@@ -641,7 +712,6 @@ def test_harness():
     print("  [PASS] IA360CalendarBook20260602 -> Slot Busy Parcial: Zoom verified + Calendar failed slot_busy sin perder Zoom ID.")
 
     # 3E. Regresiones de Readback / Incierto
-    # Regresión 1: Falta GET Zoom aunque Create ID exista (Verify Zoom Meeting no ejecutado/ausente) -> state 'uncertain'
     res_zoom_no_get = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["zoom"],
@@ -661,7 +731,6 @@ def test_harness():
     assert out_z_noget["components"]["zoom"]["id"] == "987654321"
     print("  [PASS] IA360CalendarBook20260602 -> Regresión Falta GET Zoom: components.zoom.state 'uncertain' preservando ID creado.")
 
-    # Regresión 2: Falta GET Calendar aunque Create ID exista (Verify Calendar no ejecutado/ausente) -> state 'uncertain'
     res_cal_no_get = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar"],
@@ -680,7 +749,6 @@ def test_harness():
     assert out_c_noget["components"]["calendar"]["id"] == "ev-cal-002"
     print("  [PASS] IA360CalendarBook20260602 -> Regresión Falta GET Calendar: components.calendar.state 'uncertain' preservando ID creado.")
 
-    # Regresión 3: Zoom duración diferente en GET -> state 'uncertain'
     res_zoom_dur_diff = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["zoom"],
@@ -697,7 +765,7 @@ def test_harness():
             "body": {
                 "id": "987654321",
                 "start_time": "2026-08-25T16:00:00.000Z",
-                "duration": 30,  # Esperado 60
+                "duration": 30,
                 "topic": "Zoom Mismatch Duracion"
             }
         }}
@@ -708,7 +776,6 @@ def test_harness():
     assert out_z_dur["components"]["zoom"]["state"] == "uncertain"
     print("  [PASS] IA360CalendarBook20260602 -> Regresión Zoom duración discrepante: components.zoom.state 'uncertain'.")
 
-    # Regresión 4: Calendar GET missing status (o status vacío/no confirmado) -> state 'uncertain'
     res_cal_missing_status = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar"],
@@ -732,7 +799,6 @@ def test_harness():
     assert out_c_nostatus["components"]["calendar"]["state"] == "uncertain"
     print("  [PASS] IA360CalendarBook20260602 -> Regresión Calendar GET sin status: components.calendar.state 'uncertain'.")
 
-    # Regresión 5: Discrepancia de horario en Calendar GET
     res_slot_mismatch = run_node_js(code_build_book, [{}], mock_nodes={
         "Normalize Booking": {"json": {
             "resources": ["calendar"],
@@ -756,6 +822,55 @@ def test_harness():
     assert out_mismatch["verified"] is False
     assert out_mismatch["components"]["calendar"]["state"] == "uncertain"
     print("  [PASS] IA360CalendarBook20260602 -> Regresión Discrepancia de horario: components.calendar.state 'uncertain'.")
+
+    # 3F. Normalize Booking: Validación determinista de horario laboral con precisión de milisegundos
+    # Límite inferior exacto (08:00:00.000 local MX = 14:00:00.000Z) -> PASS
+    res_norm_start_exact = run_node_js(code_norm_book, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {"resources": ["calendar"], "start": "2026-08-25T14:00:00.000Z", "end": "2026-08-25T15:00:00.000Z"}
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_norm_start_exact["success"] is True
+    print("  [PASS] IA360CalendarBook20260602 -> Normalize Booking: Límite exacto 08:00:00.000 local MX aceptado.")
+
+    # Límite superior exacto (fin 20:00:00.000 local MX = 02:00:00.000Z día siguiente) -> PASS
+    res_norm_end_exact = run_node_js(code_norm_book, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {"resources": ["zoom"], "start": "2026-08-26T01:00:00.000Z", "end": "2026-08-26T02:00:00.000Z"}
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_norm_end_exact["success"] is True
+    print("  [PASS] IA360CalendarBook20260602 -> Normalize Booking: Límite exacto 20:00:00.000 local MX aceptado.")
+
+    # Negativo: +1ms sobre 20:00 (20:00:00.001 local MX = 02:00:00.001Z) -> MUST FAIL con AGENDA_OUTSIDE_BUSINESS_HOURS
+    res_norm_end_plus_1ms = run_node_js(code_norm_book, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {"resources": ["calendar"], "start": "2026-08-26T01:00:00.000Z", "end": "2026-08-26T02:00:00.001Z"}
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_norm_end_plus_1ms["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_norm_end_plus_1ms["error"]
+    print("  [PASS] IA360CalendarBook20260602 -> Normalize Booking: Rechaza 20:00:00.001 (+1ms) con AGENDA_OUTSIDE_BUSINESS_HOURS.")
+
+    # Negativo: -1ms antes de 08:00 (07:59:59.999 local MX = 13:59:59.999Z) -> MUST FAIL con AGENDA_OUTSIDE_BUSINESS_HOURS
+    res_norm_start_minus_1ms = run_node_js(code_norm_book, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {"resources": ["calendar"], "start": "2026-08-25T13:59:59.999Z", "end": "2026-08-25T15:00:00.000Z"}
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_norm_start_minus_1ms["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_norm_start_minus_1ms["error"]
+    print("  [PASS] IA360CalendarBook20260602 -> Normalize Booking: Rechaza 07:59:59.999 (-1ms) con AGENDA_OUTSIDE_BUSINESS_HOURS.")
+
+    # Negativo: Cruce de día local
+    res_norm_cross = run_node_js(code_norm_book, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {"resources": ["calendar"], "start": "2026-08-26T01:00:00.000Z", "end": "2026-08-26T15:00:00.000Z"}
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_norm_cross["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_norm_cross["error"]
+    print("  [PASS] IA360CalendarBook20260602 -> Normalize Booking: Rechaza cruce de día local (AGENDA_OUTSIDE_BUSINESS_HOURS).")
+
+    # Negativo: Bearer auth presente NO evade validación de horario
+    res_norm_bearer_no_evasion = run_node_js(code_norm_book, [{"json": {
+        "headers": {"authorization": "Bearer secret_tok"},
+        "body": {"resources": ["calendar", "zoom"], "start": "2026-08-25T05:00:00.000Z", "end": "2026-08-25T06:00:00.000Z"}
+    }}], env_vars={"N8N_CALENDAR_TOKEN": "secret_tok"})
+    assert res_norm_bearer_no_evasion["success"] is False and "AGENDA_OUTSIDE_BUSINESS_HOURS" in res_norm_bearer_no_evasion["error"]
+    print("  [PASS] IA360CalendarBook20260602 -> Normalize Booking: Bearer Token válido NO evade bloqueo de horario.")
 
     # -------------------------------------------------------------------------
     # 4. TEST rV1z5sUdNEzCQ1tk (Raw Cancel Writer)
@@ -784,8 +899,6 @@ def test_harness():
     assert res_norm_can_zoom["result"][0]["json"]["needZoom"] is True
 
     # 4B. Build Cancel Response: Positivos reconciliados con shapes GET reales de ausencia
-    # Cancelación selectiva Calendar-only (Delete OK + Verify ausencia 404)
-    # Mocks únicamente de los nodos ejecutados en Calendar-only cancel
     res_can_cal_ok = run_node_js(code_build_raw_can, [{}], mock_nodes={
         "Normalize Cancel": {"json": {
             "resources": ["calendar"],
@@ -806,8 +919,6 @@ def test_harness():
     assert "zoom" not in out_can_cal["components"]
     print("  [PASS] rV1z5sUdNEzCQ1tk -> Build Cancel Response: Cancelación selectiva Calendar-only verified:true con shape GET 404.")
 
-    # Cancelación selectiva Zoom-only (Delete OK + Verify ausencia statusCode 404 / code 3001)
-    # Mocks únicamente de los nodos ejecutados en Zoom-only cancel
     res_can_zoom_ok = run_node_js(code_build_raw_can, [{}], mock_nodes={
         "Normalize Cancel": {"json": {
             "resources": ["zoom"],
@@ -828,7 +939,6 @@ def test_harness():
     assert "calendar" not in out_can_zoom["components"]
     print("  [PASS] rV1z5sUdNEzCQ1tk -> Build Cancel Response: Cancelación selectiva Zoom-only verified:true con shape GET 404.")
 
-    # Cancelación Both exitosa
     res_can_both_ok = run_node_js(code_build_raw_can, [{}], mock_nodes={
         "Normalize Cancel": {"json": {
             "resources": ["calendar", "zoom"],
@@ -848,7 +958,6 @@ def test_harness():
     print("  [PASS] rV1z5sUdNEzCQ1tk -> Build Cancel Response: Cancelación total Both verified:true.")
 
     # 4C. Build Cancel Response: Falla Parcial y Regresiones
-    # Cancelación Parcial (Cal OK 404 + Zoom still present 200)
     res_can_part = run_node_js(code_build_raw_can, [{}], mock_nodes={
         "Normalize Cancel": {"json": {
             "resources": ["calendar", "zoom"],
@@ -875,7 +984,6 @@ def test_harness():
     assert out_can_part["components"]["zoom"]["state"] == "uncertain"
     print("  [PASS] rV1z5sUdNEzCQ1tk -> Build Cancel Response: Cancelación parcial (Cal 404 + Zoom 200), verified:false.")
 
-    # Regresión Readback ausente en Cancelación: Delete OK pero Verify ausencia no ejecutado/ausente -> failed
     res_can_no_verify = run_node_js(code_build_raw_can, [{}], mock_nodes={
         "Normalize Cancel": {"json": {
             "resources": ["calendar"],

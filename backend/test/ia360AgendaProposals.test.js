@@ -1,12 +1,18 @@
 // test/ia360AgendaProposals.test.js — Pruebas de comportamiento observable para propuestas de agenda,
 // validación de fronteras, estados de incertidumbre ante respuestas no verificadas, soporte independiente
-// de recursos (Calendar solo, Zoom solo, ambos), preservación de contrapartes en cancelación y asistencia supervisada.
+// de recursos (Calendar solo, Zoom solo, ambos), preservación de contrapartes en cancelación,
+// asistencia supervisada y validación determinista de horario laboral (RFC-058: 08:00-20:00 America/Mexico_City).
 'use strict';
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  AGENDA_TIMEZONE,
+  BUSINESS_HOURS_START_STR,
+  BUSINESS_HOURS_END_STR,
+  getZonedParts,
+  validateBusinessHours,
   canonicalizeResources,
   validateProposalInput,
   computePayloadHash,
@@ -39,8 +45,9 @@ test('canonicalizeResources: normalización y validación canónica de recursos'
 });
 
 test('validateProposalInput: contrato estricto de resources para Calendar solo, Zoom solo y ambos', () => {
-  const futureStart = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
-  const futureEnd = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000 + 60 * 60 * 1000).toISOString();
+  // 2026-09-15 10:00:00 a 11:00:00 CDMX = 2026-09-15 16:00:00Z a 17:00:00Z (futuro determinista y dentro de horario laboral)
+  const futureStart = '2026-09-15T16:00:00.000Z';
+  const futureEnd = '2026-09-15T17:00:00.000Z';
 
   // 1. Reserva válida: ambos recursos
   const validBoth = validateProposalInput({
@@ -442,4 +449,315 @@ test('handleOwnerFailureAssistance: audience contact vs owner y ciclo de vida de
   assert.equal(contactSentOwnerMode, null, 'NUNCA debe enviar respuesta privada de consulta al contacto');
   assert.match(ownerDirectSent, /Alek, Musio Morales es cliente potencial/);
   assert.equal(clearedAwaitingOwnerMode, false, 'NO debe limpiar el flag awaiting tras una respuesta de información al owner');
+});
+
+// ============================================================================
+// REGTESTS: Validación determinista de horario laboral (RFC-058)
+// Zona horaria: America/Mexico_City (08:00 a 20:00 local, mismo día)
+// ============================================================================
+
+test('validateBusinessHours: matrix UTC convertido con zona America/Mexico_City (08:00 a 20:00 local)', () => {
+  // CDMX es UTC-6 año completo
+  // 1. Frontera inicio: 08:00 CDMX = 14:00 UTC -> Válido
+  const startBorder = validateBusinessHours('2026-09-15T14:00:00.000Z', '2026-09-15T15:00:00.000Z');
+  assert.equal(startBorder.ok, true);
+  assert.equal(startBorder.startLocal, '08:00');
+  assert.equal(startBorder.endLocal, '09:00');
+  assert.equal(startBorder.timeZone, 'America/Mexico_City');
+
+  // 2. Frontera fin: 19:00 a 20:00 CDMX = 2026-09-16 01:00 UTC a 02:00 UTC -> Válido
+  const endBorder = validateBusinessHours('2026-09-16T01:00:00.000Z', '2026-09-16T02:00:00.000Z');
+  assert.equal(endBorder.ok, true);
+  assert.equal(endBorder.startLocal, '19:00');
+  assert.equal(endBorder.endLocal, '20:00');
+
+  // 3. Ventana preferente 10:00 a 16:00 CDMX (16:00 a 17:00 UTC) -> Válido
+  const prefWindow = validateBusinessHours('2026-09-15T16:00:00.000Z', '2026-09-15T17:00:00.000Z');
+  assert.equal(prefWindow.ok, true);
+  assert.equal(prefWindow.startLocal, '10:00');
+  assert.equal(prefWindow.endLocal, '11:00');
+
+  // 4. Franja 08:00 a 10:00 no rechazada: 08:30 a 09:30 CDMX (14:30 a 15:30 UTC) -> Válido
+  const earlyMorningValid = validateBusinessHours('2026-09-15T14:30:00.000Z', '2026-09-15T15:30:00.000Z');
+  assert.equal(earlyMorningValid.ok, true);
+  assert.equal(earlyMorningValid.startLocal, '08:30');
+  assert.equal(earlyMorningValid.endLocal, '09:30');
+
+  // 5. Franja 16:00 a 20:00 no rechazada: 17:30 a 18:30 CDMX (23:30 UTC a 00:30 UTC sig día) -> Válido
+  const eveningValid = validateBusinessHours('2026-09-15T23:30:00.000Z', '2026-09-16T00:30:00.000Z');
+  assert.equal(eveningValid.ok, true);
+  assert.equal(eveningValid.startLocal, '17:30');
+  assert.equal(eveningValid.endLocal, '18:30');
+});
+
+test('validateBusinessHours: precisión a nivel milisegundo en límites 08:00:00.000 y 20:00:00.000', () => {
+  // 1. Exactamente 20:00:00.000 local (2026-09-16T02:00:00.000Z) -> PASS
+  const exactEnd = validateBusinessHours('2026-09-16T01:00:00.000Z', '2026-09-16T02:00:00.000Z');
+  assert.equal(exactEnd.ok, true, 'exactamente 20:00:00.000 debe ser permitido');
+
+  // 2. 20:00:00.001 local (2026-09-16T02:00:00.001Z) -> FAIL por 1ms
+  const overEndMs = validateBusinessHours('2026-09-16T01:00:00.000Z', '2026-09-16T02:00:00.001Z');
+  assert.equal(overEndMs.ok, false);
+  assert.equal(overEndMs.error, 'AGENDA_OUTSIDE_BUSINESS_HOURS', '20:00:00.001 debe ser rechazado');
+
+  // 3. Exactamente 08:00:00.000 local (2026-09-15T14:00:00.000Z) -> PASS
+  const exactStart = validateBusinessHours('2026-09-15T14:00:00.000Z', '2026-09-15T15:00:00.000Z');
+  assert.equal(exactStart.ok, true, 'exactamente 08:00:00.000 debe ser permitido');
+
+  // 4. 07:59:59.999 local (2026-09-15T13:59:59.999Z) -> FAIL por 1ms
+  const underStartMs = validateBusinessHours('2026-09-15T13:59:59.999Z', '2026-09-15T15:00:00.000Z');
+  assert.equal(underStartMs.ok, false);
+  assert.equal(underStartMs.error, 'AGENDA_OUTSIDE_BUSINESS_HOURS', '07:59:59.999 debe ser rechazado');
+});
+
+test('validateBusinessHours & validateProposalInput: rechazo de madrugada, antes de 08:00 y después de 20:00 con error AGENDA_OUTSIDE_BUSINESS_HOURS', () => {
+  // 1. Madrugada: 02:00 a 03:00 CDMX (08:00 a 09:00 UTC) -> Rechazado
+  const madrugadaBh = validateBusinessHours('2026-09-15T08:00:00.000Z', '2026-09-15T09:00:00.000Z');
+  assert.equal(madrugadaBh.ok, false);
+  assert.equal(madrugadaBh.error, 'AGENDA_OUTSIDE_BUSINESS_HOURS');
+  assert.equal(madrugadaBh.startLocal, '02:00');
+  assert.equal(madrugadaBh.endLocal, '03:00');
+
+  const madrugadaProp = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.madrugada',
+    kind: 'book',
+    resources: ['calendar', 'zoom'],
+    start_utc: '2026-09-15T08:00:00.000Z',
+    end_utc: '2026-09-15T09:00:00.000Z',
+  });
+  assert.equal(madrugadaProp.ok, false);
+  assert.ok(madrugadaProp.errors.includes('AGENDA_OUTSIDE_BUSINESS_HOURS'), 'debe incluir AGENDA_OUTSIDE_BUSINESS_HOURS');
+
+  // 2. Antes de 08:00: 07:30 a 08:30 CDMX (13:30 a 14:30 UTC) -> Rechazado por start < 08:00
+  const before8Prop = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.before8',
+    kind: 'book',
+    resources: ['calendar'],
+    start_utc: '2026-09-15T13:30:00.000Z',
+    end_utc: '2026-09-15T14:30:00.000Z',
+  });
+  assert.equal(before8Prop.ok, false);
+  assert.ok(before8Prop.errors.includes('AGENDA_OUTSIDE_BUSINESS_HOURS'));
+
+  // 3. Después de 20:00: 19:30 a 20:30 CDMX (2026-09-16 01:30 a 02:30 UTC) -> Rechazado por end > 20:00
+  const after20Prop = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.after20',
+    kind: 'book',
+    resources: ['zoom'],
+    start_utc: '2026-09-16T01:30:00.000Z',
+    end_utc: '2026-09-16T02:30:00.000Z',
+  });
+  assert.equal(after20Prop.ok, false);
+  assert.ok(after20Prop.errors.includes('AGENDA_OUTSIDE_BUSINESS_HOURS'));
+
+  // 4. Noche tardía: 22:00 a 23:00 CDMX (2026-09-16 04:00 a 05:00 UTC) -> Rechazado
+  const lateNightProp = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.latenight',
+    kind: 'book',
+    resources: ['calendar', 'zoom'],
+    start_utc: '2026-09-16T04:00:00.000Z',
+    end_utc: '2026-09-16T05:00:00.000Z',
+  });
+  assert.equal(lateNightProp.ok, false);
+  assert.ok(lateNightProp.errors.includes('AGENDA_OUTSIDE_BUSINESS_HOURS'));
+});
+
+test('validateBusinessHours & validateProposalInput: rechazo de cruce de día local (spanning multiple days)', () => {
+  // 1. Cruce medianoche local: 23:00 CDMX día 1 a 01:00 CDMX día 2 (2026-09-16 05:00 UTC a 07:00 UTC)
+  const crossDayBh = validateBusinessHours('2026-09-16T05:00:00.000Z', '2026-09-16T07:00:00.000Z');
+  assert.equal(crossDayBh.ok, false);
+  assert.equal(crossDayBh.error, 'AGENDA_OUTSIDE_BUSINESS_HOURS');
+  assert.equal(crossDayBh.isSameDay, false);
+
+  const crossDayProp = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.crossday',
+    kind: 'book',
+    resources: ['calendar', 'zoom'],
+    start_utc: '2026-09-16T05:00:00.000Z',
+    end_utc: '2026-09-16T07:00:00.000Z',
+  });
+  assert.equal(crossDayProp.ok, false);
+  assert.ok(crossDayProp.errors.includes('AGENDA_OUTSIDE_BUSINESS_HOURS'));
+});
+
+test('handleOwnerAgendaDecision: confirmación de propuesta vieja fuera de horario bloquea ejecución y NUNCA llama a n8n', async () => {
+  // Propuesta guardada previamente fuera de horario (ej. 22:00 CDMX = 04:00 UTC)
+  const oldOutsideProposal = {
+    id: 'prop-old-outside-1',
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    contact_name: 'Musio Morales',
+    source_message_id: 'wamid.old.outside',
+    kind: 'book',
+    resources: ['calendar', 'zoom'],
+    start_utc: '2026-09-16T04:00:00.000Z',
+    end_utc: '2026-09-16T05:00:00.000Z',
+    title: 'Cita Nocturna Vieja',
+    estado: 'pending',
+    expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    detalle_json: { resources: ['calendar', 'zoom'] },
+  };
+
+  let dbUpdatedState = null;
+  let dbUpdatedError = null;
+  let ownerDirectSentBody = null;
+  let fetchCalled = false;
+
+  const mockClient = {
+    query: async (sql, params) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql.includes('BEGIN') || sql.includes('COMMIT') || sql.includes('ROLLBACK')) return { rows: [] };
+      if (sql.includes("SET estado = 'executing'")) {
+        return { rows: [oldOutsideProposal] };
+      }
+      if (sql.includes('pg_advisory_unlock')) return { rows: [] };
+      return { rows: [] };
+    },
+    release: () => {},
+  };
+
+  const mockPool = {
+    connect: async () => mockClient,
+    query: async (sql, params) => {
+      if (sql.includes('SELECT * FROM coexistence.ia360_agenda_proposals WHERE id')) {
+        return { rows: [oldOutsideProposal] };
+      }
+      if (sql.includes("SET estado = 'failed'") || /UPDATE coexistence\.ia360_agenda_proposals\s+SET estado\s*=\s*'failed'/.test(sql)) {
+        dbUpdatedState = 'failed';
+        dbUpdatedError = params[1];
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  const handled = await handleOwnerAgendaDecision({
+    pool: mockPool,
+    record: { contact_number: '5213322638033', wa_number: '5213321594582' },
+    buttonId: 'ia360_agenda_yes:prop-old-outside-1',
+    sendOwnerDirectText: async ({ body }) => {
+      ownerDirectSentBody = body;
+    },
+    fetchFn: async () => {
+      fetchCalled = true;
+      throw new Error('NUNCA debe invocar fetch hacia proveedor en horario fuera de rango');
+    },
+  });
+
+  assert.equal(handled, true, 'debe manejar la decisión del owner');
+  assert.equal(fetchCalled, false, 'NUNCA debe llamar a fetch hacia n8n/Calendar/Zoom');
+  assert.equal(dbUpdatedState, 'failed', 'debe marcar la propuesta como failed');
+  assert.equal(dbUpdatedError, 'AGENDA_OUTSIDE_BUSINESS_HOURS', 'error_message debe ser AGENDA_OUTSIDE_BUSINESS_HOURS');
+  assert.match(ownerDirectSentBody, /fuera de la ventana operativa|fuera del horario operativo/);
+});
+
+test('executeBookWriter: defensiva sin llamadas de red si el slot está fuera de horario comercial', async () => {
+  let fetchCalled = false;
+
+  const writerRes = await executeBookWriter({
+    proposal: {
+      id: 'prop-writer-defensive-1',
+      start_utc: '2026-09-15T08:00:00.000Z', // 02:00 AM CDMX (madrugada)
+      end_utc: '2026-09-15T09:00:00.000Z',
+      contact_number: '5213322630839',
+      resources: ['calendar', 'zoom'],
+    },
+    contactName: 'Musio Morales',
+    token: 'valid-token',
+    fetchFn: async () => {
+      fetchCalled = true;
+      throw new Error('fetchFn no debe ejecutarse');
+    },
+  });
+
+  assert.equal(fetchCalled, false, 'no debe ejecutar I/O de red');
+  assert.equal(writerRes.ok, false);
+  assert.equal(writerRes.verified, false);
+  assert.equal(writerRes.uncertain, false);
+  assert.equal(writerRes.error, 'AGENDA_OUTSIDE_BUSINESS_HOURS');
+  assert.equal(writerRes.timeZone, 'America/Mexico_City');
+  assert.deepEqual(writerRes.businessHours, { start: '08:00', end: '20:00' });
+});
+
+test('validateProposalInput & executeCancelWriter: cancelación fuera de horario permitida (cancel outside allowed)', async () => {
+  // Cancelar una cita que estaba fuera de horario comercial
+  const cancelOutsideProp = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.cancel.outside',
+    kind: 'cancel',
+    resources: ['calendar', 'zoom'],
+    event_id: 'evt_outside_123',
+    zoom_id: 'zoom_outside_456',
+  });
+  assert.equal(cancelOutsideProp.ok, true, 'cancelación fuera de horario debe ser permitida');
+
+  let cancelFetchCalled = false;
+  const cancelRes = await executeCancelWriter({
+    proposal: {
+      id: 'prop-cancel-outside-1',
+      contact_number: '5213322630839',
+      resources: ['calendar', 'zoom'],
+      event_id: 'evt_outside_123',
+      zoom_id: 'zoom_outside_456',
+    },
+    token: 'valid-token',
+    fetchFn: async (_url, opts) => {
+      cancelFetchCalled = true;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          verified: true,
+          components: {
+            calendar: { state: 'verified', id: 'evt_outside_123' },
+            zoom: { state: 'verified', id: 'zoom_outside_456' },
+          },
+        }),
+      };
+    },
+  });
+
+  assert.equal(cancelFetchCalled, true);
+  assert.equal(cancelRes.ok, true);
+  assert.equal(cancelRes.verified, true);
+});
+
+test('validateProposalInput: formato de fecha inválido preserva contratos previos', () => {
+  // 1. start_utc no es ISO válido
+  const badFormat = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.badformat',
+    kind: 'book',
+    resources: ['calendar'],
+    start_utc: '15 de septiembre a las 10am',
+    end_utc: '2026-09-15T17:00:00.000Z',
+  });
+  assert.equal(badFormat.ok, false);
+  assert.ok(badFormat.errors.includes('start_utc_explicit_iso_required'));
+
+  // 2. end_utc antes de start_utc
+  const inverted = validateProposalInput({
+    wa_number: '5213321594582',
+    contact_number: '5213322630839',
+    source_message_id: 'wamid.inverted',
+    kind: 'book',
+    resources: ['calendar'],
+    start_utc: '2026-09-15T17:00:00.000Z',
+    end_utc: '2026-09-15T16:00:00.000Z',
+  });
+  assert.equal(inverted.ok, false);
+  assert.ok(inverted.errors.includes('end_must_be_after_start'));
 });
