@@ -27,47 +27,48 @@
         "Structured Output Parser: added response_audience enum (owner, contact)",
         "Normalize WhatsApp Context: truthful dynamic dry_run and structured owner_assistance extraction",
         "Prepare RAG Pinecone Dry Run: added owner_assistance prompt directive and response_audience instructions",
-        "Normalize ForgeChat Contract: dynamic dry_run, response_audience, input_mode, failure_id, owner_assistance propagation"
+        "Normalize ForgeChat Contract: dynamic dry_run, response_audience, input_mode, failure_id, owner_assistance propagation",
+        "ToolWorkflow v2.2 caller resource-mapper schema explicitly matches value and destination trigger; identity stays server-resolved; disponibilidad uses duracion_minutos",
+        "resources is an explicit calendar/zoom selection; proposals never self-confirm; structured response_audience separates owner assistance from contact replies"
       ]
     },
     "sjrkjf7IcM7ski0n": {
       "file": "candidates/sjrkjf7IcM7ski0n.candidate.json",
       "derived_from_version": "899ca4a8-a61e-4437-81eb-4a87c1015cce",
       "changes": [
-        "executeWorkflowTrigger (Entrada): routes exclusively to backend propose endpoint (/internal/ia360-agenda/propose); zero direct writes",
-        "Webhook Reserva Owner (ia360-owner-agenda-book): requires Bearer N8N_CALENDAR_TOKEN; validates operation_id and confirmado_por_owner",
-        "Reservar Calendar y Zoom: propagates Bearer N8N_CALENDAR_TOKEN to raw writer",
-        "Registrar Enlace de la Cita: Postgres INSERT with RETURNING token, event_id, explicit non-null summary query replacement",
-        "Responder Reserva: verifies provider event creation and DB persistence returning verified:true and state:agendada"
+        "ExecuteWorkflow entry proposes only; explicit resources/source_message_id/dry_run contract; dry_run returns no proposal-created claim",
+        "Owner webhook requires Bearer, explicit confirmation and operation_id; requested resources forwarded without implicit pairing",
+        "Verified resource IDs are persisted even for partial results; link kind follows actual verified Calendar or Zoom, not requested resources",
+        "Overall verified requires all selected components verified and persisted; partial failure retains IDs without blind retry"
       ]
     },
     "F1sj5tcJVa9R3Q9Z": {
       "file": "candidates/F1sj5tcJVa9R3Q9Z.candidate.json",
       "derived_from_version": "ce84d4c4-e870-4742-9579-aab9e876bd81",
       "changes": [
-        "executeWorkflowTrigger (Entrada): routes exclusively to backend propose endpoint (/internal/ia360-agenda/propose) with kind=cancel; zero direct writes",
-        "Webhook Cancelacion Owner (ia360-owner-agenda-cancel): requires Bearer N8N_CALENDAR_TOKEN; validates operation_id and confirmado_por_owner",
-        "Cancelar Calendar y Zoom: propagates Bearer N8N_CALENDAR_TOKEN to raw writer",
-        "Borrar Enlace de la Cita: Postgres DELETE with RETURNING token, event_id",
-        "Responder Cancelacion: dual verification requiring provider rawVerified===true AND DB deletion returning verified:true and state:cancelada"
+        "ExecuteWorkflow entry proposes cancellation only; explicit resources and selected IDs; no owner self-confirmation from model",
+        "Owner webhook requires Bearer, confirmation, operation_id and selected IDs, never an excluded resource ID",
+        "PostgreSQL selective UPDATE removes only IDs proven absent by provider; DELETE only when no counterpart ID or URL remains",
+        "Cancellation response reports selected component verification and durable selective persistence; partial/uncertain states are not success; dry_run does not claim a created proposal"
       ]
     },
     "IA360CalendarBook20260602": {
       "file": "candidates/IA360CalendarBook20260602.candidate.json",
       "derived_from_version": "1f76af68-3858-41c4-83d5-913fed902902",
       "changes": [
-        "Normalize Booking: validates Bearer N8N_CALENDAR_TOKEN at HTTP entry",
-        "Verify Calendar Event Exists: canonical Google Calendar GET readback verifying created event",
-        "Build Booking Response: validates readbackEv.id without silent fallback, checks slot/title match, Zoom verification, includes summary"
+        "Bearer authentication and canonical resources required before provider calls; excluded provider branch is never executed",
+        "Calendar and Zoom each require independent GET readback with matching ID, requested slot and duration; creation response is not proof",
+        "Availability failure or busy slot routes through If Calendar Slot Free to a structured partial result without discarding an already-created Zoom",
+        "Created IDs are preserved for failed or uncertain readback; global verified only when every requested resource is verified"
       ]
     },
     "rV1z5sUdNEzCQ1tk": {
       "file": "candidates/rV1z5sUdNEzCQ1tk.candidate.json",
       "derived_from_version": "01ac3120-83c2-4d6f-84b7-317d2d667d26",
       "changes": [
-        "Normalize Cancel: validates Bearer N8N_CALENDAR_TOKEN at HTTP entry",
-        "Verify Event Absence in Calendar: HTTP GET post-delete verifying 404/410/cancelled absence",
-        "Build Cancel Response: emits verified:true upon absence verification"
+        "Bearer authentication, explicit resources and only selected resource IDs required",
+        "Only selected delete branches execute; Zoom uses existing OAuth2 credential; selected providers require independent GET absence 404/410/cancelled",
+        "Missing readback, still-present resource, or provider error cannot become verified; retain IDs and report components without deleting unrelated resources"
       ]
     }
   },
@@ -80,5 +81,6 @@
     "LCFkBV47IEkjh9ss": "23c6d302-389c-4fa1-9ffc-6d9e55f27bc2",
     "i4IapJoxLObQTPW1": "06b2eb7e-0fa9-47b8-9bbb-90dc406a14ed",
     "4IJC78aFkI5ihNZD": "f70dc217-3da7-4dd3-9a3b-3e1659e37927"
-  }
+  },
+  "updated_at": "2026-09-09T00:45:18.506122+00:00"
 }

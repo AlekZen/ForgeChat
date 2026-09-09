@@ -27,7 +27,7 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: Bearer token required for raw booking writer');\n}\n\nconst payload = raw.body || raw;\nif (!payload.start || !payload.end) throw new Error('Missing start/end');\n\nlet rawRes = payload.resources;\nif (typeof rawRes === 'string') {\n  try { rawRes = JSON.parse(rawRes); } catch (e) { rawRes = rawRes.split(',').map(s => s.trim()); }\n}\nif (!Array.isArray(rawRes) || rawRes.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources es obligatorio y debe ser un array no vacio de \"calendar\" y/o \"zoom\".');\n}\nconst validSet = new Set(['calendar', 'zoom']);\nfor (const r of rawRes) {\n  if (!validSet.has(r)) {\n    throw new Error(`RECURSOS_INVALIDOS: recurso desconocido \"${r}\". Solo se permite \"calendar\" y/o \"zoom\".`);\n  }\n}\nconst unique = Array.from(new Set(rawRes));\nconst resources = ['calendar', 'zoom'].filter(r => unique.includes(r));\nif (resources.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources no contiene recursos validos.');\n}\n\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst calendarId = payload.calendarId || 'ocompudoc@gmail.com';\nconst contact = payload.contact || {};\nconst displayName = contact.contactName || payload.contactName || 'Lead IA360';\nconst wa = contact.contactNumber || payload.contactNumber || '';\nconst summary = String(payload.summary || '').trim() || `IA360 diagnóstico - ${displayName}`;\nconst description = String(payload.description || '').trim() || `Reunión IA360 agendada desde WhatsApp. Contacto: ${displayName} (+${wa}).`;\n\nreturn [{\n  json: {\n    ...payload,\n    resources,\n    needCalendar,\n    needZoom,\n    calendarId,\n    displayName,\n    wa,\n    start: payload.start,\n    end: payload.end,\n    tz: 'America/Mexico_City',\n    summary,\n    description,\n    zoomMeetingId: null,\n    zoomJoinUrl: ''\n  }\n}];"
+        "jsCode": "const raw = $input.first().json || {};\nconst headers = raw.headers || {};\nconst auth = headers.authorization || headers.Authorization || '';\nconst expected = $env.N8N_CALENDAR_TOKEN;\n\nif (!expected || auth !== `Bearer ${expected}`) {\n  throw new Error('AUTH_FAILED: Bearer token required for raw booking writer');\n}\n\nconst payload = raw.body || raw;\nif (!payload.start || !payload.end) throw new Error('Missing start/end');\n\nlet rawRes = payload.resources;\nif (typeof rawRes === 'string') {\n  try { rawRes = JSON.parse(rawRes); } catch (e) { rawRes = rawRes.split(',').map(s => s.trim()); }\n}\nif (!Array.isArray(rawRes) || rawRes.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources es obligatorio y debe ser un array no vacio de \"calendar\" y/o \"zoom\".');\n}\nconst validSet = new Set(['calendar', 'zoom']);\nfor (const r of rawRes) {\n  if (!validSet.has(r)) {\n    throw new Error(`RECURSOS_INVALIDOS: recurso desconocido \"${r}\". Solo se permite \"calendar\" y/o \"zoom\".`);\n  }\n}\nconst unique = Array.from(new Set(rawRes));\nconst resources = ['calendar', 'zoom'].filter(r => unique.includes(r));\nif (resources.length === 0) {\n  throw new Error('RECURSOS_INVALIDOS: resources no contiene recursos validos.');\n}\n\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst calendarId = payload.calendarId || 'ocompudoc@gmail.com';\nconst contact = payload.contact || {};\nconst displayName = contact.contactName || payload.contactName || 'Lead IA360';\nconst wa = contact.contactNumber || payload.contactNumber || '';\nconst summary = String(payload.summary || '').trim() || `IA360 diagn\u00f3stico - ${displayName}`;\nconst description = String(payload.description || '').trim() || `Reuni\u00f3n IA360 agendada desde WhatsApp. Contacto: ${displayName} (+${wa}).`;\n\nreturn [{\n  json: {\n    ...payload,\n    resources,\n    needCalendar,\n    needZoom,\n    calendarId,\n    displayName,\n    wa,\n    start: payload.start,\n    end: payload.end,\n    tz: 'America/Mexico_City',\n    summary,\n    description,\n    zoomMeetingId: null,\n    zoomJoinUrl: ''\n  }\n}];"
       },
       "id": "Normalize Booking",
       "name": "Normalize Booking",
@@ -106,16 +106,79 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-zoom-created-1",
+              "leftValue": "={{ Boolean($json.id) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "If Zoom Created",
+      "name": "If Zoom Created",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.zoom.us/v2/meetings/' + $json.id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zoomOAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "Verify Zoom Meeting",
+      "name": "Verify Zoom Meeting",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        -200
+      ],
+      "credentials": {
+        "zoomOAuth2Api": {
+          "id": "21lumQ7GPjOQv2gr",
+          "name": "Zoom account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const norm = $('Normalize Booking').first().json;\nconst zoom = $input.first() ? $input.first().json : {};\nconst zoomId = zoom.id || zoom.zoomMeetingId || null;\nconst zoomJoinUrl = zoom.join_url || zoom.zoomJoinUrl || '';\n\nreturn [{\n  json: {\n    ...norm,\n    zoomMeetingId: zoomId,\n    zoomJoinUrl: zoomJoinUrl,\n    zoom_raw: zoom\n  }\n}];"
+        "jsCode": "const norm = $('Normalize Booking').first().json;\nconst inputData = $input.first() ? $input.first().json : {};\nlet createData = {};\ntry { createData = $('Create Zoom Meeting').first()?.json || {}; } catch (e) {}\n\nconst createdId = createData.id ? String(createData.id) : (inputData.id ? String(inputData.id) : null);\nconst createdJoinUrl = createData.join_url || inputData.join_url || '';\n\nlet verifyResp = null;\nif (inputData.statusCode !== undefined || inputData.body !== undefined) {\n  verifyResp = inputData;\n} else if (inputData.id && inputData !== createData) {\n  verifyResp = inputData;\n}\n\nconst zoomError = createData.error || inputData.error || (verifyResp && verifyResp.statusCode && Number(verifyResp.statusCode) >= 400 ? `HTTP ${verifyResp.statusCode}` : null);\n\nreturn [{\n  json: {\n    ...norm,\n    zoomMeetingId: createdId,\n    zoomJoinUrl: createdJoinUrl || (verifyResp?.body?.join_url) || '',\n    zoom_create: createData,\n    zoom_verify: verifyResp,\n    zoom_error: zoomError\n  }\n}];"
       },
       "id": "Merge Zoom Info",
       "name": "Merge Zoom Info",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        880,
-        -120
+        1320,
+        -100
       ]
     },
     {
@@ -145,7 +208,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        1100,
+        1540,
         0
       ]
     },
@@ -174,8 +237,8 @@
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.3,
       "position": [
-        1320,
-        -120
+        1760,
+        -100
       ],
       "credentials": {
         "googleCalendarOAuth2Api": {
@@ -183,20 +246,21 @@
           "name": "Google Calendar account"
         }
       },
-      "alwaysOutputData": true
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const raw = $input.first().json;\nconst meta = $('If Needs Calendar').first().json;\nconst busy = raw.calendars?.[meta.calendarId]?.busy || raw.busy || [];\nif (busy.length > 0) throw new Error('slot_busy');\nreturn [{ json: { ok: true, busy, ...meta } }];"
+        "jsCode": "const raw = $input.first().json;\nconst meta = $('If Needs Calendar').first().json;\nconst calendar = raw.calendars?.[meta.calendarId];\nconst busy = calendar?.busy ?? raw.busy;\nconst availabilityVerified = Array.isArray(busy) && !raw.error && !calendar?.errors?.length;\nconst slotFree = availabilityVerified && busy.length === 0;\nconst calendarError = availabilityVerified === false ? 'calendar_availability_unverified' : (slotFree ? null : 'slot_busy');\nreturn [{ json: { ...meta, slotFree, calendarError } }];"
       },
       "id": "Assert Slot Free",
       "name": "Assert Slot Free",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1540,
-        -120
+        1980,
+        -100
       ]
     },
     {
@@ -223,8 +287,8 @@
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.3,
       "position": [
-        1760,
-        -120
+        2200,
+        -100
       ],
       "credentials": {
         "googleCalendarOAuth2Api": {
@@ -251,8 +315,8 @@
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.3,
       "position": [
-        1980,
-        -120
+        2420,
+        -100
       ],
       "credentials": {
         "googleCalendarOAuth2Api": {
@@ -265,14 +329,14 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const norm = $('Normalize Booking').first().json;\nconst resources = norm.resources || [];\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst components = {};\nlet allVerified = true;\n\nif (needZoom) {\n  let zoomData = null;\n  try { zoomData = $('Merge Zoom Info').first()?.json || $('Create Zoom Meeting').first()?.json; } catch (e) {}\n  const zoomId = zoomData?.zoomMeetingId ? String(zoomData.zoomMeetingId) : (zoomData?.id ? String(zoomData.id) : null);\n  const zoomJoinUrl = zoomData?.zoomJoinUrl || zoomData?.join_url || null;\n  const zoomError = zoomData?.error?.message || zoomData?.error || null;\n  \n  const zoomVerified = Boolean(zoomId && zoomJoinUrl && String(zoomJoinUrl).startsWith('http'));\n  if (zoomVerified) {\n    components.zoom = {\n      state: 'verified',\n      id: zoomId,\n      join_url: zoomJoinUrl\n    };\n  } else {\n    allVerified = false;\n    components.zoom = {\n      state: zoomId ? 'uncertain' : 'failed',\n      id: zoomId || undefined,\n      join_url: zoomJoinUrl || undefined,\n      error: zoomError || 'Zoom meeting was not verified by provider'\n    };\n  }\n}\n\nif (needCalendar) {\n  let calData = null;\n  try { calData = $('Verify Calendar Event Exists').first()?.json; } catch (e) {}\n  if (!calData || !calData.id) {\n    try { calData = $('Create Calendar Event').first()?.json; } catch (e) {}\n  }\n  const calId = calData?.id ? String(calData.id) : null;\n  const calError = calData?.error?.message || calData?.error || null;\n  const readStart = calData?.start?.dateTime || calData?.start?.date || '';\n  const readEnd = calData?.end?.dateTime || calData?.end?.date || '';\n  const readSummary = String(calData?.summary || '').trim();\n\n  const startMatch = Boolean(readStart && new Date(readStart).toISOString() === new Date(norm.start).toISOString());\n  const endMatch = Boolean(readEnd && new Date(readEnd).toISOString() === new Date(norm.end).toISOString());\n  const titleMatch = Boolean(!norm.summary || readSummary === String(norm.summary).trim());\n  const calVerified = Boolean(calId && startMatch && endMatch && titleMatch);\n\n  if (calVerified) {\n    components.calendar = {\n      state: 'verified',\n      id: calId,\n      htmlLink: calData.htmlLink || undefined\n    };\n  } else {\n    allVerified = false;\n    components.calendar = {\n      state: calId ? 'uncertain' : 'failed',\n      id: calId || undefined,\n      error: calError || (calId ? 'Calendar event slot/title mismatch' : 'READBACK_FAILED: Google Calendar event was not verified by readback')\n    };\n  }\n}\n\nconst verified = Boolean(allVerified && resources.length > 0);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'booked' : 'uncertain',\n    state: verified ? 'agendada' : 'incierta',\n    resources,\n    components,\n    start: norm.start,\n    end: norm.end,\n    summary: norm.summary,\n    contactName: norm.displayName,\n    contactNumber: norm.wa,\n    calendarEventId: components.calendar?.id || null,\n    calendarHtmlLink: components.calendar?.htmlLink || null,\n    zoomMeetingId: components.zoom?.id || null,\n    zoomJoinUrl: components.zoom?.join_url || null\n  }\n}];"
+        "jsCode": "const norm = $('Normalize Booking').first().json;\nconst resources = norm.resources || [];\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst components = {};\nlet allVerified = true;\n\nif (needZoom) {\n  let zoomCreate = null;\n  let zoomVerify = null;\n  let mergeData = null;\n\n  try { mergeData = $('Merge Zoom Info').first()?.json; } catch (e) {}\n  try { zoomCreate = $('Create Zoom Meeting').first()?.json; } catch (e) {}\n  try { zoomVerify = $('Verify Zoom Meeting').first()?.json; } catch (e) {}\n\n  if (!zoomCreate && mergeData?.zoom_create) zoomCreate = mergeData.zoom_create;\n  if (!zoomVerify && mergeData?.zoom_verify) zoomVerify = mergeData.zoom_verify;\n\n  const createdId = zoomCreate?.id ? String(zoomCreate.id) : (mergeData?.zoomMeetingId ? String(mergeData.zoomMeetingId) : null);\n  const createdJoinUrl = zoomCreate?.join_url || mergeData?.zoomJoinUrl || null;\n  const createError = zoomCreate?.error?.message || zoomCreate?.error || null;\n\n  const verifyData = zoomVerify?.body || zoomVerify;\n  const verifyStatusCode = Number(zoomVerify?.statusCode || (verifyData?.id ? 200 : 0));\n  const verifyId = verifyData?.id ? String(verifyData.id) : null;\n  const verifyStartTime = verifyData?.start_time || '';\n  const verifyDuration = verifyData?.duration !== undefined ? Number(verifyData.duration) : null;\n  const verifyTopic = String(verifyData?.topic || '').trim();\n  const verifyJoinUrl = verifyData?.join_url || createdJoinUrl;\n  const verifyError = zoomVerify?.error?.message || zoomVerify?.error || (verifyStatusCode >= 400 ? `HTTP ${verifyStatusCode}` : null);\n\n  const startMatch = Boolean(verifyStartTime && new Date(verifyStartTime).getTime() === new Date(norm.start).getTime());\n  const expectedDuration = Math.max(1, Math.ceil((new Date(norm.end).getTime() - new Date(norm.start).getTime()) / 60000));\n  const durationMatch = verifyDuration === expectedDuration;\n  const topicMatch = Boolean(Boolean(norm.summary) === false || verifyTopic === String(norm.summary).trim());\n\n  const zoomVerified = Boolean(\n    createdId &&\n    verifyId &&\n    verifyId === createdId &&\n    zoomVerify?.statusCode === 200 &&\n    durationMatch &&\n    startMatch &&\n    topicMatch &&\n    Boolean(verifyError) === false\n  );\n\n  if (zoomVerified) {\n    components.zoom = {\n      state: 'verified',\n      id: createdId,\n      join_url: verifyJoinUrl || createdJoinUrl\n    };\n  } else {\n    allVerified = false;\n    const hasId = Boolean(createdId || verifyId);\n    components.zoom = {\n      state: hasId ? 'uncertain' : 'failed',\n      id: createdId || verifyId || undefined,\n      join_url: (createdJoinUrl || verifyJoinUrl) || undefined,\n      error: verifyError || createError || (hasId ? 'Zoom meeting verification mismatch or GET failed' : 'Zoom meeting creation failed')\n    };\n  }\n}\n\nif (needCalendar) {\n  let calCreate = null;\n  let calVerify = null;\n  let slotError = null;\n  try { slotError = $('Assert Slot Free').first()?.json?.calendarError; } catch (e) {}\n\n  try { calCreate = $('Create Calendar Event').first()?.json; } catch (e) {}\n  try { calVerify = $('Verify Calendar Event Exists').first()?.json; } catch (e) {}\n\n  const createdCalId = calCreate?.id ? String(calCreate.id) : null;\n  const createCalError = calCreate?.error?.message || calCreate?.error || null;\n\n  const verifyCalData = calVerify?.body || calVerify;\n  const verifyCalId = verifyCalData?.id ? String(verifyCalData.id) : null;\n  const verifyCalStatus = String(verifyCalData?.status || '').toLowerCase();\n  const verifyCalError = calVerify?.error?.message || calVerify?.error || (verifyCalData?.error?.message || null);\n  const readStart = verifyCalData?.start?.dateTime || verifyCalData?.start?.date || '';\n  const readEnd = verifyCalData?.end?.dateTime || verifyCalData?.end?.date || '';\n  const readSummary = String(verifyCalData?.summary || '').trim();\n\n  const idMatch = Boolean(createdCalId && verifyCalId && verifyCalId === createdCalId);\n  const notCancelled = Boolean(verifyCalStatus && verifyCalStatus !== 'cancelled');\n  const startMatch = Boolean(readStart && new Date(readStart).toISOString() === new Date(norm.start).toISOString());\n  const endMatch = Boolean(readEnd && new Date(readEnd).toISOString() === new Date(norm.end).toISOString());\n  const titleMatch = Boolean(Boolean(norm.summary) === false || readSummary === String(norm.summary).trim());\n\n  const calVerified = Boolean(idMatch && notCancelled && startMatch && endMatch && titleMatch && Boolean(verifyCalError) === false && Boolean(createCalError) === false);\n\n  if (calVerified) {\n    components.calendar = {\n      state: 'verified',\n      id: createdCalId,\n      htmlLink: verifyCalData?.htmlLink || calCreate?.htmlLink || undefined\n    };\n  } else {\n    allVerified = false;\n    const hasCalId = Boolean(createdCalId || verifyCalId);\n    components.calendar = {\n      state: hasCalId ? 'uncertain' : 'failed',\n      id: createdCalId || verifyCalId || undefined,\n      error: slotError || verifyCalError || createCalError || (hasCalId ? (verifyCalStatus === 'cancelled' ? 'Calendar event is cancelled' : 'Calendar event slot/title mismatch or readback failed') : 'READBACK_FAILED: Google Calendar event was not verified by readback')\n    };\n  }\n}\n\nconst verified = Boolean(allVerified && resources.length > 0);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'booked' : 'uncertain',\n    state: verified ? 'agendada' : 'incierta',\n    resources,\n    components,\n    start: norm.start,\n    end: norm.end,\n    summary: norm.summary,\n    contactName: norm.displayName,\n    contactNumber: norm.wa,\n    calendarEventId: components.calendar?.id || null,\n    calendarHtmlLink: components.calendar?.htmlLink || null,\n    zoomMeetingId: components.zoom?.id || null,\n    zoomJoinUrl: components.zoom?.join_url || null\n  }\n}];"
       },
       "id": "Build Booking Response",
       "name": "Build Booking Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2200,
+        2640,
         0
       ]
     },
@@ -287,8 +351,39 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        2420,
+        2860,
         0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-cal-1",
+              "leftValue": "={{ $json.slotFree }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-calendar-slot-free",
+      "name": "If Calendar Slot Free",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2200,
+        -220
       ]
     }
   ],
@@ -334,6 +429,35 @@
       ]
     },
     "Create Zoom Meeting": {
+      "main": [
+        [
+          {
+            "node": "If Zoom Created",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Zoom Created": {
+      "main": [
+        [
+          {
+            "node": "Verify Zoom Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Zoom Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Zoom Meeting": {
       "main": [
         [
           {
@@ -388,7 +512,7 @@
       "main": [
         [
           {
-            "node": "Create Calendar Event",
+            "node": "If Calendar Slot Free",
             "type": "main",
             "index": 0
           }
@@ -422,6 +546,24 @@
         [
           {
             "node": "Respond Booked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Calendar Slot Free": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Booking Response",
             "type": "main",
             "index": 0
           }

@@ -11,15 +11,15 @@
         "workflowInputs": {
           "values": [
             {
+              "name": "resources",
+              "type": "string"
+            },
+            {
               "name": "evento_id",
               "type": "string"
             },
             {
               "name": "zoom_id",
-              "type": "string"
-            },
-            {
-              "name": "resources",
               "type": "string"
             },
             {
@@ -106,7 +106,7 @@
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const resp = $input.first().json || {};\nconst prep = $('Preparar Propuesta Cancelacion').first().json || {};\nconst ok = resp.ok === true;\nconst proposalId = resp.proposal_id || null;\nconst state = resp.state || (ok ? 'pending_owner_confirmation' : 'blocked');\nconst msg = resp.message || (ok\n  ? `Propuesta de cancelaci\u00f3n de cita (${prep.resources.join(', ')}) enviada a Alek para confirmaci\u00f3n.`\n  : `No se pudo generar la propuesta de cancelaci\u00f3n: ${resp.error || 'error desconocido'}`);\n\nreturn [{\n  json: {\n    ok,\n    estado: ok ? 'propuesta_cancelacion_creada' : 'error_propuesta',\n    state,\n    proposal_id: proposalId,\n    resources: prep.resources,\n    event_id: prep.event_id,\n    zoom_id: prep.zoom_id,\n    mensaje: msg,\n    requires_owner_tap: ok && state === 'pending_owner_confirmation'\n  }\n}];"
+        "jsCode": "const resp = $input.first().json || {};\nconst prep = $('Preparar Propuesta Cancelacion').first().json || {};\nconst ok = resp.ok === true;\nconst proposalId = resp.proposal_id || null;\nconst state = resp.state || (ok ? 'pending_owner_confirmation' : 'blocked');\nconst msg = resp.message || (ok\n  ? `Propuesta de cancelaci\u00f3n de cita (${prep.resources.join(', ')}) enviada a Alek para confirmaci\u00f3n.`\n  : `No se pudo generar la propuesta de cancelaci\u00f3n: ${resp.error || 'error desconocido'}`);\n\nreturn [{\n  json: {\n    ok,\n    estado: state === 'dry_run' ? 'dry_run' : (ok ? 'propuesta_cancelacion_creada' : 'error_propuesta'),\n    state,\n    proposal_id: proposalId,\n    resources: prep.resources,\n    event_id: prep.event_id,\n    zoom_id: prep.zoom_id,\n    mensaje: msg,\n    requires_owner_tap: ok && state === 'pending_owner_confirmation'\n  }\n}];"
       },
       "id": "f3333333-3333-4333-8333-333333333333",
       "name": "Responder Propuesta Cancelacion",
@@ -222,9 +222,9 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH matched AS (\n  SELECT token, event_id, zoom_meeting_id, zoom_join_url, kind\n    FROM coexistence.ia360_meeting_links\n   WHERE ($1::text <> '' AND event_id = $1)\n      OR ($2::text <> '' AND zoom_meeting_id::text = $2)\n   LIMIT 1\n),\nto_delete AS (\n  DELETE FROM coexistence.ia360_meeting_links m\n   USING matched\n   WHERE m.token = matched.token\n     AND (\n       ($3::boolean AND $4::boolean)\n       OR ($3::boolean AND (matched.zoom_meeting_id IS NULL OR matched.zoom_join_url IS NULL))\n       OR ($4::boolean AND (matched.event_id IS NULL OR matched.event_id = ''))\n     )\n   RETURNING m.token, m.event_id, m.zoom_meeting_id, 'deleted' AS op\n),\nto_update AS (\n  UPDATE coexistence.ia360_meeting_links m\n     SET event_id = CASE WHEN $3::boolean THEN NULL ELSE m.event_id END,\n         zoom_meeting_id = CASE WHEN $4::boolean THEN NULL ELSE m.zoom_meeting_id END,\n         zoom_join_url = CASE WHEN $4::boolean THEN NULL ELSE m.zoom_join_url END,\n         kind = CASE WHEN $3::boolean THEN 'zoom' WHEN $4::boolean THEN 'cal' ELSE m.kind END\n    FROM matched\n   WHERE m.token = matched.token\n     AND NOT EXISTS (SELECT 1 FROM to_delete)\n   RETURNING m.token, m.event_id, m.zoom_meeting_id, 'updated' AS op\n)\nSELECT * FROM to_delete\nUNION ALL\nSELECT * FROM to_update;",
+        "query": "WITH matched AS (\n  SELECT token, event_id, zoom_meeting_id, zoom_join_url, kind\n    FROM coexistence.ia360_meeting_links\n   WHERE ($1::text <> '' AND event_id = $1)\n      OR ($2::text <> '' AND zoom_meeting_id::text = $2)\n   LIMIT 1\n),\nto_delete AS (\n  DELETE FROM coexistence.ia360_meeting_links m\n   USING matched\n   WHERE m.token = matched.token\n     AND (\n       ($3::boolean AND $4::boolean)\n       OR ($3::boolean AND (matched.zoom_meeting_id IS NULL AND matched.zoom_join_url IS NULL))\n       OR ($4::boolean AND (matched.event_id IS NULL OR matched.event_id = ''))\n     )\n   RETURNING m.token, m.event_id, m.zoom_meeting_id, 'deleted' AS op\n),\nto_update AS (\n  UPDATE coexistence.ia360_meeting_links m\n     SET event_id = CASE WHEN $3::boolean THEN NULL ELSE m.event_id END,\n         zoom_meeting_id = CASE WHEN $4::boolean THEN NULL ELSE m.zoom_meeting_id END,\n         zoom_join_url = CASE WHEN $4::boolean THEN NULL ELSE m.zoom_join_url END,\n         kind = CASE WHEN $3::boolean THEN 'zoom' WHEN $4::boolean THEN 'cal' ELSE m.kind END\n    FROM matched\n   WHERE m.token = matched.token\n     AND NOT EXISTS (SELECT 1 FROM to_delete)\n   RETURNING m.token, m.event_id, m.zoom_meeting_id, 'updated' AS op\n)\nSELECT * FROM to_delete\nUNION ALL\nSELECT * FROM to_update;",
         "options": {
-          "queryReplacement": "={{ [ $('Preparar Cancelacion').first().json.calendarEventId || '', $('Preparar Cancelacion').first().json.zoomMeetingId || '', Boolean(($node['Cancelar Calendar y Zoom'].json.body?.components?.calendar?.state === 'verified') || ($node['Cancelar Calendar y Zoom'].json.components?.calendar?.state === 'verified') || ($('Preparar Cancelacion').first().json.resources.includes('calendar') && ($node['Cancelar Calendar y Zoom'].json.body?.ok || $node['Cancelar Calendar y Zoom'].json.ok))), Boolean(($node['Cancelar Calendar y Zoom'].json.body?.components?.zoom?.state === 'verified') || ($node['Cancelar Calendar y Zoom'].json.components?.zoom?.state === 'verified') || ($('Preparar Cancelacion').first().json.resources.includes('zoom') && ($node['Cancelar Calendar y Zoom'].json.body?.ok || $node['Cancelar Calendar y Zoom'].json.ok))) ] }}"
+          "queryReplacement": "={{ [ $('Preparar Cancelacion').first().json.calendarEventId || '', $('Preparar Cancelacion').first().json.zoomMeetingId || '', $('Preparar Cancelacion').first().json.resources.includes('calendar') && (($node['Cancelar Calendar y Zoom'].json.body?.components || $node['Cancelar Calendar y Zoom'].json.components)?.calendar?.state === 'verified'), $('Preparar Cancelacion').first().json.resources.includes('zoom') && (($node['Cancelar Calendar y Zoom'].json.body?.components || $node['Cancelar Calendar y Zoom'].json.components)?.zoom?.state === 'verified') ] }}"
         }
       },
       "id": "Borrar o Actualizar Enlace",
@@ -237,8 +237,8 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "PZlF3s9aXk9Z2w1Q",
-          "name": "coexistence (postgres:15)"
+          "id": "Iv27o2JYkuc2ZiEz",
+          "name": "ForgeChat Postgres WRITER (deals)"
         }
       }
     },

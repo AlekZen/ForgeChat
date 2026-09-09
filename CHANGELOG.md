@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **IA360 Owner-Authorized Agenda & Decoupled Resources (Problem 16):**
+  - Multi-resource agenda proposal contract supporting decoupled `calendar`, `zoom`, or both (`resources` array), with independent write execution and per-resource readback verification.
+  - Granular state machine separating proposal lifecycle (`pending_owner_confirmation`, `executing`, `completed`, `failed`, `uncertain`) from individual component states (`components.<resource>.state`: `verified`, `failed`, `uncertain`).
+  - Database migrations `056` (new `ia360_agenda_proposals` table with structured proposal snapshots and component state tracking) and `057` (`ia360_meeting_links` multi-resource persistence and token deduplication).
+  - Triage and bot failure capture isolation: owner instructions now arrive to `callIa360Agent` as labeled `owner_assistance` context instead of being blindly re-emitted as raw text replies to contacts.
+  - Independent cancellation mechanics: selective cancellation of Calendar or Zoom without implicit cascade or accidental deletion of the counter-resource.
+  - Correlation and isolation guards preventing concurrent requests or altered time slots from overwriting prior proposals.
+
 ### Changed
 - **Brand-language pass for Meta / WhatsApp guidelines:** dropped "official … /
   unofficial hack" framing in README, reworded the login splash to no longer

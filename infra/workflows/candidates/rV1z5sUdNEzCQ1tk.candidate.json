@@ -71,15 +71,48 @@
       "parameters": {
         "resource": "meeting",
         "operation": "delete",
-        "meetingId": "={{ $('Normalize Cancel').first().json.zoomMeetingId }}"
+        "meetingId": "={{ $('Normalize Cancel').first().json.zoomMeetingId }}",
+        "authentication": "oAuth2"
       },
       "id": "Delete Zoom Meeting",
       "name": "Delete Zoom Meeting",
       "type": "n8n-nodes-base.zoom",
       "typeVersion": 1,
       "position": [
+        440,
+        -100
+      ],
+      "credentials": {
+        "zoomOAuth2Api": {
+          "id": "21lumQ7GPjOQv2gr",
+          "name": "Zoom account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.zoom.us/v2/meetings/' + $('Normalize Cancel').first().json.zoomMeetingId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zoomOAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "Verify Zoom Absence",
+      "name": "Verify Zoom Absence",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
         660,
-        -120
+        -100
       ],
       "credentials": {
         "zoomOAuth2Api": {
@@ -151,7 +184,7 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($node[\"Normalize Cancel\"].json.calendarId) + '/events/' + $node[\"Normalize Cancel\"].json.calendarEventId }}",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($('Normalize Cancel').first().json.calendarId) + '/events/' + $('Normalize Cancel').first().json.calendarEventId }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "googleCalendarOAuth2Api",
         "options": {
@@ -177,12 +210,13 @@
           "id": "dvgs8BuVIihlfrTn",
           "name": "Google Calendar account"
         }
-      }
+      },
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const norm = $('Normalize Cancel').first().json;\nconst resources = norm.resources || [];\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst components = {};\nlet allVerified = true;\n\nif (needZoom) {\n  let zoomDelResp = null;\n  try { zoomDelResp = $('Delete Zoom Meeting').first()?.json; } catch (e) {}\n  const zoomError = zoomDelResp?.error?.message || zoomDelResp?.error || null;\n  const isZoomDeleted = !zoomError && (zoomDelResp?.success !== false);\n\n  if (isZoomDeleted) {\n    components.zoom = {\n      state: 'verified',\n      id: norm.zoomMeetingId\n    };\n  } else {\n    allVerified = false;\n    components.zoom = {\n      state: 'failed',\n      id: norm.zoomMeetingId,\n      error: zoomError || 'Zoom meeting deletion failed'\n    };\n  }\n}\n\nif (needCalendar) {\n  let getResp = null;\n  try { getResp = $('Verify Event Absence in Calendar').first()?.json; } catch (e) {}\n  const statusCode = Number(getResp?.statusCode || (getResp?.status === 404 || getResp?.status === 410 ? getResp.status : 0));\n  const body = getResp?.body || getResp || {};\n  const isAbsent = statusCode === 404 || statusCode === 410 || body.status === 'cancelled' || body.error?.code === 404 || body.error?.code === 410;\n\n  if (isAbsent) {\n    components.calendar = {\n      state: 'verified',\n      id: norm.calendarEventId\n    };\n  } else {\n    allVerified = false;\n    components.calendar = {\n      state: statusCode === 200 ? 'uncertain' : 'failed',\n      id: norm.calendarEventId,\n      error: `Calendar event still present (HTTP ${statusCode})`\n    };\n  }\n}\n\nconst verified = Boolean(allVerified && resources.length > 0);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'cancelled' : 'uncertain',\n    state: verified ? 'cancelada' : 'incierta',\n    resources,\n    components,\n    calendarEventId: norm.calendarEventId || null,\n    zoomMeetingId: norm.zoomMeetingId || null\n  }\n}];"
+        "jsCode": "const norm = $('Normalize Cancel').first().json;\nconst resources = norm.resources || [];\nconst needCalendar = resources.includes('calendar');\nconst needZoom = resources.includes('zoom');\n\nconst components = {};\nlet allVerified = true;\n\nif (needZoom) {\n  let zoomVerifyResp = null;\n  let zoomDelResp = null;\n  try { zoomDelResp = $('Delete Zoom Meeting').first()?.json; } catch (e) {}\n  try { zoomVerifyResp = $('Verify Zoom Absence').first()?.json; } catch (e) {}\n\n  const delError = zoomDelResp?.error?.message || zoomDelResp?.error || null;\n  const verifyData = zoomVerifyResp?.body || zoomVerifyResp;\n  const statusCode = Number(zoomVerifyResp?.statusCode || (zoomVerifyResp?.status === 404 || zoomVerifyResp?.status === 410 ? zoomVerifyResp.status : 0));\n  const verifyError = zoomVerifyResp?.error?.message || zoomVerifyResp?.error || null;\n\n  // Zoom absence is verified ONLY if GET returned real 404 / 410 or Zoom error code 3001 (not found)\n  // Real response != null required; null/auth error/500/empty NEVER verified\n  const isAbsent = Boolean(\n    zoomVerifyResp &&\n    Boolean(verifyError) === false &&\n    (\n      statusCode === 404 ||\n      statusCode === 410 ||\n      verifyData?.code === 3001 ||\n      verifyData?.error?.code === 404 ||\n      verifyData?.error?.code === 410 ||\n      (typeof verifyData?.message === 'string' && verifyData.message.toLowerCase().includes('not found'))\n    )\n  );\n\n  if (isAbsent) {\n    components.zoom = {\n      state: 'verified',\n      id: norm.zoomMeetingId\n    };\n  } else {\n    allVerified = false;\n    const stillPresent = (statusCode === 200);\n    components.zoom = {\n      state: stillPresent ? 'uncertain' : 'failed',\n      id: norm.zoomMeetingId,\n      error: stillPresent\n        ? 'Zoom meeting still present (HTTP 200)'\n        : (verifyError || delError || (statusCode ? `Zoom verification returned HTTP ${statusCode}` : 'READBACK_FAILED: Zoom meeting absence was not verified by readback'))\n    };\n  }\n}\n\nif (needCalendar) {\n  let getResp = null;\n  let delResp = null;\n  try { delResp = $('Delete Calendar Event').first()?.json; } catch (e) {}\n  try { getResp = $('Verify Event Absence in Calendar').first()?.json; } catch (e) {}\n\n  const delError = delResp?.error?.message || delResp?.error || null;\n  const statusCode = Number(getResp?.statusCode || (getResp?.status === 404 || getResp?.status === 410 ? getResp.status : 0));\n  const body = getResp?.body || getResp;\n  const getError = getResp?.error?.message || getResp?.error || null;\n\n  // Calendar absence is verified ONLY if GET returned real 404 / 410 or status 'cancelled'\n  // Real response != null required; null/error NEVER verified\n  const isAbsent = Boolean(\n    getResp &&\n    Boolean(getError) === false &&\n    (\n      statusCode === 404 ||\n      statusCode === 410 ||\n      body?.status === 'cancelled' ||\n      body?.error?.code === 404 ||\n      body?.error?.code === 410\n    )\n  );\n\n  if (isAbsent) {\n    components.calendar = {\n      state: 'verified',\n      id: norm.calendarEventId\n    };\n  } else {\n    allVerified = false;\n    const stillPresent = (statusCode === 200 && body?.status !== 'cancelled');\n    components.calendar = {\n      state: stillPresent ? 'uncertain' : 'failed',\n      id: norm.calendarEventId,\n      error: stillPresent\n        ? 'Calendar event still present (HTTP 200)'\n        : (getError || delError || (statusCode ? `Calendar verification returned HTTP ${statusCode}` : 'READBACK_FAILED: Google Calendar event absence was not verified by readback'))\n    };\n  }\n}\n\nconst verified = Boolean(allVerified && resources.length > 0);\n\nreturn [{\n  json: {\n    ok: verified,\n    verified,\n    status: verified ? 'cancelled' : 'uncertain',\n    state: verified ? 'cancelada' : 'incierta',\n    resources,\n    components,\n    calendarEventId: norm.calendarEventId || null,\n    zoomMeetingId: norm.zoomMeetingId || null\n  }\n}];"
       },
       "id": "Build Cancel Response",
       "name": "Build Cancel Response",
@@ -251,6 +285,17 @@
       ]
     },
     "Delete Zoom Meeting": {
+      "main": [
+        [
+          {
+            "node": "Verify Zoom Absence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Zoom Absence": {
       "main": [
         [
           {

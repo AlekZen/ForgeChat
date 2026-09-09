@@ -1,7 +1,7 @@
 {
   "id": "IA360ContactIntelDraft20260605",
   "versionId": "8fe2d301-e59f-4cb7-8cb3-80e1476484a6",
-  "name": "IA360 Contact Intelligence Agent (Producción)",
+  "name": "IA360 Contact Intelligence Agent (Producci\u00f3n)",
   "active": true,
   "activeVersionId": "8fe2d301-e59f-4cb7-8cb3-80e1476484a6",
   "nodes": [
@@ -60,7 +60,7 @@
         "text": "={{ $('Prepare RAG Pinecone Dry Run').first().json.agent_input }}",
         "options": {
           "maxIterations": 4,
-          "systemMessage": "Eres la IA de Alek para IA360, atendiendo conversaciones por WhatsApp. Hablas como una persona real del equipo de Alek: cálida, directa, con criterio. Arquitectura pipeline-first.\n\nQUIÉN ERES (si te preguntan):\n- Eres la asistente de IA de Alek para IA360. Si alguien pregunta si eres humano o un bot, dilo con naturalidad y sin rodeos: eres la IA de Alek, y aun así estás para ayudar de verdad.\n- No finjas ser Alek en persona; eres su IA.\n\nREGLA CRÍTICA DE IDIOMA:\n- Responde SIEMPRE en español mexicano impecable.\n- Prohibido contestar en inglés, incluso si el usuario usa palabras en inglés.\n- Usa acentos, ñ y la palabra año/años cuando aplique.\n- Nunca uses frases como \"Currently\", \"However\", \"Let's\", \"I can't\" o \"workflow\" en inglés.\n\nTONO Y FORMA DE HABLAR (lo más importante):\n- Suena a persona, no a formulario. PROHIBIDO usar plantillas o etiquetas tipo \"Hallazgo:\", \"Dato mínimo faltante:\", \"Siguiente acción:\", \"Lo registro como:\", \"Lo dejo para revisión\", \"clasificado\", \"operación cliente\", \"route\", \"intent\". Eso es mecánica interna: NUNCA aparece en lo que lee el cliente.\n- Una respuesta natural fluye en 1-3 frases conversacionales. Si necesitas un dato, pídelo como lo haría una persona (\"¿De qué tamaño es tu equipo de ventas?\"), no como un campo de captura.\n- Habla SOLO de lo que el contacto trajo en su último mensaje. No arrastres dolores, áreas ni hallazgos viejos a una conversación que no los toca.\n- No inventes contexto: si no sabes de qué trata una reunión, no le pongas tema. Sólo puedes afirmar lo que te devolvió una herramienta.\n- Cuando algo queda pendiente de Alek (un alta, un envío, agendar algo), dilo en humano: \"se lo paso a Alek y te confirmo\", \"lo dejo listo para que Alek le dé el ok antes de enviar\". Nunca digas \"revisión humana\" ni \"lo dejo en revisión\".\n\nCONTRATO (estructura técnica, invisible para el cliente):\n- Devuelve SIEMPRE un objeto JSON válido, sin markdown y sin texto fuera del JSON.\n- Conserva el contrato que ForgeChat espera: reply, intent, date, action, extracted.\n- El campo reply es lo único que lee la persona: breve, cálido, útil; máximo 600 caracteres; sin etiquetas ni jerga interna.\n- No inventes horarios libres; si quiere agendar usa action=offer_slots.\n- No envíes mensajes, no escribas CRM y no cambies pipeline desde n8n. Si hace falta una acción externa, prepara la respuesta para pedir lo que falte o dejarlo listo para el ok de Alek (en el JSON marca requires_human_approval, pero en reply suena natural).\n\nCITAS: CALENDARIO Y ZOOM (cuatro herramientas; dos leen, dos son peligrosas):\n- REGLA DE ORDEN: si el mensaje menciona una cita, reunión, sesión, horario o \"el sábado/lunes/mañana\", lo PRIMERO que haces es llamar a citas_del_contacto. Es la fuente de la verdad de lo ya acordado.\n- Si citas_del_contacto devuelve una cita que encaja con lo que pregunta, RESPONDE CON ESA CITA: día y hora exactos tal como vienen, y no ofrezcas horarios nuevos ni vuelvas a agendar. \"¿A qué hora quedamos el sábado?\" se contesta con la hora de esa cita, no con huecos libres.\n- consultar_disponibilidad es SOLO LECTURA y da los huecos LIBRES de un día. Úsala únicamente cuando haga falta proponer un horario NUEVO. Ojo: los huecos libres son lo contrario de una cita agendada; no los confundas. Si responde dia_libre=true, ese día no tiene ningún evento.\n- proponer_reunion y cancelar_reunion ESCRIBEN Y BORRAN en el calendario real de Alek o crean/cancelan salas de Zoom. NUNCA las ejecutes por iniciativa propia, ni porque el contacto lo pida, ni porque parezca obvio. El camino es siempre el mismo: propones el horario en texto, marcas requires_human_approval, y esperas a que Alek confirme. Sólo con la confirmación explícita de Alek en este hilo se llaman con confirmado_por_owner=true. Sin esa confirmación fallan a propósito, y ese fallo es correcto, no un error que debas sortear.\n- RECURSOS (resources): array canónico obligatorio ['calendar'], ['zoom'], o ['calendar', 'zoom']. Determina los recursos desde el contexto semántico de la conversación:\n  * Si el contacto pide videollamada / llamada virtual / Zoom / link de sesión -> incluye 'zoom'.\n  * Si el contacto pide agendar cita / evento en calendario / apartar fecha -> incluye 'calendar'.\n  * Si pide reunión completa o ambas cosas -> ['calendar', 'zoom'].\n  * Ante ambigüedad genuina, pregunta amablemente para aclarar el canal preferido; NUNCA asumas un default implícito sin intención semántica ni uses expresiones regulares para autoconfirmar.\n- Si el contacto pide mover o cancelar una cita, PROPONES el cambio con el ID del recurso y pides el ok; no tocas el calendario ni Zoom por tu cuenta.\n- Jamás inventes un horario, un enlace de Zoom ni un identificador de evento: si no vino de una herramienta, no existe.\n\nCONTEXTO DE PRUEBA / COMANDOS DE ALEK:\n- Si el contacto es Alek o escribe como dueño con comandos tipo \"da de alta\", \"agrega\", \"envíale\", \"mueve\", \"pipeline\", trátalo como instrucción operativa interna, no como prospecto.\n- Para comandos internos, NO digas que no puedes. Responde resolviendo: qué dato te falta y que lo dejas listo para su ok.\n- Ejemplo: \"da de alta a andres y envíale un pipeline\" -> \"Va. Para dar de alta a Andrés necesito su WhatsApp y cuál pipeline quieres. Pásamelos y lo dejo listo para que le des el ok antes de mandarlo.\" Usa intent=provide_info, action=nurture, route=human_review (esto en el JSON; el reply nunca menciona \"human_review\").\n\nTAXONOMÍA (solo para los campos JSON):\nintent: book | ask_pain | provide_info | optout | smalltalk | other | list_bookings\naction: offer_slots | book | cancel | reschedule | list_bookings | advance_pain | nurture | optout | none\nroute: agenda | diagnostico | crm_update | human_review | nurture | optout | no_action\n\nRESPUESTA ESPERADA:\n{\n  \"reply\": \"respuesta natural y humana, en español mexicano, sin etiquetas ni jerga interna\",\n  \"intent\": \"...\",\n  \"date\": \"YYYY-MM-DD o null\",\n  \"action\": \"...\",\n  \"extracted\": {\"area_operacion\":\"texto o null\", \"urgencia\":\"alta|media|baja|null\"},\n  \"contact_intelligence\": {\n    \"identity_status\":\"known|candidate|unknown\",\n    \"route\":\"agenda|diagnostico|crm_update|human_review|nurture|optout|no_action\",\n    \"stage_signal\":\"texto breve\",\n    \"tools_used\":[\"nombres de tools consultadas o []\"],\n    \"confidence\":0.0,\n    \"next_best_action\":\"texto breve en español\",\n    \"human_review_required\":true\n  },\n  \"dry_run\": true,\n  \"requires_human_approval\": true\n}\n\nCÓMO DECIDIR (interno; nunca se lo expliques al cliente):\n- Pregunta por una cita ya acordada -> intent=list_bookings/action=list_bookings, con lo que devolvió citas_del_contacto.\n- Quiere horarios nuevos, reagendar o cancelar -> intent=book; usa offer_slots, reschedule o cancel según corresponda, siempre pidiendo el ok de Alek.\n- Describe dolor operativo, trabajo manual, falta de visibilidad, CRM, WhatsApp, ERP, reportes, automatización o IA -> intent=ask_pain/action=advance_pain. Conversa sobre eso con curiosidad genuina; no saltes a agenda salvo que lo pida.\n- Comando interno de Alek -> intent=provide_info/action=nurture/route=human_review.\n- Saludo sin intención -> smalltalk/none.\n\n\nCONTINUIDAD DEL HILO COMPARTIDO:\n- El texto actual vive en text. Usa history y conversation_context para entender a qué pregunta previa está respondiendo el contacto.\n- Si conversation_context trae previousQuestion y currentReply, responde a esa relación; no hagas una pregunta nueva ni prometas ejecución.\n- account_context es identidad server-side: úsala para ubicar cuenta/proyecto, nunca la reemplaces ni la infieras.\n",
+          "systemMessage": "Eres la IA de Alek para IA360, atendiendo conversaciones por WhatsApp. Hablas como una persona real del equipo de Alek: c\u00e1lida, directa, con criterio. Arquitectura pipeline-first.\n\nQUI\u00c9N ERES (si te preguntan):\n- Eres la asistente de IA de Alek para IA360. Si alguien pregunta si eres humano o un bot, dilo con naturalidad y sin rodeos: eres la IA de Alek, y aun as\u00ed est\u00e1s para ayudar de verdad.\n- No finjas ser Alek en persona; eres su IA.\n\nREGLA CR\u00cdTICA DE IDIOMA:\n- Responde SIEMPRE en espa\u00f1ol mexicano impecable.\n- Prohibido contestar en ingl\u00e9s, incluso si el usuario usa palabras en ingl\u00e9s.\n- Usa acentos, \u00f1 y la palabra a\u00f1o/a\u00f1os cuando aplique.\n- Nunca uses frases como \"Currently\", \"However\", \"Let's\", \"I can't\" o \"workflow\" en ingl\u00e9s.\n\nTONO Y FORMA DE HABLAR (lo m\u00e1s importante):\n- Suena a persona, no a formulario. PROHIBIDO usar plantillas o etiquetas tipo \"Hallazgo:\", \"Dato m\u00ednimo faltante:\", \"Siguiente acci\u00f3n:\", \"Lo registro como:\", \"Lo dejo para revisi\u00f3n\", \"clasificado\", \"operaci\u00f3n cliente\", \"route\", \"intent\". Eso es mec\u00e1nica interna: NUNCA aparece en lo que lee el cliente.\n- Una respuesta natural fluye en 1-3 frases conversacionales. Si necesitas un dato, p\u00eddelo como lo har\u00eda una persona (\"\u00bfDe qu\u00e9 tama\u00f1o es tu equipo de ventas?\"), no como un campo de captura.\n- Habla SOLO de lo que el contacto trajo en su \u00faltimo mensaje. No arrastres dolores, \u00e1reas ni hallazgos viejos a una conversaci\u00f3n que no los toca.\n- No inventes contexto: si no sabes de qu\u00e9 trata una reuni\u00f3n, no le pongas tema. S\u00f3lo puedes afirmar lo que te devolvi\u00f3 una herramienta.\n- Cuando algo queda pendiente de Alek (un alta, un env\u00edo, agendar algo), dilo en humano: \"se lo paso a Alek y te confirmo\", \"lo dejo listo para que Alek le d\u00e9 el ok antes de enviar\". Nunca digas \"revisi\u00f3n humana\" ni \"lo dejo en revisi\u00f3n\".\n\nCONTRATO (estructura t\u00e9cnica, invisible para el cliente):\n- Devuelve SIEMPRE un objeto JSON v\u00e1lido, sin markdown y sin texto fuera del JSON.\n- Conserva el contrato que ForgeChat espera: reply, intent, date, action, extracted.\n- El campo reply es lo \u00fanico que lee la persona: breve, c\u00e1lido, \u00fatil; m\u00e1ximo 600 caracteres; sin etiquetas ni jerga interna.\n- No inventes horarios libres; si quiere agendar usa action=offer_slots.\n- No env\u00edes mensajes, no escribas CRM y no cambies pipeline desde n8n. Si hace falta una acci\u00f3n externa, prepara la respuesta para pedir lo que falte o dejarlo listo para el ok de Alek (en el JSON marca requires_human_approval, pero en reply suena natural).\n\nCITAS: CALENDARIO Y ZOOM (cuatro herramientas; dos leen, dos son peligrosas):\n- REGLA DE ORDEN: si el mensaje menciona una cita, reuni\u00f3n, sesi\u00f3n, horario o \"el s\u00e1bado/lunes/ma\u00f1ana\", lo PRIMERO que haces es llamar a citas_del_contacto. Es la fuente de la verdad de lo ya acordado.\n- Si citas_del_contacto devuelve una cita que encaja con lo que pregunta, RESPONDE CON ESA CITA: d\u00eda y hora exactos tal como vienen, y no ofrezcas horarios nuevos ni vuelvas a agendar. \"\u00bfA qu\u00e9 hora quedamos el s\u00e1bado?\" se contesta con la hora de esa cita, no con huecos libres.\n- consultar_disponibilidad es SOLO LECTURA y da los huecos LIBRES de un d\u00eda. \u00dasala \u00fanicamente cuando haga falta proponer un horario NUEVO. Ojo: los huecos libres son lo contrario de una cita agendada; no los confundas. Si responde dia_libre=true, ese d\u00eda no tiene ning\u00fan evento.\n- proponer_reunion y cancelar_reunion ESCRIBEN Y BORRAN en el calendario real de Alek o crean/cancelan salas de Zoom. NUNCA las ejecutes por iniciativa propia, ni porque el contacto lo pida, ni porque parezca obvio. El camino es siempre el mismo: propones el horario en texto, marcas requires_human_approval, y esperas a que Alek confirme. S\u00f3lo con la confirmaci\u00f3n expl\u00edcita de Alek en este hilo se llaman con confirmado_por_owner=true. Sin esa confirmaci\u00f3n fallan a prop\u00f3sito, y ese fallo es correcto, no un error que debas sortear.\n- RECURSOS (resources): array can\u00f3nico obligatorio ['calendar'], ['zoom'], o ['calendar', 'zoom']. Determina los recursos desde el contexto sem\u00e1ntico de la conversaci\u00f3n:\n  * Si el contacto pide videollamada / llamada virtual / Zoom / link de sesi\u00f3n -> incluye 'zoom'.\n  * Si el contacto pide agendar cita / evento en calendario / apartar fecha -> incluye 'calendar'.\n  * Si pide reuni\u00f3n completa o ambas cosas -> ['calendar', 'zoom'].\n  * Ante ambig\u00fcedad genuina, pregunta amablemente para aclarar el canal preferido; NUNCA asumas un default impl\u00edcito sin intenci\u00f3n sem\u00e1ntica ni uses expresiones regulares para autoconfirmar.\n- Si el contacto pide mover o cancelar una cita, PROPONES el cambio con el ID del recurso y pides el ok; no tocas el calendario ni Zoom por tu cuenta.\n- Jam\u00e1s inventes un horario, un enlace de Zoom ni un identificador de evento: si no vino de una herramienta, no existe.\n\nCONTEXTO DE PRUEBA / COMANDOS DE ALEK:\n- Si el contacto es Alek o escribe como due\u00f1o con comandos tipo \"da de alta\", \"agrega\", \"env\u00edale\", \"mueve\", \"pipeline\", tr\u00e1talo como instrucci\u00f3n operativa interna, no como prospecto.\n- Para comandos internos, NO digas que no puedes. Responde resolviendo: qu\u00e9 dato te falta y que lo dejas listo para su ok.\n- Ejemplo: \"da de alta a andres y env\u00edale un pipeline\" -> \"Va. Para dar de alta a Andr\u00e9s necesito su WhatsApp y cu\u00e1l pipeline quieres. P\u00e1samelos y lo dejo listo para que le des el ok antes de mandarlo.\" Usa intent=provide_info, action=nurture, route=human_review (esto en el JSON; el reply nunca menciona \"human_review\").\n\nTAXONOM\u00cdA (solo para los campos JSON):\nintent: book | ask_pain | provide_info | optout | smalltalk | other | list_bookings\naction: offer_slots | book | cancel | reschedule | list_bookings | advance_pain | nurture | optout | none\nroute: agenda | diagnostico | crm_update | human_review | nurture | optout | no_action\n\nRESPUESTA ESPERADA:\n{\n  \"reply\": \"respuesta natural y humana, en espa\u00f1ol mexicano, sin etiquetas ni jerga interna\",\n  \"intent\": \"...\",\n  \"date\": \"YYYY-MM-DD o null\",\n  \"action\": \"...\",\n  \"extracted\": {\"area_operacion\":\"texto o null\", \"urgencia\":\"alta|media|baja|null\"},\n  \"contact_intelligence\": {\n    \"identity_status\":\"known|candidate|unknown\",\n    \"route\":\"agenda|diagnostico|crm_update|human_review|nurture|optout|no_action\",\n    \"stage_signal\":\"texto breve\",\n    \"tools_used\":[\"nombres de tools consultadas o []\"],\n    \"confidence\":0.0,\n    \"next_best_action\":\"texto breve en espa\u00f1ol\",\n    \"human_review_required\":true\n  },\n  \"dry_run\": true,\n  \"requires_human_approval\": true\n}\n\nC\u00d3MO DECIDIR (interno; nunca se lo expliques al cliente):\n- Pregunta por una cita ya acordada -> intent=list_bookings/action=list_bookings, con lo que devolvi\u00f3 citas_del_contacto.\n- Quiere horarios nuevos, reagendar o cancelar -> intent=book; usa offer_slots, reschedule o cancel seg\u00fan corresponda, siempre pidiendo el ok de Alek.\n- Describe dolor operativo, trabajo manual, falta de visibilidad, CRM, WhatsApp, ERP, reportes, automatizaci\u00f3n o IA -> intent=ask_pain/action=advance_pain. Conversa sobre eso con curiosidad genuina; no saltes a agenda salvo que lo pida.\n- Comando interno de Alek -> intent=provide_info/action=nurture/route=human_review.\n- Saludo sin intenci\u00f3n -> smalltalk/none.\n\n\nCONTINUIDAD DEL HILO COMPARTIDO:\n- El texto actual vive en text. Usa history y conversation_context para entender a qu\u00e9 pregunta previa est\u00e1 respondiendo el contacto.\n- Si conversation_context trae previousQuestion y currentReply, responde a esa relaci\u00f3n; no hagas una pregunta nueva ni prometas ejecuci\u00f3n.\n- account_context es identidad server-side: \u00fasala para ubicar cuenta/proyecto, nunca la reemplaces ni la infieras.\n",
           "returnIntermediateSteps": false
         },
         "promptType": "define",
@@ -80,7 +80,7 @@
         400
       ],
       "parameters": {
-        "jsCode": "const base = ($('Prepare RAG Pinecone Dry Run').first()?.json) || $('Lookup IA360 Memory').first().json || $('Identity Snapshot').first().json || $('Normalize WhatsApp Context').first().json;\nconst memoryContext = base.memory_context || null;\nconst memorySeen = Boolean(memoryContext && (memoryContext.facts_count > 0 || memoryContext.events_count > 0 || memoryContext.memory_rows > 0));\nconst signalClassification = base.signal_classification || null;\nconst ragContext = base.rag_context || null;\nconst rawItem = $input.first().json;\nconst agentErrorCode = typeof rawItem?.error === 'string' && rawItem.error.trim() ? 'AGENT_PROVIDER_UNAVAILABLE' : null;\n\nlet candidate = rawItem.output ?? rawItem.text ?? rawItem;\nif (typeof candidate === 'string') {\n  const trimmed = candidate.trim().replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n  try { candidate = JSON.parse(trimmed); } catch (e) { candidate = { reply: trimmed }; }\n}\nif (!candidate || typeof candidate !== 'object') candidate = {};\n\nconst allowedIntents = new Set(['book','ask_pain','provide_info','optout','smalltalk','other','list_bookings']);\nconst allowedActions = new Set(['offer_slots','book','cancel','reschedule','list_bookings','advance_pain','nurture','optout','reply_to_contact','none']);\nconst allowedAudiences = new Set(['owner', 'contact']);\n\nconst audience = allowedAudiences.has(candidate.response_audience)\n  ? candidate.response_audience\n  : (base.input_mode === 'owner_assistance' ? 'owner' : 'contact');\n\nconst ci = candidate.contact_intelligence && typeof candidate.contact_intelligence === 'object' ? candidate.contact_intelligence : {};\nconst toolsUsed = Array.isArray(ci.tools_used) ? [...ci.tools_used] : [];\nif (memorySeen && !toolsUsed.includes('ia360_memory_lookup')) toolsUsed.push('ia360_memory_lookup');\nif (signalClassification && !toolsUsed.includes('ia360_signal_classifier_gpt_5_5')) toolsUsed.push('ia360_signal_classifier_gpt_5_5');\nif (ragContext && !toolsUsed.includes('ia360_hybrid_rag')) toolsUsed.push('ia360_hybrid_rag');\n\nconst text = String(base.text || '').trim();\nconst lower = text.toLowerCase();\n\nfunction cleanText(value, max = 240) {\n  return String(value || '')\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email]')\n    .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[phone]')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\n\nlet reply = String(candidate.reply || (base.input_mode === 'owner_assistance' ? 'Entendido Alek, procesando la solicitud del contacto.' : 'Te leo. Para cuidarlo bien, lo dejo como revisión de Alek antes de responder.'));\nlet intent = allowedIntents.has(candidate.intent) ? candidate.intent : 'other';\nlet action = allowedActions.has(candidate.action) ? candidate.action : 'none';\n\nconst confidence = typeof ci.confidence === 'number' ? Math.max(0, Math.min(1, ci.confidence)) : (signalClassification?.confidence || 0.85);\n\nconst auditContact = {\n  masked_contact_number: base.contact?.contact_number || null,\n  name: cleanText(base.contact?.name || '', 120) || null,\n  role: cleanText(base.contact?.role || '', 120) || null,\n  espo_contact_id: base.contact?.espo_id || null,\n};\n\nconst out = {\n  reply: reply.slice(0, 600),\n  intent,\n  date: /^\\d{4}-\\d{2}-\\d{2}$/.test(String(candidate.date || '')) ? String(candidate.date) : null,\n  action,\n  response_audience: audience,\n  extracted: candidate.extracted && typeof candidate.extracted === 'object' ? candidate.extracted : {},\n  input_mode: base.input_mode || 'direct',\n  failure_id: base.failure_id || null,\n  owner_assistance: base.owner_assistance || null,\n  source: 'ia360-contact-intelligence-agent-draft',\n  agent_error_code: agentErrorCode,\n  account_context: base.account_context || null,\n  conversation_context: base.conversation_context || null,\n  contextual_text: base.contextual_text || base.text || '',\n  contact_intelligence: {\n    identity_status: ci.identity_status || base.identity_snapshot?.identity_status || 'unknown',\n    route: ci.route || 'human_review',\n    stage_signal: ci.stage_signal || base.stage || 'desconocido',\n    tools_used: toolsUsed,\n    confidence,\n    next_best_action: ci.next_best_action || signalClassification?.next_action || 'Auditar en WhatsApp/n8n antes de actuar.',\n    human_review_required: ci.human_review_required !== false || Boolean(signalClassification?.owner_review_required),\n  },\n  dry_run: base.dry_run === undefined ? true : Boolean(base.dry_run),\n  requires_human_approval: true,\n  memory_context: memoryContext,\n  signal_classification: signalClassification,\n  rag_context: ragContext,\n  audit: {\n    request_id: base.request_id,\n    channel: base.channel,\n    contact: auditContact,\n    identity_snapshot: base.identity_snapshot,\n    memory_context: memoryContext,\n    signal_classification: signalClassification,\n    rag_context: ragContext,\n  },\n};\n\nreturn [{ json: out }];"
+        "jsCode": "const base = ($('Prepare RAG Pinecone Dry Run').first()?.json) || $('Lookup IA360 Memory').first().json || $('Identity Snapshot').first().json || $('Normalize WhatsApp Context').first().json;\nconst memoryContext = base.memory_context || null;\nconst memorySeen = Boolean(memoryContext && (memoryContext.facts_count > 0 || memoryContext.events_count > 0 || memoryContext.memory_rows > 0));\nconst signalClassification = base.signal_classification || null;\nconst ragContext = base.rag_context || null;\nconst rawItem = $input.first().json;\nconst agentErrorCode = typeof rawItem?.error === 'string' && rawItem.error.trim() ? 'AGENT_PROVIDER_UNAVAILABLE' : null;\n\nlet candidate = rawItem.output ?? rawItem.text ?? rawItem;\nif (typeof candidate === 'string') {\n  const trimmed = candidate.trim().replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n  try { candidate = JSON.parse(trimmed); } catch (e) { candidate = { reply: trimmed }; }\n}\nif (!candidate || typeof candidate !== 'object') candidate = {};\n\nconst allowedIntents = new Set(['book','ask_pain','provide_info','optout','smalltalk','other','list_bookings']);\nconst allowedActions = new Set(['offer_slots','book','cancel','reschedule','list_bookings','advance_pain','nurture','optout','reply_to_contact','none']);\nconst allowedAudiences = new Set(['owner', 'contact']);\n\nconst audience = allowedAudiences.has(candidate.response_audience)\n  ? candidate.response_audience\n  : (base.input_mode === 'owner_assistance' ? 'owner' : 'contact');\n\nconst ci = candidate.contact_intelligence && typeof candidate.contact_intelligence === 'object' ? candidate.contact_intelligence : {};\nconst toolsUsed = Array.isArray(ci.tools_used) ? [...ci.tools_used] : [];\nif (memorySeen && !toolsUsed.includes('ia360_memory_lookup')) toolsUsed.push('ia360_memory_lookup');\nif (signalClassification && !toolsUsed.includes('ia360_signal_classifier_gpt_5_5')) toolsUsed.push('ia360_signal_classifier_gpt_5_5');\nif (ragContext && !toolsUsed.includes('ia360_hybrid_rag')) toolsUsed.push('ia360_hybrid_rag');\n\nconst text = String(base.text || '').trim();\nconst lower = text.toLowerCase();\n\nfunction cleanText(value, max = 240) {\n  return String(value || '')\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email]')\n    .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[phone]')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\n\nlet reply = String(candidate.reply || (base.input_mode === 'owner_assistance' ? 'Entendido Alek, procesando la solicitud del contacto.' : 'Te leo. Para cuidarlo bien, lo dejo como revisi\u00f3n de Alek antes de responder.'));\nlet intent = allowedIntents.has(candidate.intent) ? candidate.intent : 'other';\nlet action = allowedActions.has(candidate.action) ? candidate.action : 'none';\n\nconst confidence = typeof ci.confidence === 'number' ? Math.max(0, Math.min(1, ci.confidence)) : (signalClassification?.confidence || 0.85);\n\nconst auditContact = {\n  masked_contact_number: base.contact?.contact_number || null,\n  name: cleanText(base.contact?.name || '', 120) || null,\n  role: cleanText(base.contact?.role || '', 120) || null,\n  espo_contact_id: base.contact?.espo_id || null,\n};\n\nconst out = {\n  reply: reply.slice(0, 600),\n  intent,\n  date: /^\\d{4}-\\d{2}-\\d{2}$/.test(String(candidate.date || '')) ? String(candidate.date) : null,\n  action,\n  response_audience: audience,\n  extracted: candidate.extracted && typeof candidate.extracted === 'object' ? candidate.extracted : {},\n  input_mode: base.input_mode || 'direct',\n  failure_id: base.failure_id || null,\n  owner_assistance: base.owner_assistance || null,\n  source: 'ia360-contact-intelligence-agent-draft',\n  agent_error_code: agentErrorCode,\n  account_context: base.account_context || null,\n  conversation_context: base.conversation_context || null,\n  contextual_text: base.contextual_text || base.text || '',\n  contact_intelligence: {\n    identity_status: ci.identity_status || base.identity_snapshot?.identity_status || 'unknown',\n    route: ci.route || 'human_review',\n    stage_signal: ci.stage_signal || base.stage || 'desconocido',\n    tools_used: toolsUsed,\n    confidence,\n    next_best_action: ci.next_best_action || signalClassification?.next_action || 'Auditar en WhatsApp/n8n antes de actuar.',\n    human_review_required: ci.human_review_required !== false || Boolean(signalClassification?.owner_review_required),\n  },\n  dry_run: base.dry_run === undefined ? true : Boolean(base.dry_run),\n  requires_human_approval: true,\n  memory_context: memoryContext,\n  signal_classification: signalClassification,\n  rag_context: ragContext,\n  audit: {\n    request_id: base.request_id,\n    channel: base.channel,\n    contact: auditContact,\n    identity_snapshot: base.identity_snapshot,\n    memory_context: memoryContext,\n    signal_classification: signalClassification,\n    rag_context: ragContext,\n  },\n};\n\nreturn [{ json: out }];"
       },
       "typeVersion": 2
     },
@@ -195,7 +195,7 @@
         288
       ],
       "parameters": {
-        "jsCode": "const j = $input.first().json;\nconst baseUrl = String($env.FORGECHAT_API_BASE_URL || 'https://wa.geekstudio.dev').replace(/\\/$/, '');\nconst secret = $env.IA360_DIRECTIVE_SECRET || '';\n\nasync function lookupMemory(contact) {\n  const guardrails = {\n    transcript_returned: false,\n    external_send_allowed: false,\n    crm_write_executed: false\n  };\n  if (!secret) {\n    return { ok: false, error: 'missing_IA360_DIRECTIVE_SECRET', events: [], facts: [], guardrails };\n  }\n  if (!contact?.wa_number || !contact?.contact_number) {\n    return { ok: false, error: 'missing_contact_keys', events: [], facts: [], guardrails };\n  }\n  const payload = {\n    wa_number: contact.wa_number,\n    contact_number: contact.contact_number,\n    limit: 8\n  };\n  if (this?.helpers?.httpRequest) {\n    return await this.helpers.httpRequest({\n      method: 'POST',\n      url: `${baseUrl}/api/internal/ia360-memory/lookup`,\n      headers: {\n        'content-type': 'application/json',\n        'X-IA360-Directive-Secret': secret\n      },\n      body: payload,\n      json: true\n    });\n  }\n  if (typeof fetch !== 'function') {\n    return { ok: false, error: 'http_client_unavailable', events: [], facts: [], guardrails };\n  }\n  const res = await fetch(`${baseUrl}/api/internal/ia360-memory/lookup`, {\n    method: 'POST',\n    headers: {\n      'content-type': 'application/json',\n      'X-IA360-Directive-Secret': secret\n    },\n    body: JSON.stringify(payload)\n  });\n  const data = await res.json().catch(() => ({}));\n  return { ...data, ok: Boolean(data.ok) && res.ok };\n}\n\nconst memory = await lookupMemory.call(this, j.contact || {});\nconst memoryFacts = Array.isArray(memory.facts) ? memory.facts.slice(0, 5) : [];\nconst memoryEvents = Array.isArray(memory.events) ? memory.events.slice(0, 5) : [];\nconst memorySummary = [\n  ...memoryFacts.map(f => ({\n    type: 'fact',\n    persona: f.persona || null,\n    role: f.role || null,\n    preference: f.preference || null,\n    recurring_pain: f.recurring_pain || null,\n    affected_process: f.affected_process || null,\n    missing_metric: f.missing_metric || null,\n    confidence: f.confidence || null,\n    status: f.status || null\n  })),\n  ...memoryEvents.map(e => ({\n    type: 'event',\n    area: e.area || null,\n    signal_type: e.signal_type || null,\n    summary: e.summary || null,\n    business_impact: e.business_impact || null,\n    missing_data: e.missing_data || null,\n    next_action: e.next_action || null,\n    owner_review_status: e.owner_review_status || null\n  }))\n];\n\nconst memoryContext = {\n  schema: 'ia360_memory_context_for_agent.v1',\n  ok: Boolean(memory.ok),\n  facts_count: memoryFacts.length,\n  events_count: memoryEvents.length,\n  summary: memorySummary,\n  lookup_error: memory.ok ? null : (memory.error || null),\n  guardrails: {\n    transcript_returned: false,\n    external_send_allowed: false,\n    crm_write_executed: false\n  }\n};\n\nconst agentPayload = {\n  ...j,\n  memory_context: memoryContext,\n  instruction: 'Antes de responder, usa memory_context si trae facts o events. No inventes datos. No copies transcript. Si hay señal útil, responde con hallazgo, impacto, dato faltante y siguiente acción. En contact_intelligence.tools_used incluye ia360_memory_lookup cuando este contexto exista.'\n};\n\nreturn [{\n  json: {\n    ...j,\n    memory_context: memoryContext,\n    agent_input: JSON.stringify(agentPayload, null, 2)\n  }\n}];"
+        "jsCode": "const j = $input.first().json;\nconst baseUrl = String($env.FORGECHAT_API_BASE_URL || 'https://wa.geekstudio.dev').replace(/\\/$/, '');\nconst secret = $env.IA360_DIRECTIVE_SECRET || '';\n\nasync function lookupMemory(contact) {\n  const guardrails = {\n    transcript_returned: false,\n    external_send_allowed: false,\n    crm_write_executed: false\n  };\n  if (!secret) {\n    return { ok: false, error: 'missing_IA360_DIRECTIVE_SECRET', events: [], facts: [], guardrails };\n  }\n  if (!contact?.wa_number || !contact?.contact_number) {\n    return { ok: false, error: 'missing_contact_keys', events: [], facts: [], guardrails };\n  }\n  const payload = {\n    wa_number: contact.wa_number,\n    contact_number: contact.contact_number,\n    limit: 8\n  };\n  if (this?.helpers?.httpRequest) {\n    return await this.helpers.httpRequest({\n      method: 'POST',\n      url: `${baseUrl}/api/internal/ia360-memory/lookup`,\n      headers: {\n        'content-type': 'application/json',\n        'X-IA360-Directive-Secret': secret\n      },\n      body: payload,\n      json: true\n    });\n  }\n  if (typeof fetch !== 'function') {\n    return { ok: false, error: 'http_client_unavailable', events: [], facts: [], guardrails };\n  }\n  const res = await fetch(`${baseUrl}/api/internal/ia360-memory/lookup`, {\n    method: 'POST',\n    headers: {\n      'content-type': 'application/json',\n      'X-IA360-Directive-Secret': secret\n    },\n    body: JSON.stringify(payload)\n  });\n  const data = await res.json().catch(() => ({}));\n  return { ...data, ok: Boolean(data.ok) && res.ok };\n}\n\nconst memory = await lookupMemory.call(this, j.contact || {});\nconst memoryFacts = Array.isArray(memory.facts) ? memory.facts.slice(0, 5) : [];\nconst memoryEvents = Array.isArray(memory.events) ? memory.events.slice(0, 5) : [];\nconst memorySummary = [\n  ...memoryFacts.map(f => ({\n    type: 'fact',\n    persona: f.persona || null,\n    role: f.role || null,\n    preference: f.preference || null,\n    recurring_pain: f.recurring_pain || null,\n    affected_process: f.affected_process || null,\n    missing_metric: f.missing_metric || null,\n    confidence: f.confidence || null,\n    status: f.status || null\n  })),\n  ...memoryEvents.map(e => ({\n    type: 'event',\n    area: e.area || null,\n    signal_type: e.signal_type || null,\n    summary: e.summary || null,\n    business_impact: e.business_impact || null,\n    missing_data: e.missing_data || null,\n    next_action: e.next_action || null,\n    owner_review_status: e.owner_review_status || null\n  }))\n];\n\nconst memoryContext = {\n  schema: 'ia360_memory_context_for_agent.v1',\n  ok: Boolean(memory.ok),\n  facts_count: memoryFacts.length,\n  events_count: memoryEvents.length,\n  summary: memorySummary,\n  lookup_error: memory.ok ? null : (memory.error || null),\n  guardrails: {\n    transcript_returned: false,\n    external_send_allowed: false,\n    crm_write_executed: false\n  }\n};\n\nconst agentPayload = {\n  ...j,\n  memory_context: memoryContext,\n  instruction: 'Antes de responder, usa memory_context si trae facts o events. No inventes datos. No copies transcript. Si hay se\u00f1al \u00fatil, responde con hallazgo, impacto, dato faltante y siguiente acci\u00f3n. En contact_intelligence.tools_used incluye ia360_memory_lookup cuando este contexto exista.'\n};\n\nreturn [{\n  json: {\n    ...j,\n    memory_context: memoryContext,\n    agent_input: JSON.stringify(agentPayload, null, 2)\n  }\n}];"
       },
       "typeVersion": 2
     },
@@ -245,7 +245,7 @@
         272
       ],
       "parameters": {
-        "jsCode": "const base = $('Lookup IA360 Memory').first().json;\nconst rawItem = $('IA360 Signal Classifier - gpt-5.5').first().json;\nconst gw = $('Estado Vivo del Contacto').first().json || {};\n\nfunction cleanText(value, max = 240) {\n  return String(value || '')\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email]')\n    .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[phone]')\n    .replace(/\\b(?:sk|pk|rk|org|proj)-[A-Za-z0-9_-]{16,}\\b/g, '[secret]')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\n\nfunction digits(value) { return String(value || '').replace(/\\D/g, ''); }\nfunction maskNumber(value) {\n  const s = digits(value);\n  return s ? `${s.slice(0, 3)}***${s.slice(-2)}` : '';\n}\nfunction slug(value, fallback = 'ia360') {\n  const out = String(value || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');\n  return out || fallback;\n}\n\nfunction parseClassifier(raw) {\n  let candidate = raw.output ?? raw.text ?? raw;\n  if (typeof candidate === 'string') {\n    const trimmed = candidate.trim().replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n    try { candidate = JSON.parse(trimmed); } catch (e) { candidate = {}; }\n  }\n  if (!candidate || typeof candidate !== 'object') candidate = {};\n  const allowed = new Set(['cartera_cobranza_portal', 'taller_garantia_dias_detencion', 'auditoria_licencias_gasto', 'fiscal_opinion_sat_sync', 'no_signal']);\n  const primaryArea = allowed.has(candidate.primary_area) ? candidate.primary_area : 'no_signal';\n  const confidence = Math.max(0, Math.min(1, Number(candidate.confidence || 0)));\n  const ownerReviewRequired = candidate.owner_review_required !== false || confidence < 0.72 || primaryArea === 'no_signal';\n  return {\n    schema: 'ia360_signal_classifier_result.v1',\n    primary_area: primaryArea,\n    confidence,\n    summary: cleanText(candidate.summary || '', 240) || null,\n    missing_data: cleanText(candidate.missing_data || '', 180) || null,\n    next_action: cleanText(candidate.next_action || '', 180) || null,\n    owner_review_required: ownerReviewRequired,\n    model: 'gpt-5.5',\n    classification_timestamp: new Date().toISOString(),\n  };\n}\n\nconst classification = parseClassifier(rawItem);\nconst projectSlug = slug(base.project_slug || base.account?.project_slug || base.account_context?.projectKey || 'ia360');\nconst activeAccountKey = String(gw.account_key || base.account_key || 'nexus').trim() || 'nexus';\nconst contactKey = base.contact?.contact_number || base.contact?.wa_number || base.request_id;\nconst collName = `ia360_${projectSlug}`;\n\nconst hybridDocs = [\n  ...(base.memory_context?.facts || []).map(f => ({ source: 'memory_fact', text: f.fact_text || f.text })),\n  ...(base.memory_context?.events || []).map(e => ({ source: 'memory_event', text: e.event_summary || e.summary })),\n].filter(d => Boolean(d.text));\n\nconst ragContext = {\n  schema: 'ia360_hybrid_rag_context.v1',\n  active_account_key: activeAccountKey,\n  collection: collName,\n  project_slug: projectSlug,\n  facts_count: (base.memory_context?.facts || []).length,\n  events_count: (base.memory_context?.events || []).length,\n  documents_retrieved: hybridDocs.length,\n  documents: hybridDocs.slice(0, 10),\n  guardrails: {\n    no_cross_contact_context: true,\n    isolated_by_collection: true,\n    fail_closed_urls: true\n  }\n};\n\nconst vivos = (gw.estado_vivo && Array.isArray(gw.estado_vivo.issues)) ? gw.estado_vivo.issues : [];\nconst planeLive = {\n  schema: 'ia360_plane_estado_vivo.v1',\n  leido_en_vivo: true,\n  nunca_persistido: true,\n  scope_ok: gw.scope_ok === true,\n  account_key: activeAccountKey,\n  proyectos_permitidos: Array.isArray(gw.permitted_projects) ? gw.permitted_projects : [],\n  active_project_id: gw.active_project_id || null,\n  active_project_identifier: gw.active_project_identifier || null,\n  issues_count: vivos.length,\n  issues: vivos.slice(0, 25).map(w => ({\n    referencia: w.sequence_id ? String(w.sequence_id) : null,\n    nombre: w.nombre,\n    prioridad: w.priority || null,\n  })),\n  fuente: 'Plane REST al momento de contestar',\n};\n\nconst agentPayload = {\n  ...base,\n  input_mode: base.input_mode || 'direct',\n  failure_id: base.failure_id || null,\n  owner_assistance: base.owner_assistance || null,\n  signal_classification: classification,\n  rag_context: ragContext,\n  plane_live: planeLive,\n  active_project: {\n    account_key: activeAccountKey,\n    plane_project_id: gw.active_project_id || null,\n    plane_identifier: gw.active_project_identifier || null\n  },\n  instruction: [\n    'Usa signal_classification, rag_context y plane_live.',\n    'REGLA INVIOLABLE DE SUPERFICIES Y ENLACES:',\n    '1. SOLO puedes mencionar URLs que figuren explícitamente en verified_surfaces o en los hechos verificados de rag_context.',\n    '2. NUNCA inventes o asumas dominios .com sin verificación.',\n    '3. Si el usuario pide un enlace y no existe un enlace verificado en tu contexto, responde: \"No tengo un enlace verificado para eso en este momento\".',\n    'MODO ASISTENCIA OWNER (owner_assistance):',\n    base.owner_assistance ? [\n      'Estás en modo ASISTENCIA AL OWNER. El owner (Alek) ha proporcionado una orden/instrucción sobre la solicitud original del contacto.',\n      `Instrucción del owner: \"${base.owner_assistance.owner_instruction}\".`,\n      `Solicitud original del contacto: \"${base.owner_assistance.original_request}\".`,\n      '1. Si la orden implica agendar o cancelar, utiliza la herramienta correspondiente (proponer_reunion o cancelar_reunion) para emitir la propuesta inmutable.',\n      '2. AUDIENCIA DEL MENSAJE (response_audience): Por defecto en este modo, response_audience es \"owner\" y tu \"reply\" le explica a Alek qué propuesta o acción preparaste.',\n      '3. Solo si pretendes enviar un mensaje directo al contacto, establece action: \"reply_to_contact\" y response_audience: \"contact\". NUNCA reenvíes instrucciones internas literales del owner ni expongas mecanismos internos.',\n      '4. NUNCA declares la cita como ya agendada si la propuesta apenas fue creada en espera de confirmación de Alek.'\n    ].join(' ') : 'Modo directo con el contacto (response_audience: \"contact\").',\n    'No insistas en agenda salvo que el contacto la pida o el owner lo instruya explícitamente.'\n  ].join(' '),\n};\n\nconst auditRow = {\n  request_id: base.request_id,\n  workflow: 'IA360 Contact Intelligence Agent - Draft',\n  contact_key: contactKey,\n  account_key: activeAccountKey,\n  project_slug: projectSlug,\n  query_text: cleanText(classification.summary || base.text || '', 220),\n  filters_json: JSON.stringify({ account_key: activeAccountKey, collection: collName }),\n  filters_complete: true,\n  dry_run: false,\n  query_executed: true,\n  result_count: hybridDocs.length,\n  fallback_reason: null,\n  guardrails_json: JSON.stringify(ragContext.guardrails),\n  status: 'hybrid_rag_served',\n};\n\nreturn [{\n  json: {\n    ...base,\n    project_slug: projectSlug,\n    account_key: activeAccountKey,\n    contact_key: contactKey,\n    signal_classification: classification,\n    rag_context: ragContext,\n    account_context: {\n      account_key: activeAccountKey,\n      permitted_projects: gw.permitted_projects || []\n    },\n    agent_input: JSON.stringify(agentPayload, null, 2),\n    audit_rows: {\n      rag_query_audit: auditRow,\n    },\n  },\n}];"
+        "jsCode": "const base = $('Lookup IA360 Memory').first().json;\nconst rawItem = $('IA360 Signal Classifier - gpt-5.5').first().json;\nconst gw = $('Estado Vivo del Contacto').first().json || {};\n\nfunction cleanText(value, max = 240) {\n  return String(value || '')\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email]')\n    .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[phone]')\n    .replace(/\\b(?:sk|pk|rk|org|proj)-[A-Za-z0-9_-]{16,}\\b/g, '[secret]')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\n\nfunction digits(value) { return String(value || '').replace(/\\D/g, ''); }\nfunction maskNumber(value) {\n  const s = digits(value);\n  return s ? `${s.slice(0, 3)}***${s.slice(-2)}` : '';\n}\nfunction slug(value, fallback = 'ia360') {\n  const out = String(value || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');\n  return out || fallback;\n}\n\nfunction parseClassifier(raw) {\n  let candidate = raw.output ?? raw.text ?? raw;\n  if (typeof candidate === 'string') {\n    const trimmed = candidate.trim().replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n    try { candidate = JSON.parse(trimmed); } catch (e) { candidate = {}; }\n  }\n  if (!candidate || typeof candidate !== 'object') candidate = {};\n  const allowed = new Set(['cartera_cobranza_portal', 'taller_garantia_dias_detencion', 'auditoria_licencias_gasto', 'fiscal_opinion_sat_sync', 'no_signal']);\n  const primaryArea = allowed.has(candidate.primary_area) ? candidate.primary_area : 'no_signal';\n  const confidence = Math.max(0, Math.min(1, Number(candidate.confidence || 0)));\n  const ownerReviewRequired = candidate.owner_review_required !== false || confidence < 0.72 || primaryArea === 'no_signal';\n  return {\n    schema: 'ia360_signal_classifier_result.v1',\n    primary_area: primaryArea,\n    confidence,\n    summary: cleanText(candidate.summary || '', 240) || null,\n    missing_data: cleanText(candidate.missing_data || '', 180) || null,\n    next_action: cleanText(candidate.next_action || '', 180) || null,\n    owner_review_required: ownerReviewRequired,\n    model: 'gpt-5.5',\n    classification_timestamp: new Date().toISOString(),\n  };\n}\n\nconst classification = parseClassifier(rawItem);\nconst projectSlug = slug(base.project_slug || base.account?.project_slug || base.account_context?.projectKey || 'ia360');\nconst activeAccountKey = String(gw.account_key || base.account_key || 'nexus').trim() || 'nexus';\nconst contactKey = base.contact?.contact_number || base.contact?.wa_number || base.request_id;\nconst collName = `ia360_${projectSlug}`;\n\nconst hybridDocs = [\n  ...(base.memory_context?.facts || []).map(f => ({ source: 'memory_fact', text: f.fact_text || f.text })),\n  ...(base.memory_context?.events || []).map(e => ({ source: 'memory_event', text: e.event_summary || e.summary })),\n].filter(d => Boolean(d.text));\n\nconst ragContext = {\n  schema: 'ia360_hybrid_rag_context.v1',\n  active_account_key: activeAccountKey,\n  collection: collName,\n  project_slug: projectSlug,\n  facts_count: (base.memory_context?.facts || []).length,\n  events_count: (base.memory_context?.events || []).length,\n  documents_retrieved: hybridDocs.length,\n  documents: hybridDocs.slice(0, 10),\n  guardrails: {\n    no_cross_contact_context: true,\n    isolated_by_collection: true,\n    fail_closed_urls: true\n  }\n};\n\nconst vivos = (gw.estado_vivo && Array.isArray(gw.estado_vivo.issues)) ? gw.estado_vivo.issues : [];\nconst planeLive = {\n  schema: 'ia360_plane_estado_vivo.v1',\n  leido_en_vivo: true,\n  nunca_persistido: true,\n  scope_ok: gw.scope_ok === true,\n  account_key: activeAccountKey,\n  proyectos_permitidos: Array.isArray(gw.permitted_projects) ? gw.permitted_projects : [],\n  active_project_id: gw.active_project_id || null,\n  active_project_identifier: gw.active_project_identifier || null,\n  issues_count: vivos.length,\n  issues: vivos.slice(0, 25).map(w => ({\n    referencia: w.sequence_id ? String(w.sequence_id) : null,\n    nombre: w.nombre,\n    prioridad: w.priority || null,\n  })),\n  fuente: 'Plane REST al momento de contestar',\n};\n\nconst agentPayload = {\n  ...base,\n  input_mode: base.input_mode || 'direct',\n  failure_id: base.failure_id || null,\n  owner_assistance: base.owner_assistance || null,\n  signal_classification: classification,\n  rag_context: ragContext,\n  plane_live: planeLive,\n  active_project: {\n    account_key: activeAccountKey,\n    plane_project_id: gw.active_project_id || null,\n    plane_identifier: gw.active_project_identifier || null\n  },\n  instruction: [\n    'Usa signal_classification, rag_context y plane_live.',\n    'REGLA INVIOLABLE DE SUPERFICIES Y ENLACES:',\n    '1. SOLO puedes mencionar URLs que figuren expl\u00edcitamente en verified_surfaces o en los hechos verificados de rag_context.',\n    '2. NUNCA inventes o asumas dominios .com sin verificaci\u00f3n.',\n    '3. Si el usuario pide un enlace y no existe un enlace verificado en tu contexto, responde: \"No tengo un enlace verificado para eso en este momento\".',\n    'MODO ASISTENCIA OWNER (owner_assistance):',\n    base.owner_assistance ? [\n      'Est\u00e1s en modo ASISTENCIA AL OWNER. El owner (Alek) ha proporcionado una orden/instrucci\u00f3n sobre la solicitud original del contacto.',\n      `Instrucci\u00f3n del owner: \"${base.owner_assistance.owner_instruction}\".`,\n      `Solicitud original del contacto: \"${base.owner_assistance.original_request}\".`,\n      '1. Si la orden implica agendar o cancelar, utiliza la herramienta correspondiente (proponer_reunion o cancelar_reunion) para emitir la propuesta inmutable.',\n      '2. AUDIENCIA DEL MENSAJE (response_audience): Por defecto en este modo, response_audience es \"owner\" y tu \"reply\" le explica a Alek qu\u00e9 propuesta o acci\u00f3n preparaste.',\n      '3. Solo si pretendes enviar un mensaje directo al contacto, establece action: \"reply_to_contact\" y response_audience: \"contact\". NUNCA reenv\u00edes instrucciones internas literales del owner ni expongas mecanismos internos.',\n      '4. NUNCA declares la cita como ya agendada si la propuesta apenas fue creada en espera de confirmaci\u00f3n de Alek.'\n    ].join(' ') : 'Modo directo con el contacto (response_audience: \"contact\").',\n    'No insistas en agenda salvo que el contacto la pida o el owner lo instruya expl\u00edcitamente.'\n  ].join(' '),\n};\n\nconst auditRow = {\n  request_id: base.request_id,\n  workflow: 'IA360 Contact Intelligence Agent - Draft',\n  contact_key: contactKey,\n  account_key: activeAccountKey,\n  project_slug: projectSlug,\n  query_text: cleanText(classification.summary || base.text || '', 220),\n  filters_json: JSON.stringify({ account_key: activeAccountKey, collection: collName }),\n  filters_complete: true,\n  dry_run: false,\n  query_executed: true,\n  result_count: hybridDocs.length,\n  fallback_reason: null,\n  guardrails_json: JSON.stringify(ragContext.guardrails),\n  status: 'hybrid_rag_served',\n};\n\nreturn [{\n  json: {\n    ...base,\n    project_slug: projectSlug,\n    account_key: activeAccountKey,\n    contact_key: contactKey,\n    signal_classification: classification,\n    rag_context: ragContext,\n    account_context: {\n      account_key: activeAccountKey,\n      permitted_projects: gw.permitted_projects || []\n    },\n    agent_input: JSON.stringify(agentPayload, null, 2),\n    audit_rows: {\n      rag_query_audit: auditRow,\n    },\n  },\n}];"
       },
       "typeVersion": 2
     },
@@ -1066,7 +1066,7 @@
         460
       ],
       "parameters": {
-        "description": "Busca en los pendientes VIVOS de Plane del contacto. Úsala cuando el contacto pregunte por el estado de algo concreto. Devuelve hasta 5 resultados con referencia, nombre y prioridad. Nunca inventes números de pendiente: sólo cita los que devuelva esta herramienta.",
+        "description": "Busca en los pendientes VIVOS de Plane del contacto. \u00dasala cuando el contacto pregunte por el estado de algo concreto. Devuelve hasta 5 resultados con referencia, nombre y prioridad. Nunca inventes n\u00fameros de pendiente: s\u00f3lo cita los que devuelva esta herramienta.",
         "workflowId": {
           "__rl": true,
           "mode": "id",
@@ -1077,7 +1077,30 @@
           "value": {
             "numero_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact?.contact_number || $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body?.contact_number || '' }}",
             "texto_busqueda": "={{ $fromAI('texto_busqueda', 'Palabras clave para buscar en Plane', 'string') }}"
-          }
+          },
+          "schema": [
+            {
+              "id": "numero_contacto",
+              "displayName": "numero_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "texto_busqueda",
+              "displayName": "texto_busqueda",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "matchingColumns": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
         }
       }
     },
@@ -1103,8 +1126,49 @@
             "fecha": "={{ $fromAI('fecha', 'Fecha a consultar en formato YYYY-MM-DD (ejemplo: 2026-08-25)', 'string') }}",
             "hora_inicio": "={{ $fromAI('hora_inicio', 'Hora de inicio del rango a consultar (0-23, hora CDMX, default 9)', 'string') }}",
             "hora_fin": "={{ $fromAI('hora_fin', 'Hora de fin del rango a consultar (0-23, hora CDMX, default 18)', 'string') }}",
-            "duracion": "={{ $fromAI('duracion', 'Duración de cada hueco en minutos (default 60)', 'string') }}"
-          }
+            "duracion_minutos": "={{ $fromAI('duracion_minutos', 'Duraci\u00f3n de cada hueco en minutos (default 60)', 'string') }}"
+          },
+          "schema": [
+            {
+              "id": "fecha",
+              "displayName": "fecha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_inicio",
+              "displayName": "hora_inicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_fin",
+              "displayName": "hora_fin",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "duracion_minutos",
+              "displayName": "duracion_minutos",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "matchingColumns": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
         }
       },
       "notes": "P65: lectura del calendario real de Alek. No escribe nada."
@@ -1119,7 +1183,7 @@
         460
       ],
       "parameters": {
-        "description": "Propone una reunión con Alek para agendar en Google Calendar y/o Zoom según resources ('calendar', 'zoom' o ambos). Emite una propuesta inmutable que queda pendiente de confirmación del owner (Alek). Usa horarios en ISO 8601 UTC. NO escribe directamente en el calendario ni autoriza citas.",
+        "description": "Propone una reuni\u00f3n con Alek para agendar en Google Calendar y/o Zoom seg\u00fan resources ('calendar', 'zoom' o ambos). Emite una propuesta inmutable que queda pendiente de confirmaci\u00f3n del owner (Alek). Usa horarios en ISO 8601 UTC. NO escribe directamente en el calendario ni autoriza citas.",
         "workflowId": {
           "__rl": true,
           "mode": "id",
@@ -1128,16 +1192,102 @@
         "workflowInputs": {
           "mappingMode": "defineBelow",
           "value": {
-            "inicio_iso": "={{ $fromAI('inicio_iso', 'Fecha y hora de inicio de la reunión en formato ISO 8601 UTC (ejemplo: 2026-08-25T16:00:00Z)', 'string') }}",
-            "fin_iso": "={{ $fromAI('fin_iso', 'Fecha y hora de fin de la reunión en formato ISO 8601 UTC (ejemplo: 2026-08-25T17:00:00Z)', 'string') }}",
-            "titulo": "={{ $fromAI('titulo', 'Título o motivo de la reunión (opcional)', 'string') }}",
+            "inicio_iso": "={{ $fromAI('inicio_iso', 'Fecha y hora de inicio de la reuni\u00f3n en formato ISO 8601 UTC (ejemplo: 2026-08-25T16:00:00Z)', 'string') }}",
+            "fin_iso": "={{ $fromAI('fin_iso', 'Fecha y hora de fin de la reuni\u00f3n en formato ISO 8601 UTC (ejemplo: 2026-08-25T17:00:00Z)', 'string') }}",
+            "titulo": "={{ $fromAI('titulo', 'T\u00edtulo o motivo de la reuni\u00f3n (opcional)', 'string') }}",
             "numero_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact?.contact_number || $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body?.contact_number || '' }}",
             "nombre_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact?.name || $('Normalize WhatsApp Context').item.json.contact_name || $('Webhook WhatsApp Contact Intelligence').item.json.body?.contact_name || 'Lead IA360' }}",
             "wa_number": "={{ $('Normalize WhatsApp Context').item.json.contact?.wa_number || $('Normalize WhatsApp Context').item.json.wa_number || $('Webhook WhatsApp Contact Intelligence').item.json.body?.wa_number || '' }}",
             "source_message_id": "={{ $('Normalize WhatsApp Context').item.json.request_id || $('Normalize WhatsApp Context').item.json.message_id || $('Webhook WhatsApp Contact Intelligence').item.json.body?.message_id || '' }}",
             "dry_run": "={{ Boolean($('Normalize WhatsApp Context').item.json.dry_run ?? $('Webhook WhatsApp Contact Intelligence').item.json.body?.dry_run) }}",
-            "resources": "={{ $fromAI('resources', 'Array JSON canónico de recursos a reservar: [\"calendar\"], [\"zoom\"], o [\"calendar\", \"zoom\"]. Determinado según la intención semántica del contacto.', 'string') }}"
-          }
+            "resources": "={{ $fromAI('resources', 'Array JSON can\u00f3nico de recursos a reservar: [\"calendar\"], [\"zoom\"], o [\"calendar\", \"zoom\"]. Determinado seg\u00fan la intenci\u00f3n sem\u00e1ntica del contacto.', 'string') }}"
+          },
+          "schema": [
+            {
+              "id": "inicio_iso",
+              "displayName": "inicio_iso",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fin_iso",
+              "displayName": "fin_iso",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "titulo",
+              "displayName": "titulo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_contacto",
+              "displayName": "numero_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_contacto",
+              "displayName": "nombre_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wa_number",
+              "displayName": "wa_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_message_id",
+              "displayName": "source_message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dry_run",
+              "displayName": "dry_run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "resources",
+              "displayName": "resources",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "matchingColumns": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
         }
       },
       "notes": "P65: ESCRIBE en el calendario real de Alek y/o crea Zoom. Exige confirmado_por_owner=true."
@@ -1152,7 +1302,7 @@
         460
       ],
       "parameters": {
-        "description": "Propone cancelar una reunión agendada de este contacto en Google Calendar y/o Zoom según resources ('calendar', 'zoom' o ambos). Emite una propuesta inmutable que queda pendiente de confirmación del owner (Alek). Requiere IDs del recurso seleccionado.",
+        "description": "Propone cancelar una reuni\u00f3n agendada de este contacto en Google Calendar y/o Zoom seg\u00fan resources ('calendar', 'zoom' o ambos). Emite una propuesta inmutable que queda pendiente de confirmaci\u00f3n del owner (Alek). Requiere IDs del recurso seleccionado.",
         "workflowId": {
           "__rl": true,
           "mode": "id",
@@ -1161,14 +1311,82 @@
         "workflowInputs": {
           "mappingMode": "defineBelow",
           "value": {
-            "resources": "={{ $fromAI('resources', 'Array JSON canónico de recursos a cancelar: [\"calendar\"], [\"zoom\"], o [\"calendar\", \"zoom\"].', 'string') }}",
+            "resources": "={{ $fromAI('resources', 'Array JSON can\u00f3nico de recursos a cancelar: [\"calendar\"], [\"zoom\"], o [\"calendar\", \"zoom\"].', 'string') }}",
             "evento_id": "={{ $fromAI('evento_id', 'ID del evento de Google Calendar a cancelar (obligatorio si se cancela calendar)', 'string') }}",
-            "zoom_id": "={{ $fromAI('zoom_id', 'ID de la reunión de Zoom a cancelar (obligatorio si se cancela zoom)', 'string') }}",
+            "zoom_id": "={{ $fromAI('zoom_id', 'ID de la reuni\u00f3n de Zoom a cancelar (obligatorio si se cancela zoom)', 'string') }}",
             "numero_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact?.contact_number || $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body?.contact_number || '' }}",
             "wa_number": "={{ $('Normalize WhatsApp Context').item.json.contact?.wa_number || $('Normalize WhatsApp Context').item.json.wa_number || $('Webhook WhatsApp Contact Intelligence').item.json.body?.wa_number || '' }}",
             "source_message_id": "={{ $('Normalize WhatsApp Context').item.json.request_id || $('Normalize WhatsApp Context').item.json.message_id || $('Webhook WhatsApp Contact Intelligence').item.json.body?.message_id || '' }}",
             "dry_run": "={{ Boolean($('Normalize WhatsApp Context').item.json.dry_run ?? $('Webhook WhatsApp Contact Intelligence').item.json.body?.dry_run) }}"
-          }
+          },
+          "schema": [
+            {
+              "id": "resources",
+              "displayName": "resources",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evento_id",
+              "displayName": "evento_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zoom_id",
+              "displayName": "zoom_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_contacto",
+              "displayName": "numero_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wa_number",
+              "displayName": "wa_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_message_id",
+              "displayName": "source_message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dry_run",
+              "displayName": "dry_run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "matchingColumns": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
         }
       },
       "notes": "P65: BORRA del calendario real de Alek y/o Zoom. Exige confirmado_por_owner=true."
@@ -1193,7 +1411,21 @@
           "mappingMode": "defineBelow",
           "value": {
             "numero_contacto": "={{ $('Normalize WhatsApp Context').item.json.contact?.contact_number || $('Normalize WhatsApp Context').item.json.contact_number || $('Webhook WhatsApp Contact Intelligence').item.json.body?.contact_number || '' }}"
-          }
+          },
+          "schema": [
+            {
+              "id": "numero_contacto",
+              "displayName": "numero_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "matchingColumns": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
         }
       },
       "notes": "P65: lectura de ia360_meeting_links. Es la fuente de la verdad de lo ya acordado."

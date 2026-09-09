@@ -81,7 +81,7 @@ def operations(before, after):
     new = {n['name']: n for n in after['nodes']}
     if len(new) != len(after['nodes']):
         raise ValueError('duplicate_node_name')
-    replaced = {name for name in old.keys() & new.keys() if (old[name]['type'], old[name].get('typeVersion')) != (new[name]['type'], new[name].get('typeVersion'))}
+    replaced = {name for name in old.keys() & new.keys() if (old[name]['type'], old[name].get('typeVersion')) != (new[name]['type'], new[name].get('typeVersion')) or any(k in old[name] and k not in new[name] for k in NODE_SETTINGS)}
     removed = (old.keys() - new.keys()) | replaced
     added = (new.keys() - old.keys()) | replaced
     ops = []
