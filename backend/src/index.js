@@ -6,8 +6,11 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const pool = require('./db');
+const { router: alekitoBridgeRouter } = require('./routes/alekitoBridge');
+const { ensureBridgeTable, startBridgeRecovery } = require('./services/alekitoBridge');
 const { router: authRouter, authMiddleware, ensureTables } = require('./auth');
 const { router: messagesRouter } = require('./routes/messages');
+const { router: followUpsRouter } = require('./routes/followUps');
 const { router: webhookRouter } = require('./routes/webhook');
 const { router: ia360IntakeRouter } = require('./routes/ia360-intake');
 const { router: ia360CalendarRouter } = require('./routes/ia360-calendar');
@@ -27,6 +30,7 @@ const { router: dashboardRouter } = require('./routes/dashboard');
 const { router: pipelinesRouter } = require('./routes/pipelines');
 const { startWorker: startMediaWorker, shutdown: shutdownMediaQueue } = require('./queue/mediaQueue');
 const { startSendWorker, shutdownSendQueue } = require('./queue/sendQueue');
+const { startFollowUpReconciler, stopFollowUpReconciler } = require('./services/followUpReconciler');
 const { startReminderScheduler } = require('./services/ia360Reminders');
 const { startDiapazoSesionRecordatorio } = require('./services/diapazoSesionRecordatorio');
 const { startIa360FailuresSweep } = require('./services/botFailuresDigest');
@@ -104,6 +108,9 @@ app.use(apiLimiter);
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Public routes (webhook from n8n — no auth)
+app.use('/api', alekitoBridgeRouter); // Authenticated, actual n8n peer only.
+// Dedicated HMAC RPC, strictly contact metadata reads; no internal bridge auth changes.
+require('./services/personaContactDirectory.cjs').mountPersonaContactDirectory(app,{pool:require('./db'),P:require('./services/alekitoBridgePolicy'),secret:process.env.NEXUS_SELLO_FORGECHAT});
 app.use('/api', webhookRouter);
 app.use('/api', ia360IntakeRouter); // B-28 intake (publico, secreto compartido)
 app.use('/api', ia360CalendarRouter); // IA360 add-to-calendar (publico, token)
@@ -114,6 +121,7 @@ app.use('/api', authRouter);
 
 // Protected routes
 app.use('/api', authMiddleware, messagesRouter);
+app.use('/api', authMiddleware, followUpsRouter);
 app.use('/api', authMiddleware, categoriesRouter);
 app.use('/api', authMiddleware, contactFieldsRouter);
 app.use('/api', authMiddleware, usersRouter);
@@ -138,11 +146,14 @@ app.use((err, req, res, next) => {
 // Start server
 async function start() {
   await ensureTables();
+  await ensureBridgeTable();
   mediaStorage.ensureBucket().catch(err =>
     console.error('[media-storage] table ensure failed (will retry on first upload):', err.message)
   );
   startMediaWorker();
   startSendWorker();
+  startBridgeRecovery();
+  startFollowUpReconciler();
   startReminderScheduler(); // IA360 per-meeting reminders (self-contained)
   startDiapazoSesionRecordatorio(); // DIAPAZO: recordatorio de Sesión de Afinación abandonada (>24 h sin submit)
   startDiapazoPoller(); // G6: poll de taps diapazo_* del owner en chat_history (egress human-gated)
@@ -211,6 +222,7 @@ async function start() {
   const shutdown = async (sig) => {
     console.log(`[ForgeChat] ${sig} received, draining…`);
     server.close(() => {});
+    stopFollowUpReconciler();
     await shutdownMediaQueue();
     await shutdownSendQueue();
     process.exit(0);

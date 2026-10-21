@@ -1,0 +1,37 @@
+'use strict';
+const {createHash}=require('node:crypto');
+const verified=new WeakSet();
+const hash=x=>createHash('sha256').update(x).digest('hex');
+const digits=x=>String(x||'').replace(/\D/g,'');
+class ButtonIngressError extends Error{constructor(code){super(code);this.code=code;this.status=409;}}
+const fail=code=>{throw new ButtonIngressError(code);};
+const PAYLOAD=/^alekito_bridge:([A-Za-z0-9][A-Za-z0-9._-]{7,127}):([0-9])$/;
+function mayBeButton(row){return row?.direction==='incoming'&&['button','interactive'].includes(row.message_type);}
+function messages(raw){const found=[];for(const entry of raw?.entry||[])for(const change of entry.changes||[])for(const message of change.value?.messages||[])found.push({message,metadata:change.value?.metadata});return found;}
+async function normalizeButtonIngress(row,{wa,owner,accountRef,ownerRef,resolveSource,now=Date.now()}){
+ if(!mayBeButton(row)||digits(row.wa_number)!==digits(wa)||digits(row.contact_number)!==digits(owner))fail('BUTTON_OWNER_BINDING_INVALID');
+ const age=now-Date.parse(row.timestamp);if(!Number.isFinite(age)||age< -30000||age>=300000)fail('FRESH_INGRESS_REQUIRED');
+ if(!/^wamid\.[A-Za-z0-9+/=_-]+$/.test(row.message_id||''))fail('REAL_INGRESS_REQUIRED');
+ const candidates=messages(row.raw_payload).filter(x=>x.message.id===row.message_id);
+ if(candidates.length!==1)fail('BUTTON_RAW_MESSAGE_AMBIGUOUS');
+ const {message:m,metadata}=candidates[0];
+ if(digits(m.from)!==digits(owner)||!metadata?.display_phone_number||digits(metadata.display_phone_number)!==digits(wa))fail('BUTTON_RAW_SCOPE_MISMATCH');
+ let payload,label;
+ if(row.message_type==='button'&&m.type==='button'){payload=m.button?.payload;label=m.button?.text;}
+ else if(row.message_type==='interactive'&&m.type==='interactive'&&m.interactive?.type==='button_reply'){payload=m.interactive.button_reply?.id;label=m.interactive.button_reply?.title;}
+ else fail('BUTTON_VARIANT_UNSUPPORTED');
+ if(typeof label!=='string'||!label||label.length>80||label.includes('\0')||typeof payload!=='string'||!payload)fail('BUTTON_PAYLOAD_INVALID');
+ const match=PAYLOAD.exec(payload);
+ if(!match&&payload!==label)fail('BUTTON_PAYLOAD_INVALID');
+ if(!m.context?.id||m.context.id!==row.context_message_id)fail('BUTTON_CONTEXT_MISMATCH');
+ const source=await resolveSource({requestId:match?match[1]:null,index:match?Number(match[2]):null,label,contextMessageId:m.context.id,row});
+ if(!source||!PAYLOAD.test(source.payload)||source.account_ref!==accountRef||source.owner_ref!==ownerRef||source.message_id!==m.context.id||source.type!=='QUICK_REPLY'||source.label!==label||!source.schema_verified||!['sent','delivered','read'].includes(source.delivery_state)||!Number.isFinite(Date.parse(source.sent_at))||Date.parse(source.sent_at)>Date.parse(row.timestamp))fail('BUTTON_SOURCE_MISMATCH');
+ if(match&&(source.request_id!==match[1]||source.index!==Number(match[2])||source.payload!==payload))fail('BUTTON_SOURCE_MISMATCH');
+ const result=Object.freeze({kind:'verified_template_quick_reply',original_type:row.message_type,message_id:row.message_id,account_ref:accountRef,owner_ref:ownerRef,
+  text:'Respuesta mediante boton: '+source.label,button_payload:source.payload,reply_to:'m_'+hash(m.context.id).slice(0,12),
+  source_request_id:source.request_id,button_index:source.index,source_schema_digest:source.schema_digest,
+  intent:{type:'template_quick_reply',label:source.label,privileged_operation:null}});
+ verified.add(result);return result;
+}
+function isVerifiedButton(value,row,options){return !!value&&verified.has(value)&&value.message_id===row.message_id&&(!options||(value.account_ref===options.accountRef&&value.owner_ref===options.contactRef));}
+module.exports={normalizeButtonIngress,isVerifiedButton,mayBeButton,ButtonIngressError,PAYLOAD};

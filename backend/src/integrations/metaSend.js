@@ -8,7 +8,7 @@ function url(phoneNumberId, path = 'messages') {
   return `https://graph.facebook.com/${META_API_VERSION}/${encodeURIComponent(phoneNumberId)}/${path}`;
 }
 
-async function postJson(endpoint, accessToken, body) {
+async function postJson(endpoint, accessToken, body, signal = undefined) {
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: {
@@ -16,6 +16,7 @@ async function postJson(endpoint, accessToken, body) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   const text = await res.text();
   let parsed = null;
@@ -35,7 +36,7 @@ async function postJson(endpoint, accessToken, body) {
  * Send a free-form text message. Requires the recipient to be inside the
  * 24-hour customer service window (Meta enforces this).
  */
-async function sendText({ accessToken, phoneNumberId, to, body, previewUrl = false, contextMessageId = null }) {
+async function sendText({ accessToken, phoneNumberId, to, body, previewUrl = false, contextMessageId = null, signal = undefined }) {
   return postJson(url(phoneNumberId), accessToken, {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
@@ -44,14 +45,14 @@ async function sendText({ accessToken, phoneNumberId, to, body, previewUrl = fal
     ...(contextMessageId ? { context: { message_id: contextMessageId } } : {}),
     type: 'text',
     text: { body: String(body), preview_url: !!previewUrl },
-  });
+  }, signal);
 }
 
 /**
  * Send an approved message template. Components carry header/body/button
  * parameters per Meta's spec (e.g. [{type:'body', parameters:[{type:'text', text:'John'}]}]).
  */
-async function sendTemplate({ accessToken, phoneNumberId, to, templateName, languageCode = 'en', components = [] }) {
+async function sendTemplate({ accessToken, phoneNumberId, to, templateName, languageCode = 'en', components = [], signal = undefined }) {
   return postJson(url(phoneNumberId), accessToken, {
     messaging_product: 'whatsapp',
     to: String(to),
@@ -61,7 +62,7 @@ async function sendTemplate({ accessToken, phoneNumberId, to, templateName, lang
       language: { code: languageCode },
       components,
     },
-  });
+  }, signal);
 }
 
 /**
@@ -113,11 +114,12 @@ async function uploadMedia({ accessToken, phoneNumberId, buffer, mimeType, filen
  * already-built `interactive` object exactly as Meta expects it.
  *   { type: 'button'|'list', body:{text}, header?, footer?, action:{...} }
  */
-async function sendInteractive({ accessToken, phoneNumberId, to, interactive }) {
+async function sendInteractive({ accessToken, phoneNumberId, to, interactive, contextMessageId = null }) {
   return postJson(url(phoneNumberId), accessToken, {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
     to: String(to),
+    ...(contextMessageId ? { context: { message_id: contextMessageId } } : {}),
     type: 'interactive',
     interactive,
   });
@@ -173,4 +175,22 @@ async function sendReaction({ accessToken, phoneNumberId, to, messageId, emoji }
   });
 }
 
-module.exports = { sendText, sendTemplate, sendMedia, sendInteractive, sendLocation, sendContacts, sendReaction, uploadMedia };
+/**
+ * Marca un mensaje ENTRANTE como leído: las palomitas azules que ve el contacto.
+ *
+ * Portado de forgechat-g1g2 (`dac77fb`, 08-ago-2026), donde se escribió con su
+ * suite de integración pero nunca llegó al repo que corre en producción.
+ *
+ * NO se llama al recibir. Se llama cuando ya hay respuesta encolada para ese
+ * inbound (ver `insertPendingRow`): una palomita azul seguida de silencio es peor
+ * que ninguna palomita, porque promete atención que no llegó.
+ */
+async function markMessageRead({ accessToken, phoneNumberId, messageId }) {
+  return postJson(url(phoneNumberId), accessToken, {
+    messaging_product: 'whatsapp',
+    status: 'read',
+    message_id: String(messageId),
+  });
+}
+
+module.exports = { sendText, sendTemplate, sendMedia, sendInteractive, sendLocation, sendContacts, sendReaction, markMessageRead, uploadMedia };

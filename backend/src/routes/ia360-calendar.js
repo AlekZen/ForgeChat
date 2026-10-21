@@ -68,7 +68,7 @@ router.get('/cal/:token.ics', async (req, res) => {
   } catch (e) { console.error('[ia360-cal] ics error:', e.message); res.status(500).type('text/plain').send('Error.'); }
 });
 
-// /api/cal/:token -> pagina con Google Calendar + descargar .ics.
+// /api/cal/:token -> pagina con Google Calendar + descargar .ics + acceso Zoom.
 router.get('/cal/:token', async (req, res) => {
   try {
     const link = await loadLink(req.params.token);
@@ -81,13 +81,17 @@ router.get('/cal/:token', async (req, res) => {
       + '&dates=' + icsStamp(link.start_utc) + '/' + icsStamp(link.end_utc)
       + '&details=' + encodeURIComponent(details);
     const icsUrl = '/api/cal/' + encodeURIComponent(req.params.token) + '.ics';
+    const zoomButton = link.zoom_join_url
+      ? '<a class="btn z" href="' + link.zoom_join_url + '" target="_blank" rel="noopener">Entrar a la reunion (Zoom)</a>'
+      : '';
     res.type('text/html').send('<!doctype html><html lang="es"><head><meta charset="utf-8">'
       + '<meta name="viewport" content="width=device-width,initial-scale=1">'
       + '<title>Agregar a mi calendario</title><style>'
       + 'body{font-family:system-ui,sans-serif;max-width:420px;margin:40px auto;padding:0 16px;text-align:center}'
       + 'a.btn{display:block;margin:12px 0;padding:14px;border-radius:10px;text-decoration:none;font-weight:600}'
-      + '.g{background:#1a73e8;color:#fff}.i{background:#f1f3f4;color:#202124;border:1px solid #dadce0}'
+      + '.g{background:#1a73e8;color:#fff}.z{background:#2d8cff;color:#fff}.i{background:#f1f3f4;color:#202124;border:1px solid #dadce0}'
       + 'h1{font-size:18px}</style></head><body><h1>Agregar reunion a tu calendario</h1>'
+      + zoomButton
       + '<a class="btn g" href="' + gcal + '">Agregar a Google Calendar</a>'
       + '<a class="btn i" href="' + icsUrl + '">Descargar (Apple / Outlook / .ics)</a>'
       + '</body></html>');

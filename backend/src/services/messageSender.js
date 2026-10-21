@@ -1,3 +1,5 @@
+
+function normalizeWhatsAppBold(s) { return typeof s === 'string' ? s.replace(/\*\*([^*\n]+)\*\*/g, '*$1*') : s; }
 // Central outbound orchestration. ALL message-sending paths funnel through here:
 //   - Chat reply input  (routes/messages.js → POST /messages/send)
 //   - Broadcast launch  (routes/broadcasts.js → /:id/send)
@@ -15,6 +17,7 @@ const crypto = require('crypto');
 const pool = require('../db');
 const { getAccountByPhoneNumber, getAccountWithToken, getSingleAccount } = require('../routes/whatsappAccounts');
 const { applyPendingOutboundStatus, lockOutboundMessage } = require('./outboundStatusReceipt');
+const { markMessageRead } = require('../integrations/metaSend');
 const TERMINAL_OUTBOUND_STATUSES = new Set(['sent', 'delivered', 'read', 'failed', 'error', 'no_verificable']);
 
 function localMessageId() {
@@ -60,14 +63,31 @@ async function resolveAccount({ accountId, fromPhoneNumber }) {
  * `status` permite filas sandbox ('qa_sandboxed': fila visible y correlacionable
  * para los harness E2E, pero JAMÁS encolada hacia Meta); default: 'sending'.
  */
-async function insertPendingRow({ account, toNumber, messageType, messageBody, mediaUrl = null, mediaMime = null, templateMeta = null, contextMessageId = null, rawPayloadExtra = null, db = pool, status = 'sending' }) {
-  const messageId = localMessageId();
+async function insertPendingRow({
+  account,
+  toNumber,
+  messageType,
+  messageBody,
+  mediaUrl = null,
+  mediaMime = null,
+  templateMeta = null,
+  contextMessageId = null,
+  rawPayloadExtra = null,
+  db = pool,
+  status = 'sending',
+  correlationId = null,
+  surfaceAttestationRef = null,
+  outboundPurpose = null,
+  caseRef = null,
+}) {
+  const messageId = correlationId ? String(correlationId) : localMessageId();
   const res = await db.query(
     `INSERT INTO coexistence.chat_history
        (message_id, send_correlation_id, phone_number_id, wa_number, contact_number, to_number,
         direction, message_type, message_body, raw_payload,
-        media_url, media_mime_type, status, timestamp, template_meta, context_message_id)
-     VALUES ($1,$1,$2,$3,$4,$5,'outgoing',$6,$7,$8,$9,$10,$13,NOW(),$11,$12)
+        media_url, media_mime_type, status, timestamp, template_meta, context_message_id,
+        surface_attestation_ref, outbound_purpose, case_ref)
+     VALUES ($1,$1,$2,$3,$4,$5,'outgoing',$6,$7,$8,$9,$10,$13,NOW(),$11,$12,$14,$15,$16)
      ON CONFLICT (contact_number, (template_meta->>'ia360_handler_for'))
        WHERE direction = 'outgoing' AND (template_meta->>'ia360_handler_for') IS NOT NULL
      DO NOTHING
@@ -86,6 +106,9 @@ async function insertPendingRow({ account, toNumber, messageType, messageBody, m
       templateMeta ? JSON.stringify(templateMeta) : null,
       contextMessageId || null,
       status,
+      surfaceAttestationRef || null,
+      outboundPurpose || null,
+      caseRef || null,
     ]
   );
   if (res.rowCount === 0) {
@@ -94,6 +117,84 @@ async function insertPendingRow({ account, toNumber, messageType, messageBody, m
     return null;
   }
   return messageId;
+}
+
+// ─── Palomitas azules ───────────────────────────────────────────────────────
+// Decisión de Alek (19-ago-2026): la palomita NO se activa al recibir, sino
+// cuando el agente ya tiene respuesta lista. Y como SIEMPRE hay respuesta —aunque
+// sea el acuse automático— el contacto igual ve que lo leyeron.
+//
+// El enganche definitivo ocurre después de que BullMQ acepta el job. La fila y
+// su índice único parcial conservan el dedupe, pero nunca se enciende la palomita
+// si Redis rechazó el enqueue o la transacción se revirtió.
+//
+// El wamid del inbound viaja dentro de `ia360_handler_for`, que es o el wamid
+// pelado o `<wamid>:direct:<to>:<label>`. Los wamid no llevan ':', así que el
+// primer segmento es el mensaje al que hay que contestarle la lectura.
+const LEIDOS_RECIENTES = new Set();
+const LEIDOS_MAX = 500;
+
+/**
+ * Enciende la palomita azul de UN inbound. Sirve para los carriles que tienen su
+ * propio egress y no pasan por `insertPendingRow` (hoy: diapazo-inbound).
+ * Idempotente en proceso: varios textos por un mismo inbound = un solo acuse.
+ */
+function marcarLeidoDeInbound({ account, inboundMessageId, sendRead = markMessageRead }) {
+  try {
+    const inbound = String(inboundMessageId || '');
+    // Sólo wamid reales. Los de los harness (`wamid.e2e.…`, `wamid.qa.…`) TAMBIÉN
+    // empiezan con `wamid.`, así que el prefijo no basta: sin este segundo filtro,
+    // cada corrida de las pruebas dispararía una llamada real a Meta que falla.
+    // Mismo criterio que `isIa360SyntheticWamid` en webhook.js: sólo el patrón con
+    // puntos, porque el base64 de un wamid real no contiene puntos.
+    if (!inbound.startsWith('wamid.')) return;
+    if (/(^|\.)(e2e|qa[-_a-z0-9]*|harness)\./i.test(inbound)) return;
+    if (LEIDOS_RECIENTES.has(inbound)) return;
+    if (LEIDOS_RECIENTES.size >= LEIDOS_MAX) LEIDOS_RECIENTES.clear();
+    LEIDOS_RECIENTES.add(inbound);
+    // Fire-and-forget: la palomita NUNCA puede retrasar ni tumbar el envío.
+    sendRead({
+      accessToken: account.accessToken,
+      phoneNumberId: account.phoneNumberId,
+      messageId: inbound,
+    }).catch(err => console.error('[palomita] no se pudo marcar leído %s: %s', inbound, err.message));
+  } catch (err) {
+    console.error('[palomita] error inesperado:', err.message);
+  }
+}
+
+function marcarLeidoAlResponder({ account, templateMeta, status, sendRead = markMessageRead }) {
+  if (status !== 'sending') return; // 'qa_sandboxed' no sale a Meta
+  const handler = templateMeta?.ia360_handler_for;
+  if (!handler) return; // broadcasts, automation y chat manual quedan fuera
+  marcarLeidoDeInbound({ account, inboundMessageId: String(handler).split(':')[0], sendRead });
+}
+
+async function markInboundReadAfterEnqueue({
+  accountId,
+  localMessageId,
+  db = pool,
+  loadAccount = getAccountWithToken,
+  sendRead = markMessageRead,
+}) {
+  if (!accountId || !localMessageId) return false;
+  const { rows } = await db.query(
+    `SELECT template_meta, status
+       FROM coexistence.chat_history
+      WHERE send_correlation_id=$1`,
+    [localMessageId]
+  );
+  if (rows.length !== 1 || rows[0].status !== 'sending'
+      || !rows[0].template_meta?.ia360_handler_for) return false;
+  const account = await loadAccount(accountId);
+  if (!account) return false;
+  marcarLeidoAlResponder({
+    account,
+    templateMeta: rows[0].template_meta,
+    status: rows[0].status,
+    sendRead,
+  });
+  return true;
 }
 
 /**
@@ -147,6 +248,24 @@ async function markFailed(localId, errorMessage) {
   throw new Error('Outbound correlation changed without reaching a terminal state');
 }
 
+async function markNoVerificable(localId, publicCode = 'FOLLOWUP_SEND_UNKNOWN') {
+  const result = await pool.query(
+    `UPDATE coexistence.chat_history
+        SET status = 'no_verificable', error_message = $1
+      WHERE send_correlation_id = $2
+        AND status NOT IN ('sent', 'delivered', 'read', 'failed', 'error', 'no_verificable')`,
+    [String(publicCode).slice(0, 120), localId]
+  );
+  if (result.rowCount === 1) return true;
+  const correlated = await pool.query(
+    `SELECT status FROM coexistence.chat_history WHERE send_correlation_id = $1`,
+    [localId]
+  );
+  if (correlated.rowCount !== 1) throw new Error('Outbound correlation missing or ambiguous');
+  if (TERMINAL_OUTBOUND_STATUSES.has(correlated.rows[0].status)) return false;
+  throw new Error('Outbound correlation changed without reaching a terminal state');
+}
+
 /**
  * Return seconds-since the last incoming message from `contactNumber` to
  * `accountPhoneNumberId`. Returns null if no inbound message exists.
@@ -171,7 +290,11 @@ module.exports = {
   insertPendingRow,
   markSent,
   markFailed,
+  markNoVerificable,
   secondsSinceLastIncoming,
   localMessageId,
   TERMINAL_OUTBOUND_STATUSES,
+  marcarLeidoDeInbound,
+  markInboundReadAfterEnqueue,
+  _test: { marcarLeidoAlResponder, marcarLeidoDeInbound },
 };

@@ -5,13 +5,28 @@ const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const pool = require('../db');
-const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
+const {
+  resolveAccount,
+  insertPendingRow,
+  secondsSinceLastIncoming,
+  localMessageId,
+} = require('../services/messageSender');
+const {
+  SurfaceContractError,
+  resolveContactAccountKey,
+  attestOutboundPayload,
+} = require('../services/outboundSurfaceContract');
 const { enqueueSend } = require('../queue/sendQueue');
 const { uploadMedia } = require('../integrations/metaSend');
 const { markAccountHealth, classifyMetaError } = require('../services/accountHealth');
 const storage = require('../util/pgStorage');
 const { syncMediaToAccount } = require('./mediaLibrary');
-const { userWaNumbers, assertWaAccess, assertContactAccess } = require('../middleware/access');
+const { userWaNumbers, assertWaAccess, assertContactAccess, requirePermission } = require('../middleware/access');
+const {
+  recordProcessingEvidence,
+  listMetaReadCandidates,
+  confirmMetaRead,
+} = require('../services/metaReadService');
 const { isAdmin } = require('../permissions');
 const { canonicalizeMime, mediaFormatFor, chatKindFor, CHAT_TYPES_MSG } = require('../util/metaMime');
 const ExcelJS = require('exceljs');
@@ -596,6 +611,106 @@ router.get('/contact', async (req, res) => {
   }
 });
 
+// ─── Confirmación de lectura MANUAL y auditada ──────────────────────────────
+// Portado de forgechat-g1g2 (`dac77fb`) el 19-ago-2026. Las dos tablas que usa
+// —`message_processing_evidence` y `meta_read_receipts`— YA existían en la base de
+// producción, vacías: la migración se aplicó y el código nunca llegó.
+//
+// No compite con la palomita automática de `messageSender.marcarLeidoAlResponder`:
+// aquélla es el bot contestando, ésta es una PERSONA que procesó la conversación y
+// deja constancia de quién la leyó y por qué canal. Un mensaje ya marcado por el
+// bot vuelve como `already_read`, no se marca dos veces.
+const PUBLIC_PROCESSING_CHANNEL = 'forgechat_api';
+
+function assertPublicProcessingChannel(req, res) {
+  // El canal lo fija el servidor: si el cliente lo manda, se rechaza. Dejarlo
+  // elegir su propio canal permitiría falsificar de dónde salió la lectura.
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'processingChannel')) {
+    res.status(400).json({
+      error: 'Meta read operation could not be completed',
+      code: 'PROCESSING_CHANNEL_FORBIDDEN',
+    });
+    return false;
+  }
+  return true;
+}
+
+function sendMetaReadFailure(res, error) {
+  const status = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+  const code = error?.code || 'META_READ_FAILED';
+  if (status >= 500) console.error('[messages] Meta read operation failed:', code);
+  return res.status(status).json({ error: 'Meta read operation could not be completed', code });
+}
+
+async function assertMetaReadConversation(req, res) {
+  const { waNumber, contactNumber } = req.body || {};
+  if (!waNumber || !contactNumber) {
+    res.status(400).json({ error: 'waNumber and contactNumber required' });
+    return false;
+  }
+  return assertContactAccess(req, res, waNumber, contactNumber);
+}
+
+// Sonda de capacidad: el cliente habilita la confirmación de lectura sólo si esta
+// bandera existe y es true.
+router.get('/messages/meta-read-capability', requirePermission('chats'), (_req, res) => {
+  res.json({ confirmacionLecturaMeta: true });
+});
+
+router.post('/messages/processing-evidence', requirePermission('chats'), async (req, res) => {
+  try {
+    if (!assertPublicProcessingChannel(req, res)) return;
+    if (!(await assertMetaReadConversation(req, res))) return;
+    const result = await recordProcessingEvidence({
+      actor: req.user,
+      processingChannel: PUBLIC_PROCESSING_CHANNEL,
+      waNumber: req.body.waNumber,
+      contactNumber: req.body.contactNumber,
+      messageIds: req.body.messageIds,
+      confirm: req.body.confirm,
+    });
+    res.json(result);
+  } catch (error) {
+    sendMetaReadFailure(res, error);
+  }
+});
+
+router.post('/messages/meta-read-candidates', requirePermission('chats'), async (req, res) => {
+  try {
+    if (!assertPublicProcessingChannel(req, res)) return;
+    if (!(await assertMetaReadConversation(req, res))) return;
+    const result = await listMetaReadCandidates({
+      actor: req.user,
+      processingChannel: PUBLIC_PROCESSING_CHANNEL,
+      waNumber: req.body.waNumber,
+      contactNumber: req.body.contactNumber,
+      limit: req.body.limit === undefined ? 20 : req.body.limit,
+      includeResolved: req.body.includeResolved === undefined ? false : req.body.includeResolved,
+    });
+    res.json(result);
+  } catch (error) {
+    sendMetaReadFailure(res, error);
+  }
+});
+
+router.post('/messages/meta-read', requirePermission('chats'), async (req, res) => {
+  try {
+    if (!assertPublicProcessingChannel(req, res)) return;
+    if (!(await assertMetaReadConversation(req, res))) return;
+    const result = await confirmMetaRead({
+      actor: req.user,
+      processingChannel: PUBLIC_PROCESSING_CHANNEL,
+      waNumber: req.body.waNumber,
+      contactNumber: req.body.contactNumber,
+      messageIds: req.body.messageIds,
+      confirm: req.body.confirm,
+    });
+    res.json(result);
+  } catch (error) {
+    sendMetaReadFailure(res, error);
+  }
+});
+
 // POST /api/messages/mark-read — stamp a conversation as read (agent opened it).
 // Clears the unread badge for this (wa_number, contact_number).
 router.post('/messages/mark-read', async (req, res) => {
@@ -674,6 +789,7 @@ router.get('/messages', async (req, res) => {
       waNumber, contactNumber,
       page = '1', limit = '50',
       search = '', direction = 'all',
+      timeRange,
     } = req.query;
 
     if (!waNumber || !contactNumber) {
@@ -685,12 +801,16 @@ router.get('/messages', async (req, res) => {
     const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
     const offset = (pageNum - 1) * limitNum;
 
+    const interval = timeRangeToInterval(timeRange);
+    let timeFilter = `timestamp >= NOW() - ${DEFAULT_DATA_WINDOW}`;
+    if (interval) timeFilter = `timestamp >= NOW() - ${interval}`;
+
     const params = [waNumber, contactNumber];
     let paramIdx = 3;
     const conditions = [
       'wa_number = $1',
       'contact_number = $2',
-      `timestamp >= NOW() - ${DEFAULT_DATA_WINDOW}`,
+      timeFilter,
       // Defensive: never render status-receipt rows as chat bubbles (legacy
       // phantom "Status: delivered" rows; the webhook no longer creates these).
       `message_type <> 'status'`,
@@ -748,7 +868,10 @@ router.get('/messages', async (req, res) => {
       messages: rows
         // Strip raw_payload (the full Meta webhook JSON) — it's internal-only,
         // never read by the client, and can carry extra PII / metadata.
-        .map(({ raw_payload, ...m }) => ({ ...m, reactions: reactionsByMsg[m.message_id] || [] }))
+        .map(({ raw_payload, surface_attestation_ref, ...m }) => ({
+          ...m,
+          reactions: reactionsByMsg[m.message_id] || [],
+        }))
         .reverse(), // oldest first for chat display
       total,
       page: pageNum,
@@ -903,28 +1026,74 @@ router.post('/messages/star', async (req, res) => {
 
 /**
  * POST /messages/send
- * Body: { fromNumber, toNumber, text }
+ * Body: { fromNumber, toNumber, text, caseRef?, replyContext?, purpose?, surfaceKey? }
  * Inserts an optimistic chat_history row (status='sending') and enqueues a
  * BullMQ job. Returns the row immediately so the UI can render the bubble.
  */
 router.post('/messages/send', async (req, res) => {
   try {
-    const { fromNumber, toNumber, text, contextMessageId } = req.body || {};
+    const {
+      fromNumber,
+      toNumber,
+      text,
+      contextMessageId,
+      caseRef,
+      replyContext,
+      purpose,
+      surfaceKey,
+    } = req.body || {};
     if (!fromNumber || !toNumber || !text || !String(text).trim()) {
       return res.status(400).json({ error: 'fromNumber, toNumber, text required' });
     }
     if (String(text).length > 4096) {
       return res.status(400).json({ error: 'Message too long (max 4096 characters)' });
     }
-    // Ownership: the (wa_number, contact_number) pair must belong to the
-    // requester (admins bypass). This ties fromNumber to the user and gates
-    // toNumber — a non-admin can't send from a WABA or to a contact they don't own.
+    const forbidden = [
+      'account_key', 'accountKey', 'attestation', 'attestationRef', 'signature', 'url',
+      'phone', 'author', 'history',
+    ];
+    if (forbidden.some(key => Object.prototype.hasOwnProperty.call(req.body || {}, key))) {
+      return res.status(400).json({ error: 'Server-derived surface fields are not accepted.', code: 'SURFACE_NOT_AUTHORIZED' });
+    }
+    const normalizedCaseRef = caseRef == null ? '' : String(caseRef).trim();
+    const normalizedReplyContext = replyContext == null ? '' : String(replyContext).trim();
+    const normalizedPurpose = purpose == null ? '' : String(purpose).trim();
+    const normalizedSurfaceKey = surfaceKey == null ? '' : String(surfaceKey).trim();
+    const hasCaseRef = normalizedCaseRef !== '';
+    const hasReplyContext = normalizedReplyContext !== '';
+    const hasPurpose = normalizedPurpose !== '';
+    const hasSurface = normalizedSurfaceKey !== '';
+    const someSurfaceDetails = hasPurpose || hasSurface;
+    const hasCompleteContract = hasCaseRef && hasPurpose && hasSurface;
+    if (someSurfaceDetails && !hasCompleteContract) {
+      return res.status(400).json({
+        error: 'caseRef, purpose and surfaceKey must be supplied together.',
+        code: 'INVALID_PURPOSE',
+      });
+    }
+    if ((hasReplyContext && !hasCaseRef)
+        || (hasCaseRef && !hasReplyContext && !hasCompleteContract)) {
+      return res.status(400).json({
+        error: 'caseRef and replyContext must be supplied together when no surface contract is present.',
+        code: 'INVALID_CONTEXT_CONTRACT',
+      });
+    }
+    if (hasCaseRef && normalizedCaseRef.length > 120) {
+      return res.status(400).json({ error: 'caseRef too long (max 120 characters)', code: 'INVALID_CONTEXT_CONTRACT' });
+    }
+    if (hasReplyContext && normalizedReplyContext.length > 500) {
+      return res.status(400).json({ error: 'replyContext too long (max 500 characters)', code: 'INVALID_CONTEXT_CONTRACT' });
+    }
+    const handoffTemplateMeta = hasReplyContext ? {
+      source: 'nexus_cli',
+      case_ref: normalizedCaseRef,
+      reply_context: normalizedReplyContext,
+    } : null;
     if (!(await assertContactAccess(req, res, fromNumber, toNumber))) return;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: fromNumber });
     if (error) return res.status(400).json({ error });
 
-    // Enforce Meta's 24h customer service window for free-form text
     const secs = await secondsSinceLastIncoming({ accountPhoneNumberId: account.phoneNumberId, contactNumber: toNumber });
     if (secs == null || secs > SERVICE_WINDOW_SECONDS) {
       return res.status(409).json({
@@ -934,23 +1103,81 @@ router.post('/messages/send', async (req, res) => {
     }
 
     const ctxId = sanitizeContextId(contextMessageId);
-    const localId = await insertPendingRow({
-      account, toNumber, messageType: 'text', messageBody: String(text).trim(),
-      contextMessageId: ctxId,
-    });
-
     const trimmedText = String(text).trim();
+    let localId;
+    if (hasCompleteContract) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const senderPair = await client.query(
+          `SELECT 1
+             FROM coexistence.whatsapp_accounts a
+             JOIN coexistence.contacts c
+               ON regexp_replace(c.wa_number, '[^0-9]', '', 'g') = regexp_replace(a.display_phone_number, '[^0-9]', '', 'g')
+            WHERE a.id=$1 AND a.is_active=TRUE
+              AND regexp_replace(a.display_phone_number, '[^0-9]', '', 'g')=$2
+              AND regexp_replace(c.contact_number, '[^0-9]', '', 'g')=$3`,
+          [account.id, String(fromNumber).replace(/\D/g, ''), String(toNumber).replace(/\D/g, '')]
+        );
+        if (senderPair.rows.length !== 1) {
+          throw new SurfaceContractError('SURFACE_NOT_AUTHORIZED', 'La cuenta emisora no coincide con el contacto.');
+        }
+        const accountKey = await resolveContactAccountKey(client, toNumber);
+        const correlationId = localMessageId();
+        const attestation = await attestOutboundPayload(client, {
+          accountKey,
+          caseRef: normalizedCaseRef,
+          purpose: normalizedPurpose,
+          surfaceKey: normalizedSurfaceKey,
+          body: trimmedText,
+          correlationId,
+          actorId: String(req.user?.id || 'operator'),
+        });
+        localId = await insertPendingRow({
+          account,
+          toNumber,
+          messageType: 'text',
+          messageBody: trimmedText,
+          contextMessageId: ctxId,
+          db: client,
+          correlationId,
+          surfaceAttestationRef: attestation?.attestationRef || null,
+          outboundPurpose: normalizedPurpose,
+          caseRef: normalizedCaseRef,
+          templateMeta: handoffTemplateMeta,
+        });
+        await client.query('COMMIT');
+      } catch (contractError) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw contractError;
+      } finally {
+        client.release();
+      }
+    } else {
+      localId = await insertPendingRow({
+        account,
+        toNumber,
+        messageType: 'text',
+        messageBody: trimmedText,
+        contextMessageId: ctxId,
+        templateMeta: handoffTemplateMeta,
+      });
+    }
+
     await enqueueSend({
       kind: 'text',
       accountId: account.id,
       to: String(toNumber).replace(/\D/g, ''),
       localMessageId: localId,
-      // Enable WhatsApp link preview when the message contains a URL
+      requiresSurfaceContract: hasCompleteContract,
       payload: { body: trimmedText, previewUrl: /https?:\/\/\S+/i.test(trimmedText), contextMessageId: ctxId },
     });
 
     res.status(202).json({ ok: true, messageId: localId, correlationId: localId, status: 'sending' });
   } catch (err) {
+    if (err instanceof SurfaceContractError) {
+      return res.status(err.status || 400).json({ error: err.message, code: err.code });
+    }
     console.error('[messages] send error:', err.message);
     res.status(500).json({ error: 'Failed to enqueue send' });
   }

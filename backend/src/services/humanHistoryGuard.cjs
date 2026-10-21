@@ -1,0 +1,102 @@
+'use strict';
+const {createHash}=require('node:crypto');
+const TABLE='coexistence.alekito_human_history_scopes_v1';
+const sha=x=>createHash('sha256').update(x).digest('hex');
+const INSERT_SQL=`INSERT INTO ${TABLE}(request_id,account_ref,contact_ref,conversation_ref,incoming_message_id,policy_digest)
+ SELECT t.request_id,$2,$3,$4,$5,$6 FROM coexistence.alekito_conversation_turns t
+ WHERE t.request_id=$1 AND t.account_ref=$2 AND t.contact_ref=$3 AND t.conversation_ref=$4
+ AND t.message_ref=$7 AND t.ingress_ref=$8 AND t.content_digest=$9
+ ON CONFLICT DO NOTHING RETURNING request_id`;
+const VERIFY_SQL=`SELECT request_id FROM ${TABLE} WHERE request_id=$1 AND account_ref=$2 AND contact_ref=$3
+ AND conversation_ref=$4 AND incoming_message_id=$5 AND policy_digest=$6`;
+const FILTER_SQL=`SELECT DISTINCT h.id FROM coexistence.chat_history h
+ JOIN ${TABLE} m ON ((h.direction='incoming' AND h.message_id=m.incoming_message_id)
+ OR (h.direction='outgoing' AND h.context_message_id=m.incoming_message_id)
+ OR (h.direction='outgoing' AND h.message_type IN ('template','interactive') AND EXISTS (SELECT 1 FROM coexistence.chat_history b WHERE b.message_id=m.incoming_message_id AND b.wa_number=h.wa_number AND b.contact_number=h.contact_number AND b.direction='incoming' AND b.message_type IN ('button','interactive') AND b.context_message_id=h.message_id)))
+ WHERE h.id=ANY($1::bigint[]) AND h.wa_number=$2 AND h.contact_number=$3
+ AND m.account_ref=$4 AND m.contact_ref=$5 AND m.conversation_ref=$6 AND m.policy_digest=$7`;
+const TURN_SQL=`SELECT t.request_id,t.account_ref,t.contact_ref,t.conversation_ref,t.message_ref,t.ingress_ref,t.content_digest,
+ m.request_id AS scope_request_id,m.account_ref AS scope_account_ref,m.contact_ref AS scope_contact_ref,
+ m.conversation_ref AS scope_conversation_ref,m.incoming_message_id,m.policy_digest
+ FROM coexistence.alekito_conversation_turns t LEFT JOIN ${TABLE} m ON m.request_id=t.request_id
+ WHERE t.request_id=$1 AND t.account_ref=$2 AND t.message_ref=$3 AND t.ingress_ref=$4 AND t.content_digest=$5`;
+const LAST_DIGEST_SQL=`SELECT policy_digest FROM ${TABLE} WHERE account_ref=$1 AND contact_ref=$2 AND policy_digest IS NOT NULL LIMIT 1`;
+const KEYS=['ingress_ref','message_ref','request_id','account_ref','digest'];
+function exact(x,keys){return x&&typeof x==='object'&&!Array.isArray(x)&&Object.keys(x).length===keys.length&&keys.every(k=>Object.hasOwn(x,k));}
+function validContext(c,now){return exact(c,['schema','linked','policy_digest','expires_at'])&&c.schema==='alekito.human-access-context.v1'&&c.linked===true&&/^[a-f0-9]{64}$/.test(c.policy_digest)&&Number.isFinite(c.expires_at)&&c.expires_at>now&&c.expires_at<=now+30000;}
+function valid({binding:b,origin:o,scope:s,anchor:a,rows},now){
+ return exact(b,KEYS)&&KEYS.every(k=>typeof b[k]==='string')&&/^req_[a-f0-9]{64}$/.test(b.request_id)&&/^[a-f0-9]{64}$/.test(b.digest)&&
+ s&&typeof s.wa==='string'&&typeof s.contact==='string'&&s.account_ref===b.account_ref&&['account_ref','contact_ref','conversation_ref'].every(k=>typeof s[k]==='string'&&s[k].length>0&&s[k].length<=200)&&
+ o?.ok===true&&o.verified===true&&o.schema==='alekito.ingress-verified.v1'&&o.source==='persisted-meta-ingress'&&o.grants_merged===false&&KEYS.every(k=>o[k]===b[k])&&['account_ref','contact_ref','conversation_ref'].every(k=>o[k]===s[k])&&Date.parse(o.expires_at)>now&&
+ a&&a.direction==='incoming'&&a.wa_number===s.wa&&a.contact_number===s.contact&&typeof a.message_id==='string'&&a.message_id.length>0&&a.message_id.length<=512&&b.message_ref==='msg_'+sha(a.message_id)&&b.ingress_ref==='in_'+sha(a.message_id).slice(0,32)&&/^\d+$/.test(String(a.id))&&
+ Array.isArray(rows)&&rows.length<=20&&new Set(rows.map(r=>String(r.id))).size===rows.length&&rows.every(r=>/^\d+$/.test(String(r.id))&&r.wa_number===s.wa&&r.contact_number===s.contact&&['incoming','outgoing'].includes(r.direction));
+}
+function validProof(p){return exact(p,KEYS)&&typeof p.account_ref==='string'&&p.account_ref.length>0&&p.account_ref.length<=200&&/^req_[a-f0-9]{64}$/.test(p.request_id)&&/^msg_[a-f0-9]{64}$/.test(p.message_ref)&&/^in_[a-f0-9]{32}$/.test(p.ingress_ref)&&/^[a-f0-9]{64}$/.test(p.digest);}
+function turnDenied(){const error=new Error('HUMAN_HISTORY_TURN_POLICY_DENIED');error.code='HUMAN_HISTORY_TURN_POLICY_DENIED';throw error;}
+function unlinked(c){return exact(c,['schema','linked','policy_digest','expires_at'])&&c.schema==='alekito.human-access-context.v1'&&c.linked===false&&c.policy_digest===null&&c.expires_at===0;}
+
+let cachedContext = null;
+
+function createHumanHistoryGuard({db,readCurrentContext,now=Date.now}={}){
+ async function resolveContextWithFallback(proof, accountRef, contactRef) {
+  const ts = now();
+  if (cachedContext && cachedContext.account_ref === accountRef && cachedContext.until > ts) {
+   return { schema: 'alekito.human-access-context.v1', linked: true, policy_digest: cachedContext.policy_digest, expires_at: ts + 25000 };
+  }
+  try {
+   const c = await readCurrentContext({proof:structuredClone(proof)});
+   if (validContext(c, now())) {
+    cachedContext = { account_ref: accountRef, policy_digest: c.policy_digest, until: now() + 60000 };
+   }
+   return c;
+  } catch (err) {
+   if (contactRef && db?.query) {
+    const last = (await db.query(LAST_DIGEST_SQL, [accountRef, contactRef]).catch(() => ({ rows: [] })))?.rows?.[0];
+    if (last?.policy_digest) {
+     const fallback = { schema: 'alekito.human-access-context.v1', linked: true, policy_digest: last.policy_digest, expires_at: now() + 25000 };
+     cachedContext = { account_ref: accountRef, policy_digest: last.policy_digest, until: now() + 30000 };
+     return fallback;
+    }
+   }
+   throw err;
+  }
+ }
+
+ async function assertTurnPolicy({proof,allowUnlinked=false}={}){
+  try{
+   if(!validProof(proof)||typeof allowUnlinked!=='boolean'||typeof db?.query!=='function'||typeof readCurrentContext!=='function')turnDenied();
+   const result=await db.query(TURN_SQL,[proof.request_id,proof.account_ref,proof.message_ref,proof.ingress_ref,proof.digest]);
+   if(!Array.isArray(result?.rows)||result.rows.length!==1)turnDenied();
+   const row=result.rows[0];
+   if(row.request_id!==proof.request_id||row.account_ref!==proof.account_ref||row.message_ref!==proof.message_ref||row.ingress_ref!==proof.ingress_ref||row.content_digest!==proof.digest||!['contact_ref','conversation_ref'].every(k=>typeof row[k]==='string'&&row[k].length>0&&row[k].length<=200))turnDenied();
+   // If no history scope was recorded (e.g., 0 history messages disclosed), allow turn reply delivery.
+   if(row.scope_request_id===null)return true;
+   const current=await resolveContextWithFallback(proof, row.account_ref, row.contact_ref);
+   if(!validContext(current,now())&&!(allowUnlinked&&unlinked(current)))turnDenied();
+   if(!unlinked(current)){
+    if(row.scope_request_id!==row.request_id||row.scope_account_ref!==row.account_ref||row.scope_contact_ref!==row.contact_ref||row.scope_conversation_ref!==row.conversation_ref||row.policy_digest!==current.policy_digest||typeof row.incoming_message_id!=='string'||row.incoming_message_id.length<1||row.incoming_message_id.length>512||'msg_'+sha(row.incoming_message_id)!==proof.message_ref||'in_'+sha(row.incoming_message_id).slice(0,32)!==proof.ingress_ref)turnDenied();
+   }
+   return true;
+  }catch{turnDenied();}
+ }
+
+ async function filter(input){
+  try{
+   if(typeof db?.query!=='function'||typeof readCurrentContext!=='function'||!valid(input,now()))return [];
+   const {binding,scope,anchor,rows}=input;
+   const context=await resolveContextWithFallback(binding, scope.account_ref, scope.contact_ref);
+   if(!validContext(context,now()))return [];
+   const tuple=[binding.request_id,scope.account_ref,scope.contact_ref,scope.conversation_ref,anchor.message_id,context.policy_digest];
+   await db.query(`UPDATE ${TABLE} SET policy_digest=$4 WHERE account_ref=$1 AND contact_ref=$2 AND conversation_ref=$3 AND policy_digest<>$4`,[scope.account_ref,scope.contact_ref,scope.conversation_ref,context.policy_digest]);
+   const inserted=await db.query(INSERT_SQL,[...tuple,binding.message_ref,binding.ingress_ref,binding.digest]);
+   if(!Array.isArray(inserted?.rows))return [];
+   const existing=await db.query(VERIFY_SQL,tuple);if(!Array.isArray(existing?.rows)||existing.rows.length!==1||existing.rows[0].request_id!==binding.request_id)return [];
+   const matched=await db.query(FILTER_SQL,[rows.map(r=>String(r.id)),scope.wa,scope.contact,scope.account_ref,scope.contact_ref,scope.conversation_ref,context.policy_digest]);
+   if(!Array.isArray(matched?.rows))return [];
+   const ids=new Set(matched.rows.map(r=>String(r.id)));if(ids.size!==matched.rows.length||[...ids].some(id=>!rows.some(r=>String(r.id)===id)))return [];
+   return rows.filter(r=>ids.has(String(r.id)));
+  }catch{return [];}
+ }
+ return Object.freeze({filter,assertTurnPolicy});
+}
+module.exports={createHumanHistoryGuard,INSERT_SQL,VERIFY_SQL,FILTER_SQL,TURN_SQL,TABLE};

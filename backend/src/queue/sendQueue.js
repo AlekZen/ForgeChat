@@ -1,3 +1,5 @@
+
+function normalizeWhatsAppBold(s) { return typeof s === 'string' ? s.replace(/\*\*([^*\n]+)\*\*/g, '*$1*') : s; }
 // BullMQ outbound send queue. Rate-limited at 60 messages/sec by default
 // (well under Meta Tier 1's 80/sec ceiling). All four send-origin paths
 // (chat reply, broadcast, automation, template test) enqueue here.
@@ -7,9 +9,22 @@ const IORedis = require('ioredis');
 const pool = require('../db');
 const { getAccountWithToken } = require('../routes/whatsappAccounts');
 const { sendText, sendTemplate, sendMedia, sendInteractive, sendLocation, sendContacts, sendReaction } = require('../integrations/metaSend');
-const { markSent, markFailed } = require('../services/messageSender');
+const { markSent, markFailed, markNoVerificable, markInboundReadAfterEnqueue } = require('../services/messageSender');
 const { markAccountHealth, classifyMetaError } = require('../services/accountHealth');
 const { validateTemplateSend } = require('../integrations/templateValidator');
+const {
+  SurfaceContractError,
+  resolveContactAccountKey,
+  validateOutboundAttestation,
+  validatePurposeAndUrls,
+} = require('../services/outboundSurfaceContract');
+const {
+  FollowUpError,
+  claimFollowUpOutbound,
+  onFollowUpOutboundAccepted,
+  onFollowUpOutboundFailed,
+  onFollowUpOutboundUnknown,
+} = require('../services/followUpService');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
 const QUEUE_NAME = 'forgecrm-send';
@@ -64,8 +79,93 @@ async function stampTemplateName(localMessageId, templateName) {
   ).catch(err => console.error('[sendQueue] template_name stamp failed:', err.message));
 }
 
+async function validateSurfaceContractBeforeMeta({ kind, account, to, localMessageId, payload, requiresSurfaceContract = false }) {
+  if (!localMessageId) return null;
+  const { rows } = await pool.query(
+    `SELECT phone_number_id, contact_number, message_body, surface_attestation_ref,
+            outbound_purpose, case_ref, send_correlation_id
+       FROM coexistence.chat_history
+      WHERE send_correlation_id = $1`,
+    [localMessageId]
+  );
+  if (rows.length !== 1) {
+    if (requiresSurfaceContract) {
+      throw new SurfaceContractError('SURFACE_NOT_AUTHORIZED', 'No existe un único outbox para el contrato.');
+    }
+    return null;
+  }
+  const row = rows[0];
+  if (!row.outbound_purpose && !row.surface_attestation_ref) {
+    if (requiresSurfaceContract) {
+      throw new SurfaceContractError('SURFACE_NOT_AUTHORIZED', 'El outbox perdió su contrato de superficie.');
+    }
+    return null;
+  }
+  if (String(row.phone_number_id || '') !== String(account.phoneNumberId || '')) {
+    throw new SurfaceContractError('SURFACE_NOT_AUTHORIZED', 'La cuenta emisora no coincide con el contrato.');
+  }
+  if (String(row.contact_number || '') !== String(to || '').replace(/\D/g, '')) {
+    throw new SurfaceContractError('SURFACE_NOT_AUTHORIZED', 'El contacto no coincide con el contrato.');
+  }
+
+  let finalBody;
+  if (kind === 'text') finalBody = String(payload?.body || '');
+  else if (kind === 'media') finalBody = String(payload?.caption || '');
+  else finalBody = String(row.message_body || '');
+  if (kind === 'text' && finalBody !== String(row.message_body || '')) {
+    throw new SurfaceContractError('SURFACE_URL_MISMATCH', 'El job no coincide con el payload persistido.');
+  }
+
+  const accountKey = await resolveContactAccountKey(pool, row.contact_number);
+  if (row.surface_attestation_ref) {
+    return validateOutboundAttestation(pool, {
+      attestationRef: row.surface_attestation_ref,
+      accountKey,
+      contactNumber: row.contact_number,
+      body: finalBody,
+      correlationId: row.send_correlation_id,
+    });
+  }
+  validatePurposeAndUrls({ purpose: row.outbound_purpose, surface: null, body: finalBody });
+  return { purpose: row.outbound_purpose, caseRef: row.case_ref };
+}
+
+function isFollowUpOrigin(originRef) {
+  return originRef?.kind === 'follow_up_opener' || originRef?.kind === 'follow_up_delivery';
+}
+
+function isAmbiguousSendError(error) {
+  if (error?.providerAcceptancePossible) return true;
+  const codes = [error?.code, error?.cause?.code]
+    .map(value => String(value || '').toUpperCase())
+    .filter(Boolean);
+  const ambiguousCodes = new Set([
+    'ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'EPIPE',
+    'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
+    'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  ]);
+  if (codes.some(code => ambiguousCodes.has(code))) return true;
+  const messages = `${error?.message || ''} ${error?.cause?.message || ''}`;
+  return /(fetch failed|timeout|timed out|socket hang up|connection reset|meta returned no message id)/i.test(messages);
+}
+
+function publicSendCode(error, ambiguous) {
+  if (ambiguous) return 'FOLLOWUP_SEND_UNKNOWN';
+  if (error?.templateBlocked) return 'FOLLOWUP_TRIGGER_FAILED';
+  if (error instanceof SurfaceContractError || error instanceof FollowUpError) return error.code;
+  return 'FOLLOWUP_SEND_FAILED';
+}
+
 async function processJob(job) {
-  const { kind, accountId, to, localMessageId, payload, originRef } = job.data || {};
+  // Revalidate bridge owner, approved template and immutable schema before Meta.
+  if (job.data?.alekitoBridgeRequestId) {
+    await require('../services/alekitoBridge').validateBridgeDispatch(job.data);
+  }
+  if (job.data?.alekitoConversationRequestId) {
+    await require('../services/alekitoBridge').validateConversationDispatch(job.data);
+  }
+  const { kind, accountId, to, localMessageId, payload, originRef, requiresSurfaceContract } = job.data || {};
+  if (isFollowUpOrigin(originRef)) await claimFollowUpOutbound({ db: pool, originRef });
   const account = await getAccountWithToken(accountId);
   if (!account) throw new Error(`Account id=${accountId} not found`);
   if (!account.accessToken) throw new Error('Access token missing');
@@ -94,6 +194,8 @@ async function processJob(job) {
     }
   }
 
+  await validateSurfaceContractBeforeMeta({ kind, account, to, localMessageId, payload, requiresSurfaceContract });
+
   // G-BRAIN sandbox QA: los números 52199900XXXXX son ficticios (harness E2E).
   // Enviarlos por el WABA real es riesgo de calidad ante Meta (decenas de envíos
   // a números inexistentes). Tras pasar la validación de template (fidelidad del
@@ -106,6 +208,9 @@ async function processJob(job) {
     const sandboxWamid = `wamid.qa-sandbox.${Date.now()}.${job.id || '0'}`;
     if (localMessageId) await markSent(localMessageId, sandboxWamid);
     if (kind === 'template') await stampTemplateName(localMessageId, payload?.name);
+    if (isFollowUpOrigin(originRef)) {
+      await onFollowUpOutboundAccepted({ db: pool, originRef, wamid: sandboxWamid });
+    }
     console.log('[sendQueue] QA sandbox: egress a Meta OMITIDO kind=%s to=%s wamid=%s', kind, to, sandboxWamid);
     return { wamid: sandboxWamid, qaSandbox: true };
   }
@@ -113,13 +218,13 @@ async function processJob(job) {
   let result;
   try {
     if (kind === 'text') {
-      result = await sendText({ ...args, body: payload.body, previewUrl: payload.previewUrl, contextMessageId: payload.contextMessageId });
+      result = await require('../services/alekitoBridge').withOwnerNotificationEgress({job:job.data,account},({signal}={})=>sendText({ ...args, signal, body: payload.body, previewUrl: payload.previewUrl, contextMessageId: payload.contextMessageId }));
     } else if (kind === 'template') {
-      result = await sendTemplate({ ...args, templateName: payload.name, languageCode: payload.languageCode, components: payload.components });
+      result = await require('../services/alekitoBridge').withOwnerNotificationEgress({job:job.data,account},({signal}={})=>sendTemplate({ ...args, signal, templateName: payload.name, languageCode: payload.languageCode, components: payload.components }));
     } else if (kind === 'media') {
       result = await sendMedia({ ...args, type: payload.type, mediaId: payload.mediaId, link: payload.link, caption: payload.caption, filename: payload.filename, contextMessageId: payload.contextMessageId });
     } else if (kind === 'interactive') {
-      result = await sendInteractive({ ...args, interactive: payload.interactive });
+      result = await sendInteractive({ ...args, interactive: payload.interactive, contextMessageId: payload.contextMessageId });
     } else if (kind === 'location') {
       result = await sendLocation({ ...args, latitude: payload.latitude, longitude: payload.longitude, name: payload.name, address: payload.address });
     } else if (kind === 'contacts') {
@@ -131,6 +236,10 @@ async function processJob(job) {
     }
     await markAccountHealth(account.id, 'healthy');
   } catch (err) {
+    if (err instanceof require('../services/alekitoNotificationError').NotificationError && err.notificationSuppressed === true) {
+      err.skipRetry = true; // Local guard, no provider attempt or account-health failure.
+      throw err;
+    }
     const cls = classifyMetaError(err);
     await markAccountHealth(account.id, cls, err.message);
     // Outbound egress is at-most-once. Every synchronous provider rejection is
@@ -142,11 +251,24 @@ async function processJob(job) {
   }
 
   const wamid = result?.messages?.[0]?.id;
-  if (!wamid) throw new Error('Meta returned no message id');
+  if (!wamid) {
+    const error = new Error('Meta returned no message id');
+    error.providerAcceptancePossible = true;
+    throw error;
+  }
 
-  // Swap the optimistic row's local id for the real wamid
-  if (localMessageId) await markSent(localMessageId, wamid);
-  if (kind === 'template') await stampTemplateName(localMessageId, payload?.name);
+  // Meta ya pudo aceptar el mensaje. Cualquier fallo local posterior es ambiguo:
+  // nunca autoriza un segundo POST.
+  try {
+    if (localMessageId) await markSent(localMessageId, wamid);
+    if (kind === 'template') await stampTemplateName(localMessageId, payload?.name);
+    if (isFollowUpOrigin(originRef)) {
+      await onFollowUpOutboundAccepted({ db: pool, originRef, wamid });
+    }
+  } catch (error) {
+    error.providerAcceptancePossible = true;
+    throw error;
+  }
 
   // Update origin-side linkage (broadcast_log etc) if provided
   if (originRef?.kind === 'broadcast_log' && originRef.id) {
@@ -184,7 +306,14 @@ function startSendWorker() {
     const localId = job?.data?.localMessageId;
     console.error(`[sendQueue] ${job?.data?.kind} to ${job?.data?.to} failed attempt=${job?.attemptsMade || 1}/${ATTEMPTS}: ${err.message}`);
     if (localId) {
-      await markFailed(localId, err.message).catch(() => {});
+      const ambiguous = isAmbiguousSendError(err);
+      const code = publicSendCode(err, ambiguous);
+      if (ambiguous) await markNoVerificable(localId, code).catch(() => {});
+      else await markFailed(localId, code).catch(() => {});
+      if (isFollowUpOrigin(job?.data?.originRef)) {
+        const callback = ambiguous ? onFollowUpOutboundUnknown : onFollowUpOutboundFailed;
+        await callback({ db: pool, originRef: job.data.originRef, publicCode: code }).catch(() => {});
+      }
       if (job?.data?.originRef?.kind === 'broadcast_log') {
         await pool.query(
           `UPDATE coexistence.broadcast_logs SET status='failed', error_message=$1 WHERE id=$2`,
@@ -203,8 +332,11 @@ function startSendWorker() {
 
 async function enqueueSend(jobData, opts = {}) {
   const idKey = jobData.localMessageId || `${jobData.accountId}-${jobData.to}-${Date.now()}`;
+  // BullMQ reserva ':' como separador interno; la correlación durable lo usa,
+  // así que el jobId conserva identidad sustituyendo sólo ese separador.
+  const stableJobId = `send-${String(idKey).replace(/:/g, '~')}`;
   const addOpts = {
-    jobId: `send-${idKey}`,
+    jobId: stableJobId,
     attempts: ATTEMPTS,
     removeOnComplete: { count: 500, age: 3600 },
     removeOnFail: { count: 1000, age: 86400 },
@@ -214,6 +346,10 @@ async function enqueueSend(jobData, opts = {}) {
   // worker picks it up — non-blocking, no scheduler needed.
   if (opts.delayMs && opts.delayMs > 0) addOpts.delay = Math.round(opts.delayMs);
   await sendQueue.add('send', jobData, addOpts);
+  await markInboundReadAfterEnqueue({
+    accountId: jobData.accountId,
+    localMessageId: jobData.localMessageId,
+  }).catch(error => console.error('[palomita] post-enqueue read failed:', error.message));
 }
 
 async function shutdownSendQueue() {
@@ -227,4 +363,12 @@ async function shutdownSendQueue() {
   }
 }
 
-module.exports = { sendQueue, startSendWorker, enqueueSend, shutdownSendQueue };
+module.exports = {
+  sendQueue,
+  startSendWorker,
+  enqueueSend,
+  shutdownSendQueue,
+  processJob,
+  validateSurfaceContractBeforeMeta,
+  isAmbiguousSendError,
+};

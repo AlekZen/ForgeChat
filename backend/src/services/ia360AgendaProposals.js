@@ -1,0 +1,1799 @@
+// services/ia360AgendaProposals.js — Módulo puro y orquestador de propuestas de agenda
+// durables con confirmación obligatoria del owner (Alek) y soporte independiente de recursos (Calendar, Zoom, ambos).
+//
+// CONTRATO Y ARQUITECTURA (2026-09-08):
+// 1. Las herramientas del agente (proponer_reunion / cancelar_reunion) NUNCA autorizan
+//    escrituras directamente ni pasan un booleano $fromAI.
+// 2. Campo obligatorio `resources`: array canónico único de 'calendar' y/o 'zoom', no vacío,
+//    sin default implícito. Forma parte del hash, de la propuesta inmutable y de la autorización.
+// 3. En su lugar, llaman a POST /internal/ia360-agenda/propose para emitir una propuesta
+//    inmutable con clave única (source_message_id, kind, payload_hash) y estado 'pending'.
+// 4. El owner recibe una tarjeta interactiva en WhatsApp con la operación y recursos seleccionados,
+//    y botones estructurados: ia360_agenda_yes:<proposal_id> / ia360_agenda_no:<proposal_id>.
+// 5. Al hacer tap, el backend verifica: emisor == IA360_OWNER_NUMBER, misma línea emisora
+//    (proposal.wa_number === recordWa), propuesta pending y no expirada (30 min),
+//    bloqueo asesor global (pg_try_advisory_lock), reclamo atómico condicional con commit previo a I/O,
+//    y ejecuta el writer hacia n8n con Bearer N8N_CALENDAR_TOKEN y payload con resources canónicos.
+// 6. Exige respuesta verificada por componente ({ components: { calendar?: {state, id}, zoom?: {state, id, join_url} } }).
+//    ok/verified global es true SÓLO si TODOS los recursos solicitados resultaron 'verified'.
+// 7. Parcial conserva cada resultado/ID durable sin reintento ciego ni borrar la contraparte no cancelada.
+// 8. Los comentarios del owner en tarjetas de fallo se pasan al agente en modo 'owner_assistance'.
+// 9. Validación determinista de horario laboral (RFC-058):
+//    - Zona horaria: America/Mexico_City.
+//    - Rango operativo: 08:00 a 20:00 hora local (mismo día local, start >= 08:00:00.000, end <= 20:00:00.000, end > start).
+//    - Precisión estricta a nivel milisegundo en la comparación temporal.
+//    - Error canónico: AGENDA_OUTSIDE_BUSINESS_HOURS (sin PII).
+//    - Validación antes de crear propuesta y revalidación justo antes de llamar al writer.
+//    - Cancelación permitida fuera de horario para liberar eventos.
+'use strict';
+
+const crypto = require('crypto');
+
+const PROPOSAL_EXPIRATION_MINUTES = 30;
+const PROPOSAL_STATES = [
+  'pending',
+  'executing',
+  'completed',
+  'rejected',
+  'expired',
+  'failed',
+  'execution_uncertain',
+  'blocked',
+];
+const VALID_RESOURCES = ['calendar', 'zoom'];
+const IA360_OWNER_NUMBER = process.env.IA360_OWNER_NUMBER || '5213322638033';
+const CALENDAR_ADVISORY_LOCK_ID = 36082026; // ID global estable para operaciones de calendario
+
+const AGENDA_TIMEZONE = 'America/Mexico_City';
+const BUSINESS_HOURS_START_HOUR = 8;
+const BUSINESS_HOURS_END_HOUR = 20;
+const BUSINESS_HOURS_START_STR = '08:00';
+const BUSINESS_HOURS_END_STR = '20:00';
+
+const N8N_IA360_OWNER_BOOK_WEBHOOK_URL = process.env.N8N_IA360_OWNER_BOOK_WEBHOOK_URL || 'http://n8n:5678/webhook/ia360-owner-agenda-book';
+const N8N_IA360_OWNER_CANCEL_WEBHOOK_URL = process.env.N8N_IA360_OWNER_CANCEL_WEBHOOK_URL || 'http://n8n:5678/webhook/ia360-owner-agenda-cancel';
+
+const ISO_8601_TZ_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function normalizePhone(s) {
+  if (!s) return '';
+  return String(s).replace(/\D/g, '');
+}
+
+function maskNumber(number) {
+  const s = String(number || '');
+  if (!s) return 'sin número';
+  return `${s.slice(0, 3)}***${s.slice(-2)}`;
+}
+
+function formatDateCdMx(isoRaw) {
+  if (!isoRaw) return 'la fecha agendada';
+  try {
+    const d = new Date(isoRaw);
+    if (isNaN(d.getTime())) return 'la fecha agendada';
+    return new Intl.DateTimeFormat('es-MX', {
+      timeZone: AGENDA_TIMEZONE,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(d);
+  } catch (_) {
+    return 'la fecha agendada';
+  }
+}
+
+function formatTimeCdMx(isoRaw) {
+  if (!isoRaw) return '';
+  try {
+    const d = new Date(isoRaw);
+    if (isNaN(d.getTime())) return '';
+    return new Intl.DateTimeFormat('es-MX', {
+      timeZone: AGENDA_TIMEZONE,
+      timeStyle: 'short',
+    }).format(d);
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * Extrae los componentes de fecha/hora en la zona horaria especificada usando Intl.DateTimeFormat nativo
+ * e incluye los milisegundos con precisión temporal exacta.
+ *
+ * @param {Date} date
+ * @param {string} [timeZone='America/Mexico_City']
+ * @returns {{ year: number, month: number, day: number, hour: number, minute: number, second: number, millisecond: number }}
+ */
+function getZonedParts(date, timeZone = AGENDA_TIMEZONE) {
+  const dtf = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const p = Object.fromEntries(
+    dtf.formatToParts(date).filter(x => x.type !== 'literal').map(x => [x.type, x.value])
+  );
+  return {
+    year: +p.year,
+    month: +p.month,
+    day: +p.day,
+    hour: +p.hour,
+    minute: +p.minute,
+    second: +p.second,
+    millisecond: date.getMilliseconds(),
+  };
+}
+
+/**
+ * Valida que una reunión esté dentro del horario operativo comercial en la zona horaria indicada.
+ * Reglas de negocio (2026-09-08):
+ * - Zona horaria: America/Mexico_City (explícita).
+ * - Start >= 08:00:00.000 local, End <= 20:00:00.000 local, End > Start.
+ * - Comparación temporal estricta a nivel milisegundo (ej: 20:00:00.001 es rechazado).
+ * - Mismo día local (start y end ocurren en la misma fecha del calendario local).
+ * - Preferencia 10:00-16:00 para recomendaciones, sin rechazar 08:00-10:00 ni 16:00-20:00.
+ * - Sin excepciones por prueba, admin o confirmación tardía.
+ * - No PII en la salida de error (código de error estable AGENDA_OUTSIDE_BUSINESS_HOURS).
+ *
+ * @param {Date | string} startInput
+ * @param {Date | string} endInput
+ * @param {string} [timeZone='America/Mexico_City']
+ * @returns {{ ok: boolean, error?: string, timeZone: string, businessHours: { start: string, end: string }, startLocal?: string, endLocal?: string, isSameDay?: boolean }}
+ */
+function validateBusinessHours(startInput, endInput, timeZone = AGENDA_TIMEZONE) {
+  if (!startInput || !endInput) {
+    return {
+      ok: false,
+      error: 'invalid_iso_date',
+      timeZone,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+    };
+  }
+  const start = startInput instanceof Date ? startInput : new Date(startInput);
+  const end = endInput instanceof Date ? endInput : new Date(endInput);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return {
+      ok: false,
+      error: 'invalid_iso_date',
+      timeZone,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+    };
+  }
+
+  const startParts = getZonedParts(start, timeZone);
+  const endParts = getZonedParts(end, timeZone);
+
+  const isSameDay = startParts.year === endParts.year &&
+                    startParts.month === endParts.month &&
+                    startParts.day === endParts.day;
+
+  const startMsFromMidnight =
+    startParts.hour * 3600000 +
+    startParts.minute * 60000 +
+    startParts.second * 1000 +
+    startParts.millisecond;
+
+  const endMsFromMidnight =
+    endParts.hour * 3600000 +
+    endParts.minute * 60000 +
+    endParts.second * 1000 +
+    endParts.millisecond;
+
+  const minMs = BUSINESS_HOURS_START_HOUR * 3600000; // 08:00:00.000 -> 28,800,000 ms
+  const maxMs = BUSINESS_HOURS_END_HOUR * 3600000;   // 20:00:00.000 -> 72,000,000 ms
+
+  const startLocal = `${String(startParts.hour).padStart(2, '0')}:${String(startParts.minute).padStart(2, '0')}`;
+  const endLocal = `${String(endParts.hour).padStart(2, '0')}:${String(endParts.minute).padStart(2, '0')}`;
+
+  if (!isSameDay || startMsFromMidnight < minMs || endMsFromMidnight > maxMs || end.getTime() <= start.getTime()) {
+    return {
+      ok: false,
+      error: 'AGENDA_OUTSIDE_BUSINESS_HOURS',
+      timeZone,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+      isSameDay,
+      startLocal,
+      endLocal,
+    };
+  }
+
+  return {
+    ok: true,
+    timeZone,
+    businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+    startLocal,
+    endLocal,
+  };
+}
+
+/**
+ * Normaliza y valida el array de recursos a su forma canónica ('calendar', 'zoom' en orden fijo).
+ * Rechaza arrays vacíos, valores inválidos o ausencia de array (sin defaults implícitos).
+ *
+ * @param {any} raw
+ * @returns {string[] | null}
+ */
+function canonicalizeResources(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const set = new Set();
+  for (const item of raw) {
+    if (typeof item !== 'string') return null;
+    const norm = item.trim().toLowerCase();
+    if (!VALID_RESOURCES.includes(norm)) return null;
+    set.add(norm);
+  }
+  if (set.size === 0) return null;
+  return VALID_RESOURCES.filter(r => set.has(r));
+}
+
+/**
+ * Formatea la etiqueta legible de los recursos seleccionados.
+ */
+function formatResourceLabel(resources = []) {
+  const hasCal = resources.includes('calendar');
+  const hasZoom = resources.includes('zoom');
+  if (hasCal && hasZoom) return 'Google Calendar + Zoom';
+  if (hasCal) return 'Google Calendar';
+  if (hasZoom) return 'Zoom';
+  return 'Agenda';
+}
+
+/**
+ * Calcula un hash canónico determinista del payload para deduplicación e idempotencia.
+ * Incluye resources canónicos para que operaciones de Calendar solo, Zoom solo o ambos no colisionen.
+ */
+function computePayloadHash({ kind, resources = [], start_utc, end_utc, title, event_id, zoom_id }) {
+  const resKey = Array.isArray(resources) ? resources.join(',') : '';
+  const canonical = kind === 'book'
+    ? `book:${resKey}:${start_utc || ''}:${end_utc || ''}:${title || ''}`
+    : `cancel:${resKey}:${event_id || ''}:${zoom_id || ''}`;
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Valida los parámetros de entrada de una propuesta de agenda con contrato explícito de resources.
+ *
+ * @param {object} input
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowPastDates=false]
+ * @returns {{ ok: boolean, errors: string[], sanitized: object }}
+ */
+function validateProposalInput(input = {}, { allowPastDates = false } = {}) {
+  const errors = [];
+  const waNumber = normalizePhone(input.wa_number);
+  const contactNumber = normalizePhone(input.contact_number);
+  const sourceMessageId = input.source_message_id && typeof input.source_message_id === 'string'
+    ? input.source_message_id.trim()
+    : '';
+  const kind = String(input.kind || '').trim().toLowerCase();
+  const dryRun = input.dry_run === true || input.dry_run === 'true';
+
+  if (!waNumber) errors.push('wa_number_required');
+  if (!contactNumber) errors.push('contact_number_required');
+  if (!sourceMessageId) errors.push('source_message_id_required');
+  if (!['book', 'cancel'].includes(kind)) errors.push('invalid_kind');
+
+  const canonicalResources = canonicalizeResources(input.resources);
+  if (!canonicalResources) {
+    if (!input.resources || (Array.isArray(input.resources) && input.resources.length === 0)) {
+      errors.push('resources_required');
+    } else {
+      errors.push('invalid_resources');
+    }
+  }
+
+  let startUtc = null;
+  let endUtc = null;
+  let title = input.title && typeof input.title === 'string'
+    ? input.title.trim().slice(0, 200)
+    : 'Reunión IA360';
+  let eventId = input.event_id && typeof input.event_id === 'string'
+    ? input.event_id.trim()
+    : null;
+  let zoomId = input.zoom_id && typeof input.zoom_id === 'string'
+    ? input.zoom_id.trim()
+    : (input.zoom_meeting_id ? String(input.zoom_meeting_id).trim() : null);
+
+  if (kind === 'book') {
+    if (typeof input.start_utc !== 'string' || !ISO_8601_TZ_REGEX.test(input.start_utc)) {
+      errors.push('start_utc_explicit_iso_required');
+    }
+    if (typeof input.end_utc !== 'string' || !ISO_8601_TZ_REGEX.test(input.end_utc)) {
+      errors.push('end_utc_explicit_iso_required');
+    }
+
+    if (errors.length === 0) {
+      const start = new Date(input.start_utc);
+      const end = new Date(input.end_utc);
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        errors.push('invalid_iso_date');
+      } else if (!allowPastDates && start.getTime() <= Date.now()) {
+        errors.push('start_must_be_in_future');
+      } else if (end.getTime() <= start.getTime()) {
+        errors.push('end_must_be_after_start');
+      } else {
+        const durationMs = end.getTime() - start.getTime();
+        if (durationMs < 15 * 60 * 1000) errors.push('duration_too_short');
+        if (durationMs > 24 * 60 * 60 * 1000) errors.push('duration_too_long');
+
+        const bhCheck = validateBusinessHours(start, end, AGENDA_TIMEZONE);
+        if (!bhCheck.ok) {
+          errors.push(bhCheck.error);
+        }
+
+        startUtc = start.toISOString();
+        endUtc = end.toISOString();
+      }
+    }
+  }
+
+  if (kind === 'cancel' && canonicalResources) {
+    if (canonicalResources.includes('calendar') && !eventId && !input.event_id && !zoomId) {
+      errors.push('event_id_required');
+    }
+    if (canonicalResources.includes('zoom') && !zoomId && !input.zoom_id && !input.zoom_meeting_id && !eventId) {
+      errors.push('zoom_id_required');
+    }
+  }
+
+  const payloadHash = errors.length === 0
+    ? computePayloadHash({
+        kind,
+        resources: canonicalResources,
+        start_utc: startUtc,
+        end_utc: endUtc,
+        title,
+        event_id: eventId,
+        zoom_id: zoomId,
+      })
+    : '';
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    sanitized: {
+      wa_number: waNumber,
+      contact_number: contactNumber,
+      source_message_id: sourceMessageId,
+      kind,
+      resources: canonicalResources,
+      payload_hash: payloadHash,
+      start_utc: startUtc,
+      end_utc: endUtc,
+      title,
+      event_id: eventId,
+      zoom_id: zoomId,
+      contact_name: input.contact_name && typeof input.contact_name === 'string' ? input.contact_name.trim() : null,
+      dry_run: dryRun,
+    },
+  };
+}
+
+/**
+ * Construye los botones estructurados para la tarjeta WhatsApp del owner.
+ */
+function buildProposalButtons(proposalId, kind) {
+  return [
+    {
+      type: 'reply',
+      reply: {
+        id: `ia360_agenda_yes:${proposalId}`,
+        title: kind === 'cancel' ? 'Sí, cancelar' : 'Sí, agendar',
+      },
+    },
+    {
+      type: 'reply',
+      reply: {
+        id: `ia360_agenda_no:${proposalId}`,
+        title: 'No',
+      },
+    },
+  ];
+}
+
+/**
+ * Formatea el texto de la tarjeta interactiva de propuesta para Alek indicando explícitamente los recursos.
+ */
+function formatProposalCardText({
+  kind,
+  resources = [],
+  startUtc,
+  endUtc,
+  title,
+  contactName,
+  contactNumber,
+  eventId,
+  zoomId,
+}) {
+  const who = contactName || `contacto ${maskNumber(contactNumber)}`;
+  const resourceLabel = formatResourceLabel(resources);
+
+  if (kind === 'cancel') {
+    const idLines = [];
+    if (eventId) idLines.push(`Evento ID: ${eventId}`);
+    if (zoomId) idLines.push(`Zoom ID: ${zoomId}`);
+    return [
+      'Alek, solicitud de cancelación de cita:',
+      '',
+      `Contacto: ${who} (${maskNumber(contactNumber)})`,
+      `Recursos a cancelar: ${resourceLabel}`,
+      ...(idLines.length ? [idLines.join('\n')] : []),
+      '',
+      '¿Autorizas cancelar esta reunión?',
+    ].join('\n');
+  }
+
+  const startFmt = formatDateCdMx(startUtc);
+  const endFmt = formatTimeCdMx(endUtc);
+  return [
+    'Alek, tengo una propuesta de cita pendiente de confirmación:',
+    '',
+    `Contacto: ${who} (${maskNumber(contactNumber)})`,
+    `Horario: ${startFmt}${endFmt ? ` a ${endFmt}` : ''}`,
+    `Recursos: ${resourceLabel}`,
+    `Título: ${title || 'Reunión IA360'}`,
+    '',
+    '¿Autorizas agendar esta reunión? (Expira en 30 min)',
+  ].join('\n');
+}
+
+/**
+ * Revalida si una cita pertenece al contacto y recupera el ID original y Zoom ID desde la base de datos.
+ * Acepta búsqueda por eventId o zoomId sin derivar ni forzar la selección de recursos.
+ */
+async function revalidateContactEvent({ pool, contactNumber, waNumber, eventId, zoomId, resources = [] }) {
+  if (!pool) throw new Error('database_pool_required');
+  if ((!eventId && !zoomId) || !contactNumber) return null;
+
+  try {
+    // 1. Buscar en coexistence.ia360_meeting_links
+    const { rows: linkRows } = await pool.query(
+      `SELECT token, event_id, zoom_meeting_id, zoom_join_url, kind
+         FROM coexistence.ia360_meeting_links
+        WHERE contact_number = $1
+          AND (
+            ($2::text IS NOT NULL AND lower(event_id) = lower($2))
+            OR ($3::text IS NOT NULL AND (
+              lower(zoom_join_url) = lower($3)
+              OR zoom_meeting_id::text = $3
+            ))
+          )
+        LIMIT 1`,
+      [contactNumber, eventId || null, zoomId || null]
+    );
+    if (linkRows.length) {
+      const row = linkRows[0];
+      return {
+        eventId: row.event_id || null,
+        zoomId: row.zoom_meeting_id ? String(row.zoom_meeting_id) : (row.zoom_join_url || null),
+      };
+    }
+
+    // 2. Buscar en custom_fields->ia360_bookings de coexistence.contacts bajo la misma línea
+    const { rows: contactRows } = await pool.query(
+      `SELECT c.contact_number, elem->>'event_id' AS evt, elem->>'zoom_id' AS zoom
+         FROM coexistence.contacts c,
+              LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(c.custom_fields->'ia360_bookings')='array'
+                     THEN c.custom_fields->'ia360_bookings' ELSE '[]'::jsonb END
+              ) elem
+        WHERE c.contact_number = $1 AND ($2 = '' OR c.wa_number = $2)
+          AND (
+            ($3::text IS NOT NULL AND lower(elem->>'event_id') = lower($3))
+            OR ($4::text IS NOT NULL AND lower(elem->>'zoom_id') = lower($4))
+          )
+        LIMIT 1`,
+      [contactNumber, waNumber || '', eventId || null, zoomId || null]
+    );
+    if (contactRows.length) {
+      return {
+        eventId: contactRows[0].evt || null,
+        zoomId: contactRows[0].zoom || null,
+      };
+    }
+
+    return null;
+  } catch (err) {
+    console.error('[ia360-agenda] revalidateContactEvent error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Valida el scope del servidor: comprueba que el contacto y línea existan en la DB,
+ * y que el source_message_id corresponda a un mensaje entrante real de ese contacto. (FC-SEC-002)
+ */
+async function verifyServerScope({ pool, contactNumber, waNumber, sourceMessageId }) {
+  if (!pool) throw new Error('database_pool_required');
+  try {
+    // 1. Verificar contacto bajo la línea
+    const { rows: contactRows } = await pool.query(
+      `SELECT contact_number, wa_number,
+              COALESCE(NULLIF(trim(name),''), NULLIF(trim(profile_name),'')) AS contact_name
+         FROM coexistence.contacts
+        WHERE contact_number = $1 AND wa_number = $2
+        LIMIT 1`,
+      [contactNumber, waNumber]
+    );
+    if (!contactRows.length) return null;
+
+    // 2. FC-SEC-002: Verificar que source_message_id existe en chat_history como mensaje entrante de ese contacto y línea
+    if (sourceMessageId) {
+      const { rows: msgRows } = await pool.query(
+        `SELECT id, message_id, contact_number, wa_number, direction, message_body, timestamp
+           FROM coexistence.chat_history
+          WHERE message_id = $1
+            AND contact_number = $2
+            AND wa_number = $3
+            AND direction = 'incoming'
+          LIMIT 1`,
+        [sourceMessageId, contactNumber, waNumber]
+      );
+      if (!msgRows.length) {
+        return null;
+      }
+    }
+
+    return contactRows[0];
+  } catch (err) {
+    console.error('[ia360-agenda] verifyServerScope error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Crea una propuesta durable y despacha la tarjeta al owner si aplica.
+ */
+async function proposeAgendaAction({
+  pool,
+  input,
+  sendOwnerInteractive = null,
+  loadContactName = null,
+  allowPastDates = false,
+}) {
+  if (!pool) throw new Error('database_pool_required');
+
+  const validation = validateProposalInput(input, { allowPastDates });
+  if (!validation.ok) {
+    return {
+      ok: false,
+      state: 'blocked',
+      error: validation.errors[0],
+      errors: validation.errors,
+      timeZone: AGENDA_TIMEZONE,
+      businessHours: { start: BUSINESS_HOURS_START_STR, end: BUSINESS_HOURS_END_STR },
+      message: `Validación de propuesta fallida: ${validation.errors.join(', ')}`,
+    };
+  }
+
+  const sanitized = validation.sanitized;
+
+  // Verificación server-side del scope: contacto, línea y source_message_id real en la base de datos (FC-SEC-002)
+  const contactScope = await verifyServerScope({
+    pool,
+    contactNumber: sanitized.contact_number,
+    waNumber: sanitized.wa_number,
+    sourceMessageId: sanitized.source_message_id,
+  });
+  if (!contactScope) {
+    return {
+      ok: false,
+      state: 'blocked',
+      message: 'El contacto o source_message_id no existe en la base de datos bajo la línea emisora indicada.',
+    };
+  }
+
+  // Revalidación server-side de la cita y extracción de IDs originales para cancelación
+  let resolvedEventId = sanitized.event_id;
+  let resolvedZoomId = sanitized.zoom_id;
+  if (sanitized.kind === 'cancel') {
+    const eventInfo = await revalidateContactEvent({
+      pool,
+      contactNumber: sanitized.contact_number,
+      waNumber: sanitized.wa_number,
+      eventId: sanitized.event_id,
+      zoomId: sanitized.zoom_id,
+      resources: sanitized.resources,
+    });
+    if (!eventInfo) {
+      return {
+        ok: false,
+        state: 'blocked',
+        message: 'El evento a cancelar no pertenece a este contacto en esta línea o no existe.',
+      };
+    }
+    if (sanitized.resources.includes('calendar') && !eventInfo.eventId && !sanitized.event_id) {
+      return {
+        ok: false,
+        state: 'blocked',
+        message: 'No se encontró el ID de Google Calendar para la cancelación solicitada.',
+      };
+    }
+    if (sanitized.resources.includes('zoom') && !eventInfo.zoomId && !sanitized.zoom_id) {
+      return {
+        ok: false,
+        state: 'blocked',
+        message: 'No se encontró el ID de Zoom para la cancelación solicitada.',
+      };
+    }
+    resolvedEventId = eventInfo.eventId || sanitized.event_id;
+    resolvedZoomId = eventInfo.zoomId || sanitized.zoom_id;
+    sanitized.event_id = resolvedEventId;
+    sanitized.zoom_id = resolvedZoomId;
+  }
+
+  // Dry run: cero escrituras a DB, cero envíos al owner, cero efectos
+  if (sanitized.dry_run) {
+    return {
+      ok: true,
+      state: 'dry_run',
+      message: 'Validación exitosa (dry run, cero efectos).',
+    };
+  }
+
+  const proposalId = crypto.randomUUID();
+  let finalProposalId = proposalId;
+  const expiresAt = new Date(Date.now() + PROPOSAL_EXPIRATION_MINUTES * 60 * 1000);
+  let resolvedName = sanitized.contact_name || contactScope.contact_name;
+  if (!resolvedName && loadContactName) {
+    resolvedName = await loadContactName(sanitized.contact_number);
+  }
+  if (!resolvedName) resolvedName = `contacto ${maskNumber(sanitized.contact_number)}`;
+
+  // Inserción atómica con deduplicación por constraint UNIQUE (source_message_id, kind, payload_hash)
+  // Incluye explícitamente la columna canónica SQL `resources` (migración 057)
+  try {
+    const detalleJsonObj = {
+      source: 'internal_propose',
+      resources: sanitized.resources,
+      raw_input: input,
+    };
+
+    const { rows: insertRows } = await pool.query(
+      `INSERT INTO coexistence.ia360_agenda_proposals
+         (id, wa_number, contact_number, source_message_id, kind, resources, payload_hash, start_utc, end_utc, title, event_id, zoom_id, contact_name, estado, expires_at, detalle_json)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending', $14, $15::jsonb)
+       ON CONFLICT (source_message_id, kind, payload_hash) DO NOTHING
+       RETURNING *`,
+      [
+        proposalId,
+        sanitized.wa_number,
+        sanitized.contact_number,
+        sanitized.source_message_id,
+        sanitized.kind,
+        sanitized.resources,
+        sanitized.payload_hash,
+        sanitized.start_utc,
+        sanitized.end_utc,
+        sanitized.title,
+        resolvedEventId,
+        resolvedZoomId,
+        resolvedName,
+        expiresAt.toISOString(),
+        JSON.stringify(detalleJsonObj),
+      ]
+    );
+
+    if (insertRows.length && insertRows[0].id) {
+      finalProposalId = insertRows[0].id;
+    } else {
+      // Si hubo conflicto de unicidad, se recupera la propuesta existente sin crear duplicados
+      const { rows: existingRows } = await pool.query(
+        `SELECT id, estado, expires_at, resources FROM coexistence.ia360_agenda_proposals
+          WHERE source_message_id = $1 AND kind = $2 AND payload_hash = $3
+          LIMIT 1`,
+        [sanitized.source_message_id, sanitized.kind, sanitized.payload_hash]
+      );
+      if (existingRows.length) {
+        const existing = existingRows[0];
+        const isStillPending = existing.estado === 'pending' && new Date(existing.expires_at).getTime() > Date.now();
+        return {
+          ok: true,
+          proposal_id: existing.id,
+          state: isStillPending ? 'pending_owner_confirmation' : existing.estado,
+          message: isStillPending
+            ? 'Propuesta pendiente existente reutilizada.'
+            : `Propuesta previa existente en estado ${existing.estado}.`,
+        };
+      }
+    }
+  } catch (dbErr) {
+    console.error('[ia360-agenda] error inserting proposal:', dbErr.message);
+    return {
+      ok: false,
+      state: 'blocked',
+      message: `Error al persistir la propuesta: ${dbErr.message}`,
+    };
+  }
+
+  // Despacho de la tarjeta interactiva al owner con operación y recursos explícitos
+  if (sendOwnerInteractive) {
+    try {
+      const cardBody = formatProposalCardText({
+        kind: sanitized.kind,
+        resources: sanitized.resources,
+        startUtc: sanitized.start_utc,
+        endUtc: sanitized.end_utc,
+        title: sanitized.title,
+        contactName: resolvedName,
+        contactNumber: sanitized.contact_number,
+        eventId: resolvedEventId,
+        zoomId: resolvedZoomId,
+      });
+
+      const syntheticRecord = {
+        wa_number: sanitized.wa_number,
+        contact_number: IA360_OWNER_NUMBER,
+        message_id: `ia360-agenda-prop-${finalProposalId}`,
+        message_body: '',
+        message_type: 'text',
+      };
+
+      const sent = await sendOwnerInteractive({
+        record: syntheticRecord,
+        label: `owner_agenda_proposal_${finalProposalId}`,
+        messageBody: `IA360: propuesta agenda ${sanitized.kind} ${resolvedName} (${formatResourceLabel(sanitized.resources)})`,
+        targetContact: sanitized.contact_number,
+        ownerBudget: true,
+        critical: true,
+        interactive: {
+          type: 'button',
+          body: { text: cardBody },
+          action: {
+            buttons: buildProposalButtons(finalProposalId, sanitized.kind),
+          },
+        },
+      });
+
+      if (!sent) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals SET delivery_error = 'interactive_send_returned_false' WHERE id = $1`,
+          [finalProposalId]
+        );
+        return {
+          ok: false,
+          proposal_id: finalProposalId,
+          state: 'blocked',
+          message: 'No se pudo enviar la tarjeta interactiva al owner (send returned false).',
+        };
+      }
+    } catch (sendErr) {
+      console.error('[ia360-agenda] error sending owner card:', sendErr.message);
+      await pool.query(
+        `UPDATE coexistence.ia360_agenda_proposals SET delivery_error = $2 WHERE id = $1`,
+        [finalProposalId, sendErr.message]
+      ).catch(() => {});
+      return {
+        ok: false,
+        proposal_id: finalProposalId,
+        state: 'blocked',
+        message: `Error al despachar la tarjeta interactiva al owner: ${sendErr.message}`,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    proposal_id: finalProposalId,
+    state: 'pending_owner_confirmation',
+    message: 'Propuesta creada, esperando confirmación del owner.',
+  };
+}
+
+/**
+ * Ejecuta el escritor real de reserva contra n8n con verificación estricta por componente.
+ */
+async function executeBookWriter({
+  proposal,
+  contactName,
+  fetchFn = global.fetch,
+  token = process.env.N8N_CALENDAR_TOKEN || '',
+  url = N8N_IA360_OWNER_BOOK_WEBHOOK_URL,
+}) {
+  const bhCheck = validateBusinessHours(proposal?.start_utc, proposal?.end_utc, AGENDA_TIMEZONE);
+  if (!bhCheck.ok) {
+    return {
+      ok: false,
+      verified: false,
+      uncertain: false,
+      error: bhCheck.error,
+      timeZone: bhCheck.timeZone,
+      businessHours: bhCheck.businessHours,
+      message: 'El horario solicitado está fuera de la ventana operativa (08:00 a 20:00 hora America/Mexico_City)',
+    };
+  }
+
+  if (!token || !String(token).trim()) {
+    return {
+      ok: false,
+      verified: false,
+      uncertain: false,
+      error: 'missing_calendar_token',
+      message: 'N8N_CALENDAR_TOKEN no configurado en el backend',
+    };
+  }
+
+  const requestedResources = canonicalizeResources(
+    proposal.resources || proposal.detalle_json?.resources || ['calendar', 'zoom']
+  ) || ['calendar', 'zoom'];
+
+  const payload = {
+    resources: requestedResources,
+    inicio_iso: proposal.start_utc,
+    fin_iso: proposal.end_utc,
+    titulo: proposal.title || 'Reunión IA360',
+    nombre_contacto: contactName || proposal.contact_name || 'Contacto',
+    numero_contacto: proposal.contact_number,
+    confirmado_por_owner: 'true',
+    operation_id: proposal.id,
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35000);
+
+  try {
+    const res = await fetchFn(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': 'ForgeChat-Backend/1.0',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      if (res.status >= 500) {
+        return { ok: false, verified: false, uncertain: true, error: `http_${res.status}`, message: text };
+      }
+      return { ok: false, verified: false, uncertain: false, error: `http_${res.status}`, message: text };
+    }
+
+    if (!text || !String(text).trim()) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        error: 'empty_provider_response',
+        message: 'El proveedor respondió 200 pero con cuerpo vacío (estado incierto)',
+      };
+    }
+
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      return { ok: false, verified: false, uncertain: true, error: 'invalid_json_response', message: text };
+    }
+
+    // Adaptar o respetar components estructurados
+    const components = data.components ? { ...data.components } : {};
+    if (!data.components) {
+      if (requestedResources.includes('calendar')) {
+        const calId = data.calendar_event_id || data.event_id || data.evento_id;
+        if (calId && data.verified === true) {
+          components.calendar = { state: 'verified', id: calId };
+        } else if (data.ok === true && !data.verified) {
+          components.calendar = { state: 'uncertain', id: calId || undefined };
+        } else {
+          components.calendar = { state: 'failed', error: data.error || 'calendar_booking_failed' };
+        }
+      }
+      if (requestedResources.includes('zoom')) {
+        const zId = data.zoom_meeting_id ? String(data.zoom_meeting_id) : (data.zoom_join_url || null);
+        if (zId && data.verified === true) {
+          components.zoom = { state: 'verified', id: zId, join_url: data.zoom_join_url || undefined };
+        } else if (data.ok === true && !data.verified) {
+          components.zoom = { state: 'uncertain', id: zId || undefined };
+        } else {
+          components.zoom = { state: 'failed', error: data.error || 'zoom_booking_failed' };
+        }
+      }
+    }
+
+    // Verificación estricta: sólo los recursos solicitados
+    let allVerified = true;
+    let anyUncertain = false;
+    let firstError = null;
+
+    for (const r of requestedResources) {
+      const comp = components[r];
+      if (!comp) {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || `missing_component_${r}`;
+      } else if (comp.state === 'verified') {
+        if (r === 'calendar' && !comp.id) {
+          allVerified = false;
+          anyUncertain = true;
+        }
+        if (r === 'zoom' && !comp.id && !comp.join_url) {
+          allVerified = false;
+          anyUncertain = true;
+        }
+      } else if (comp.state === 'uncertain') {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || comp.error || `${r}_uncertain`;
+      } else {
+        allVerified = false;
+        firstError = firstError || comp.error || `${r}_failed`;
+      }
+    }
+
+    const tokenGenerated = data.token || null;
+    const eventId = components.calendar?.id || data.event_id || data.calendar_event_id || null;
+    const zoomId = components.zoom?.id || (data.zoom_meeting_id ? String(data.zoom_meeting_id) : null);
+    const zoomJoinUrl = components.zoom?.join_url || data.zoom_join_url || null;
+
+    if (allVerified && data.ok === true && data.verified === true) {
+      return {
+        ok: true,
+        verified: true,
+        uncertain: false,
+        state: 'agendada',
+        resources: requestedResources,
+        components,
+        event_id: eventId,
+        calendar_event_id: eventId,
+        token: tokenGenerated,
+        zoom_meeting_id: zoomId,
+        zoom_join_url: zoomJoinUrl,
+        start_utc: data.start_utc || proposal.start_utc,
+        end_utc: data.end_utc || proposal.end_utc,
+        enlace_estable: data.enlace_estable || (tokenGenerated ? `https://wa.geekstudio.dev/api/r/${tokenGenerated}` : null),
+      };
+    }
+
+    // Si el proveedor respondió 200 pero verified no es true o falta readback, es estado INCIERTO
+    if (anyUncertain || (data.ok === true && !allVerified)) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        components,
+        error: firstError || data.error || data.motivo || 'unverified_provider_response',
+        message: data.message || data.motivo || 'El proveedor respondió pero la reserva no pudo ser verificada con readback completo (estado incierto)',
+      };
+    }
+
+    return {
+      ok: false,
+      verified: false,
+      uncertain: false,
+      resources: requestedResources,
+      components,
+      error: firstError || data.error || 'booking_failed',
+      message: data.message || 'No se pudo completar la reserva solicitada',
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      verified: false,
+      uncertain: true,
+      resources: requestedResources,
+      error: err.name === 'AbortError' ? 'timeout' : err.message,
+      message: err.message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Ejecuta el escritor real de cancelación contra n8n con verificación estricta por componente.
+ */
+async function executeCancelWriter({
+  proposal,
+  fetchFn = global.fetch,
+  token = process.env.N8N_CALENDAR_TOKEN || '',
+  url = N8N_IA360_OWNER_CANCEL_WEBHOOK_URL,
+}) {
+  if (!token || !String(token).trim()) {
+    return {
+      ok: false,
+      verified: false,
+      uncertain: false,
+      error: 'missing_calendar_token',
+      message: 'N8N_CALENDAR_TOKEN no configurado en el backend',
+    };
+  }
+
+  const requestedResources = canonicalizeResources(
+    proposal.resources || proposal.detalle_json?.resources || ['calendar', 'zoom']
+  ) || ['calendar', 'zoom'];
+
+  const payload = {
+    resources: requestedResources,
+    evento_id: proposal.event_id || '',
+    event_id: proposal.event_id || '',
+    zoom_id: proposal.zoom_id || '',
+    contact_number: proposal.contact_number,
+    confirmado_por_owner: 'true',
+    operation_id: proposal.id,
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetchFn(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': 'ForgeChat-Backend/1.0',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      if (res.status >= 500) {
+        return { ok: false, verified: false, uncertain: true, error: `http_${res.status}`, message: text };
+      }
+      return { ok: false, verified: false, uncertain: false, error: `http_${res.status}`, message: text };
+    }
+
+    if (!text || !String(text).trim()) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        error: 'empty_provider_response',
+        message: 'El proveedor respondió 200 pero con cuerpo vacío (estado incierto)',
+      };
+    }
+
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      return { ok: false, verified: false, uncertain: true, error: 'invalid_json_response', message: text };
+    }
+
+    const components = data.components ? { ...data.components } : {};
+    if (!data.components) {
+      if (requestedResources.includes('calendar')) {
+        const calId = data.event_id || data.evento_id || proposal.event_id;
+        if (calId && data.verified === true) {
+          components.calendar = { state: 'verified', id: calId };
+        } else if (data.ok === true && !data.verified) {
+          components.calendar = { state: 'uncertain', id: calId || undefined };
+        } else {
+          components.calendar = { state: 'failed', error: data.error || 'calendar_cancel_failed' };
+        }
+      }
+      if (requestedResources.includes('zoom')) {
+        const zId = data.zoom_id || proposal.zoom_id;
+        if (zId && data.verified === true) {
+          components.zoom = { state: 'verified', id: zId };
+        } else if (data.ok === true && !data.verified) {
+          components.zoom = { state: 'uncertain', id: zId || undefined };
+        } else {
+          components.zoom = { state: 'failed', error: data.error || 'zoom_cancel_failed' };
+        }
+      }
+    }
+
+    let allVerified = true;
+    let anyUncertain = false;
+    let firstError = null;
+
+    for (const r of requestedResources) {
+      const comp = components[r];
+      if (!comp) {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || `missing_component_${r}`;
+      } else if (comp.state === 'verified') {
+        // ok
+      } else if (comp.state === 'uncertain') {
+        allVerified = false;
+        anyUncertain = true;
+        firstError = firstError || comp.error || `${r}_cancel_uncertain`;
+      } else {
+        allVerified = false;
+        firstError = firstError || comp.error || `${r}_cancel_failed`;
+      }
+    }
+
+    if (allVerified && data.ok === true && data.verified === true) {
+      return {
+        ok: true,
+        verified: true,
+        uncertain: false,
+        state: 'cancelada',
+        resources: requestedResources,
+        components,
+        event_id: components.calendar?.id || data.event_id || data.evento_id || proposal.event_id,
+        zoom_id: components.zoom?.id || data.zoom_id || proposal.zoom_id,
+        enlace_retirado: data.enlace_retirado === true,
+      };
+    }
+
+    if (anyUncertain || (data.ok === true && !allVerified)) {
+      return {
+        ok: false,
+        verified: false,
+        uncertain: true,
+        resources: requestedResources,
+        components,
+        error: firstError || data.error || data.motivo || 'unverified_cancel_response',
+        message: data.message || data.motivo || 'El proveedor respondió pero la cancelación no pudo ser verificada con readback (estado incierto)',
+      };
+    }
+
+    return {
+      ok: false,
+      verified: false,
+      uncertain: false,
+      resources: requestedResources,
+      components,
+      error: firstError || data.error || 'cancel_failed',
+      message: data.message || 'No se pudo cancelar el recurso solicitado',
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      verified: false,
+      uncertain: true,
+      resources: requestedResources,
+      error: err.name === 'AbortError' ? 'timeout' : err.message,
+      message: err.message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Procesa la decisión del owner al presionar el botón de confirmación con bloqueo asesor global.
+ */
+async function handleOwnerAgendaDecision({
+  pool,
+  record,
+  buttonId,
+  sendOwnerDirectText,
+  sendContactDirectText = null,
+  syncDeal = null,
+  mergeContactState = null,
+  removeBooking = null,
+  loadContactName = null,
+  fetchFn = global.fetch,
+}) {
+  if (!record || normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+    console.warn('[ia360-agenda] decision rejected: caller is not owner');
+    return false;
+  }
+
+  const isYes = buttonId.startsWith('ia360_agenda_yes:');
+  const isNo = buttonId.startsWith('ia360_agenda_no:');
+  if (!isYes && !isNo) return false;
+
+  const proposalId = buttonId.split(':')[1];
+  if (!proposalId) return false;
+
+  if (!pool) throw new Error('database_pool_required');
+
+  const { rows: initialRows } = await pool.query(
+    `SELECT * FROM coexistence.ia360_agenda_proposals WHERE id = $1`,
+    [proposalId]
+  );
+
+  if (!initialRows.length) {
+    await sendOwnerDirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_agenda_notfound',
+      body: 'No encontré la propuesta de agenda solicitada.',
+    });
+    return true;
+  }
+
+  const proposal = initialRows[0];
+  proposal.resources = canonicalizeResources(proposal.resources) || ['calendar', 'zoom'];
+
+  // FC-SEC-005: Verificación estricta de línea: la línea receptora del tap debe coincidir con la de la propuesta
+  const recordWa = normalizePhone(record.wa_number);
+  if (!recordWa) {
+    console.warn('[ia360-agenda] decision rejected: missing record.wa_number');
+    return false;
+  }
+
+  const proposalWa = normalizePhone(proposal.wa_number);
+  if (!proposalWa || proposalWa !== recordWa) {
+    console.warn('[ia360-agenda] line mismatch: proposal.wa=%s vs record.wa=%s', proposal.wa_number, record.wa_number);
+    await sendOwnerDirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_agenda_line_mismatch',
+      body: 'La propuesta pertenece a otra línea de WhatsApp. Operación bloqueada.',
+    });
+    return true;
+  }
+
+  // Si ya no está pending o ya expiró
+  const isExpired = new Date(proposal.expires_at).getTime() <= Date.now();
+  if (proposal.estado !== 'pending' || isExpired) {
+    if (proposal.estado === 'pending' && isExpired) {
+      await pool.query(
+        `UPDATE coexistence.ia360_agenda_proposals
+            SET estado = 'expired', resuelto_at = now()
+          WHERE id = $1`,
+        [proposalId]
+      );
+    }
+    await sendOwnerDirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_agenda_expired',
+      body: `Esta propuesta de agenda ya no está disponible (estado: ${proposal.estado}, expirada o resuelta).`,
+    });
+    return true;
+  }
+
+  // Rechazo explícito
+  if (isNo) {
+    await pool.query(
+      `UPDATE coexistence.ia360_agenda_proposals
+          SET estado = 'rejected', owner_decision = 'no', owner_decided_at = now(), resuelto_at = now()
+        WHERE id = $1 AND estado = 'pending'`,
+      [proposalId]
+    );
+    await sendOwnerDirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_agenda_rejected',
+      body: 'Ok: propuesta de agenda rechazada.',
+    });
+    return true;
+  }
+
+  // Aprobación: Adquisición de cliente dedicado para bloqueo asesor global y reclamo atómico
+  let client = null;
+  let lockAcquired = false;
+
+  try {
+    client = await pool.connect();
+
+    // 1. Intentar adquirir bloqueo asesor global de calendario
+    const { rows: lockRows } = await client.query(
+      `SELECT pg_try_advisory_lock($1) AS locked`,
+      [CALENDAR_ADVISORY_LOCK_ID]
+    );
+    lockAcquired = Boolean(lockRows[0]?.locked);
+
+    if (!lockAcquired) {
+      // Si el lock está tomado por otra operación: NO consume la confirmación
+      await sendOwnerDirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_agenda_busy',
+        body: 'El calendario está procesando otra operación en este momento. Por favor reintenta en unos segundos.',
+      });
+      return true;
+    }
+
+    // 2. FC-SEC-005: Transacción de reclamo atómico condicional validando wa_number contra recordWa
+    await client.query('BEGIN');
+    const { rows: claimRows } = await client.query(
+      `UPDATE coexistence.ia360_agenda_proposals
+          SET estado = 'executing', owner_decision = 'yes', owner_decided_at = now(), updated_at = now()
+        WHERE id = $1 AND estado = 'pending' AND expires_at > now() AND wa_number = $2
+        RETURNING *`,
+      [proposalId, recordWa]
+    );
+
+    if (!claimRows.length) {
+      await client.query('ROLLBACK');
+      await sendOwnerDirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_agenda_claim_lost',
+        body: 'La propuesta ya fue tomada concurrentemente, expiró o la línea no coincide.',
+      });
+      return true;
+    }
+
+    // Commit durable del reclamo antes de ejecutar I/O
+    await client.query('COMMIT');
+    const activeProposal = claimRows[0];
+    activeProposal.resources = canonicalizeResources(activeProposal.resources) || proposal.resources;
+
+    let resolvedName = activeProposal.contact_name;
+    if (!resolvedName && loadContactName) {
+      resolvedName = await loadContactName(activeProposal.contact_number);
+    }
+    if (!resolvedName) resolvedName = `contacto ${maskNumber(activeProposal.contact_number)}`;
+
+    // 3. Ejecutar escritor
+    if (activeProposal.kind === 'book') {
+      // Revalidación determinista de horario laboral justo antes del writer para propuestas viejas/residuales
+      const bhCheck = validateBusinessHours(activeProposal.start_utc, activeProposal.end_utc, AGENDA_TIMEZONE);
+      if (!bhCheck.ok) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals
+              SET estado = 'failed', error_message = $2, detalle_json = $3::jsonb, resuelto_at = now()
+            WHERE id = $1`,
+          [
+            proposalId,
+            bhCheck.error,
+            JSON.stringify({
+              error: bhCheck.error,
+              timeZone: bhCheck.timeZone,
+              businessHours: bhCheck.businessHours,
+              start_local: bhCheck.startLocal,
+              end_local: bhCheck.endLocal,
+            }),
+          ]
+        );
+        await sendOwnerDirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_agenda_book_outside_hours',
+          body: `No se pudo agendar la cita con ${resolvedName}: el horario (${bhCheck.startLocal || 'fuera de rango'}) está fuera de la ventana operativa permitida (08:00 a 20:00 hora Ciudad de México).`,
+        });
+        return true;
+      }
+
+      const writerRes = await executeBookWriter({
+        proposal: activeProposal,
+        contactName: resolvedName,
+        fetchFn,
+      });
+
+      if (writerRes.uncertain) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals
+              SET estado = 'execution_uncertain', error_message = $2, detalle_json = $3::jsonb, updated_at = now()
+            WHERE id = $1`,
+          [proposalId, writerRes.error || writerRes.message || 'Timeout o fallo de red', JSON.stringify(writerRes)]
+        );
+        await sendOwnerDirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_agenda_book_uncertain',
+          body: `La reserva de cita entró en estado INCIERTO (${writerRes.error || 'timeout'}). No se reintentará automáticamente para evitar duplicados. Revisa ${formatResourceLabel(activeProposal.resources)}.`,
+        });
+        return true;
+      }
+
+      if (!writerRes.ok || !writerRes.verified) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals
+              SET estado = 'failed', error_message = $2, detalle_json = $3::jsonb, resuelto_at = now()
+            WHERE id = $1`,
+          [proposalId, writerRes.error || writerRes.message || 'Error en reserva', JSON.stringify(writerRes)]
+        );
+        await sendOwnerDirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_agenda_book_failed',
+          body: `No se pudo agendar la cita con ${resolvedName} (${writerRes.error || writerRes.message || 'slot ocupado'}).`,
+        });
+        return true;
+      }
+
+      // Éxito verificado
+      await pool.query(
+        `UPDATE coexistence.ia360_agenda_proposals
+            SET estado = 'completed', detalle_json = $2::jsonb, resuelto_at = now()
+          WHERE id = $1`,
+        [proposalId, JSON.stringify(writerRes)]
+      );
+
+      // Actualizar ia360_bookings en el contacto
+      if (mergeContactState) {
+        try {
+          const currentBookings = [];
+          const { rows: contactRows } = await pool.query(
+            `SELECT custom_fields->'ia360_bookings' AS arr FROM coexistence.contacts WHERE contact_number = $1`,
+            [activeProposal.contact_number]
+          );
+          let existingArr = contactRows[0]?.arr;
+          if (typeof existingArr === 'string') {
+            try { existingArr = JSON.parse(existingArr); } catch (_) { existingArr = []; }
+          }
+          if (Array.isArray(existingArr)) currentBookings.push(...existingArr);
+
+          currentBookings.push({
+            start: activeProposal.start_utc,
+            event_id: writerRes.event_id || '',
+            zoom_id: writerRes.zoom_join_url || writerRes.zoom_meeting_id || '',
+            resources: activeProposal.resources,
+          });
+
+          const customFieldsUpdate = {
+            ia360_bookings: currentBookings,
+            ia360_booking_start: activeProposal.start_utc,
+          };
+          if (writerRes.event_id) {
+            customFieldsUpdate.ia360_booking_event_id = writerRes.event_id;
+          }
+          if (writerRes.zoom_join_url || writerRes.zoom_meeting_id) {
+            customFieldsUpdate.ia360_booking_zoom_id = writerRes.zoom_join_url || writerRes.zoom_meeting_id;
+          }
+
+          await mergeContactState({
+            waNumber: activeProposal.wa_number,
+            contactNumber: activeProposal.contact_number,
+            customFields: customFieldsUpdate,
+          });
+        } catch (mergeErr) {
+          console.error('[ia360-agenda] error updating contact bookings:', mergeErr.message);
+        }
+      }
+
+      // Mover deal a 'Reunión agendada'
+      if (syncDeal) {
+        try {
+          await syncDeal({
+            record: { ...record, contact_number: activeProposal.contact_number },
+            targetStageName: 'Reunión agendada',
+            titleSuffix: 'Reunión agendada',
+            notes: `Reunión confirmada por Alek (${formatResourceLabel(activeProposal.resources)}). Slot: ${activeProposal.start_utc}`,
+          });
+        } catch (dealErr) {
+          console.error('[ia360-agenda] error syncing deal:', dealErr.message);
+        }
+      }
+
+      const startFmt = formatDateCdMx(activeProposal.start_utc);
+      const linkStr = writerRes.enlace_estable ? `\nEnlace: ${writerRes.enlace_estable}` : '';
+
+      if (sendContactDirectText) {
+        await sendContactDirectText({
+          record,
+          toNumber: activeProposal.contact_number,
+          label: 'ia360_agenda_book_done_contact',
+          body: `Listo, tu reunión quedó agendada para el ${startFmt}.${linkStr}`,
+        });
+      }
+
+      await sendOwnerDirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_agenda_book_done',
+        body: `Hecho: agendé la reunión con ${resolvedName} para el ${startFmt} (${formatResourceLabel(activeProposal.resources)}).`,
+      });
+      return true;
+    }
+
+    if (activeProposal.kind === 'cancel') {
+      const writerRes = await executeCancelWriter({
+        proposal: activeProposal,
+        fetchFn,
+      });
+
+      if (writerRes.uncertain) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals
+              SET estado = 'execution_uncertain', error_message = $2, detalle_json = $3::jsonb, updated_at = now()
+            WHERE id = $1`,
+          [proposalId, writerRes.error || 'Timeout de cancelación', JSON.stringify(writerRes)]
+        );
+        await sendOwnerDirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_agenda_cancel_uncertain',
+          body: `La cancelación de la cita entró en estado INCIERTO. Revisa ${formatResourceLabel(activeProposal.resources)}.`,
+        });
+        return true;
+      }
+
+      if (!writerRes.ok || !writerRes.verified) {
+        await pool.query(
+          `UPDATE coexistence.ia360_agenda_proposals
+              SET estado = 'failed', error_message = $2, detalle_json = $3::jsonb, resuelto_at = now()
+            WHERE id = $1`,
+          [proposalId, writerRes.error || 'Error en cancelación', JSON.stringify(writerRes)]
+        );
+        await sendOwnerDirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_agenda_cancel_failed',
+          body: `No se pudo cancelar la cita con ${resolvedName} (${writerRes.error || 'error'}).`,
+        });
+        return true;
+      }
+
+      // Éxito verificado
+      await pool.query(
+        `UPDATE coexistence.ia360_agenda_proposals
+          SET estado = 'completed', detalle_json = $2::jsonb, resuelto_at = now()
+        WHERE id = $1`,
+        [proposalId, JSON.stringify(writerRes)]
+      );
+
+      if (removeBooking) {
+        try {
+          await removeBooking({
+            waNumber: activeProposal.wa_number,
+            contactNumber: activeProposal.contact_number,
+            eventId: activeProposal.event_id,
+            zoomId: activeProposal.zoom_id,
+            resources: activeProposal.resources,
+          });
+        } catch (remErr) {
+          console.error('[ia360-agenda] error removing booking from contact:', remErr.message);
+        }
+      }
+
+      if (sendContactDirectText) {
+        await sendContactDirectText({
+          record,
+          toNumber: activeProposal.contact_number,
+          label: 'ia360_agenda_cancel_done_contact',
+          body: 'Tu reunión ha sido cancelada conforme a lo solicitado.',
+        });
+      }
+
+      await sendOwnerDirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_agenda_cancel_done',
+        body: `Hecho: cancelé la cita con ${resolvedName} (${formatResourceLabel(activeProposal.resources)}).`,
+      });
+      return true;
+    }
+  } finally {
+    if (lockAcquired && client) {
+      await client.query(`SELECT pg_advisory_unlock($1)`, [CALENDAR_ADVISORY_LOCK_ID]).catch(err => {
+        console.error('[ia360-agenda] error unlocking advisory lock:', err.message);
+      });
+    }
+    if (client) {
+      client.release();
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Procesa comentarios del owner en tarjetas de fallo (ia360_awaiting_comment_failure)
+ * pasando la instrucción al agente IA360 en modo 'owner_assistance' con contexto estructurado.
+ *
+ * CONTRATO DE AUDIENCIA Y RESOLUCIÓN:
+ * 1. Solo envía al contacto si agentRes.response_audience === 'contact' Y agentRes.action === 'reply_to_contact'.
+ * 2. Si la respuesta es para el owner (o una consulta interna), se despacha a Alek.
+ * 3. NO limpia el flag ia360_awaiting_comment_failure prematuramente; solo se limpia tras despacho exitoso al contacto.
+ * 4. Correlaciona el source_message_id real desde chat_history comparando fecha (<= timestamp del owner) y contenido con el snapshot.
+ */
+async function handleOwnerFailureAssistance({
+  pool,
+  record,
+  failureId,
+  comment,
+  loadFailureTarget,
+  callIa360Agent,
+  enqueueIa360Text,
+  sendIa360DirectText,
+  mergeContactState,
+}) {
+  if (!pool) throw new Error('database_pool_required');
+
+  const target = await loadFailureTarget(failureId);
+  const targetNumber = normalizePhone(target?.contact_number || '');
+  if (!target || !targetNumber) {
+    return { ok: false, reason: 'missing_target' };
+  }
+
+  if (!record || !record.timestamp) {
+    if (sendIa360DirectText) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_comment_fail_missing_time',
+        body: 'El mensaje del owner no incluye timestamp válido para correlacionar con el historial.',
+      });
+    }
+    return { ok: false, reason: 'missing_owner_timestamp' };
+  }
+
+  const ownerTimestamp = new Date(record.timestamp);
+  if (isNaN(ownerTimestamp.getTime())) {
+    return { ok: false, reason: 'invalid_owner_timestamp' };
+  }
+
+  await pool.query(
+    `UPDATE coexistence.ia360_bot_failures
+        SET owner_comment = $1, owner_action = 'respondio_con_comentario', status = 'comentario_recibido'
+      WHERE id = $2`,
+    [comment, failureId]
+  ).catch(e => console.error('[ia360-failure] save comment:', e.message));
+
+  // Resolver source_message_id real desde chat_history correlacionando contenido y timestamp <= comentario del owner
+  let resolvedSourceMessageId = null;
+  const failureSnapshotBody = String(target.contact_message || '').trim();
+
+  try {
+    const { rows: histRows } = await pool.query(
+      `SELECT message_id, message_body, timestamp
+         FROM coexistence.chat_history
+        WHERE contact_number = $1
+          AND wa_number = $2
+          AND direction = 'incoming'
+          AND timestamp <= $3
+        ORDER BY timestamp DESC
+        LIMIT 10`,
+      [targetNumber, target.contact_wa_number || record.wa_number, ownerTimestamp]
+    );
+
+    for (const row of histRows) {
+      const rowBody = String(row.message_body || '').trim();
+      if (rowBody && failureSnapshotBody && (failureSnapshotBody.includes(rowBody) || rowBody.includes(failureSnapshotBody))) {
+        resolvedSourceMessageId = row.message_id;
+        break;
+      }
+    }
+  } catch (histErr) {
+    console.error('[ia360-failure] error resolving source_message_id:', histErr.message);
+  }
+
+  // Si no se correlaciona con certeza el mensaje original del fallo, preservar pendiente y pedir clarificación al owner
+  if (!resolvedSourceMessageId) {
+    if (sendIa360DirectText) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_comment_fail_unresolved',
+        body: `No pude correlacionar con certeza el mensaje original del fallo (#${failureId}) con el historial del contacto. Por seguridad, el caso permanece abierto en el CRM para tu revisión manual.`,
+      });
+    }
+    return { ok: false, reason: 'unresolved_source_message', contactNumber: targetNumber };
+  }
+
+  const targetRecord = {
+    ...record,
+    contact_number: targetNumber,
+    wa_number: target.contact_wa_number || record.wa_number,
+    contact_name: target.contact_name || '',
+    message_id: resolvedSourceMessageId,
+    message_type: 'text',
+    message_body: target.contact_message || '',
+  };
+
+  // Invocar al agente IA360 en modo owner_assistance con campos estructurados
+  let agentRes = null;
+  try {
+    agentRes = await callIa360Agent({
+      record: targetRecord,
+      stageName: 'Supervisado Owner',
+      roleHint: 'owner_assistance',
+      threadContext: {
+        input_mode: 'owner_assistance',
+        owner_instruction: comment,
+        original_request: target.contact_message,
+        failure_id: failureId,
+        failure_reason: target.reason,
+        source_message_id: resolvedSourceMessageId,
+        owner_message_id: record.message_id || null,
+      },
+    });
+  } catch (agentErr) {
+    console.error('[ia360-failure] callIa360Agent error:', agentErr.message);
+  }
+
+  const contactName = target.contact_name || `contacto ${maskNumber(targetNumber)}`;
+
+  // Evaluación estricta de audiencia: solo responder al contacto si response_audience === 'contact' Y action === 'reply_to_contact'
+  if (agentRes && agentRes.reply && String(agentRes.reply).trim()) {
+    const replyBody = String(agentRes.reply).trim();
+    const isContactAudience = agentRes.response_audience === 'contact' && agentRes.action === 'reply_to_contact';
+
+    if (isContactAudience) {
+      let sent = false;
+      if (enqueueIa360Text) {
+        sent = await enqueueIa360Text({
+          record: targetRecord,
+          label: 'ia360_owner_assisted_reply',
+          body: replyBody,
+        });
+      }
+
+      await pool.query(
+        `UPDATE coexistence.ia360_bot_failures
+            SET status = $1
+          WHERE id = $2`,
+        [sent === true ? 'respondido_por_agente' : 'comentado_envio_fallo', failureId]
+      ).catch(e => console.error('[ia360-failure] mark status:', e.message));
+
+      // Solo limpiar el awaiting flag cuando la respuesta al contacto se ha enviado exitosamente
+      if (mergeContactState && sent === true) {
+        await mergeContactState({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          customFields: { ia360_awaiting_comment_failure: '' },
+        }).catch(e => console.error('[ia360-failure] clear awaiting:', e.message));
+      }
+
+      if (sendIa360DirectText) {
+        await sendIa360DirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_comment_fail_saved',
+          body: sent === true
+            ? `Listo: procesé tu indicación con IA360 y le respondí a ${contactName}.`
+            : `Guardé tu comentario, pero falló el envío al contacto (${contactName}).`,
+        });
+      }
+
+      return { ok: sent === true, handled: 'agent_reply_to_contact', contactName, contactNumber: targetNumber };
+    }
+
+    // Si la audiencia es owner: enviar la respuesta de IA360 a Alek sin limpiar el awaiting flag
+    if (sendIa360DirectText) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_comment_assistant_info',
+        body: replyBody,
+      });
+    }
+
+    return { ok: true, handled: 'owner_info', contactName, contactNumber: targetNumber };
+  }
+
+  // Si el agente falló o no dio respuesta utilizable: NUNCA hacer relay literal
+  await pool.query(
+    `UPDATE coexistence.ia360_bot_failures
+        SET status = 'comentado_agente_fallo'
+      WHERE id = $1`,
+    [failureId]
+  ).catch(e => console.error('[ia360-failure] mark status fail:', e.message));
+
+  if (sendIa360DirectText) {
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_comment_fail_saved',
+      body: `Guardé tu comentario, pero IA360 no generó una respuesta utilizable. El caso permanece abierto en el CRM.`,
+    });
+  }
+
+  return { ok: true, handled: 'pending_crm', contactName, contactNumber: targetNumber };
+}
+
+module.exports = {
+  PROPOSAL_EXPIRATION_MINUTES,
+  PROPOSAL_STATES,
+  VALID_RESOURCES,
+  IA360_OWNER_NUMBER,
+  CALENDAR_ADVISORY_LOCK_ID,
+  AGENDA_TIMEZONE,
+  BUSINESS_HOURS_START_STR,
+  BUSINESS_HOURS_END_STR,
+  N8N_IA360_OWNER_BOOK_WEBHOOK_URL,
+  N8N_IA360_OWNER_CANCEL_WEBHOOK_URL,
+  canonicalizeResources,
+  formatResourceLabel,
+  normalizePhone,
+  maskNumber,
+  formatDateCdMx,
+  formatTimeCdMx,
+  getZonedParts,
+  validateBusinessHours,
+  computePayloadHash,
+  validateProposalInput,
+  buildProposalButtons,
+  formatProposalCardText,
+  revalidateContactEvent,
+  verifyServerScope,
+  proposeAgendaAction,
+  executeBookWriter,
+  executeCancelWriter,
+  handleOwnerAgendaDecision,
+  handleOwnerFailureAssistance,
+};
